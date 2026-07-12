@@ -1,0 +1,2 @@
+"""Copytrade bot backend package."""
+
