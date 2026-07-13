@@ -6549,6 +6549,63 @@ def test_submit_worker_duplicate_enqueue_submits_once_and_applies_once() -> None
     assert not watcher.engine.pending_intents.has_active_order(order)
 
 
+def test_submit_retry_resets_pre_exchange_submit_transient_failure() -> None:
+    client = TimeoutExecutionClient()
+    order = submit_barrier_order(order_id=780, action="INCREASE", source_fill_id="fill-transient-submit")
+    allocation = allocation_record(qty="1", notional="100")
+    allocation.id = 10
+
+    class OrderSession(FakeSession):
+        async def get(self, model, key):
+            if model is ExecutionOrder and key == order.id:
+                return order
+            return None
+
+    watcher = HyperliquidLowLatencyWatcher(
+        settings=settings(),
+        info_client=NoopInfoClient(),
+        execution_client=client,
+        db_session_factory=lambda: OrderSession(),
+    )
+    watcher.engine.pending_intents.reserve(order, allocation)
+    order.status = "SUBMITTING"
+
+    async def run() -> bool:
+        return await watcher._prepare_submit_retry_if_safe(order.id)
+
+    assert asyncio.run(run()) is True
+    assert order.status == "PENDING_SUBMIT"
+
+
+def test_submit_retry_does_not_reset_after_exchange_submit_started() -> None:
+    client = TimeoutExecutionClient()
+    order = submit_barrier_order(order_id=781, action="INCREASE", source_fill_id="fill-transient-sent")
+    allocation = allocation_record(qty="1", notional="100")
+    allocation.id = 10
+
+    class OrderSession(FakeSession):
+        async def get(self, model, key):
+            if model is ExecutionOrder and key == order.id:
+                return order
+            return None
+
+    watcher = HyperliquidLowLatencyWatcher(
+        settings=settings(),
+        info_client=NoopInfoClient(),
+        execution_client=client,
+        db_session_factory=lambda: OrderSession(),
+    )
+    watcher.engine.pending_intents.reserve(order, allocation)
+    order.status = "SUBMITTING"
+    order.order_submit_started_at = datetime.now(timezone.utc)
+
+    async def run() -> bool:
+        return await watcher._prepare_submit_retry_if_safe(order.id)
+
+    assert asyncio.run(run()) is False
+    assert order.status == "SUBMITTING"
+
+
 def test_submit_risk_settings_uses_confirmed_per_market_leverage_override() -> None:
     client = TimeoutExecutionClient()
     engine = FillDrivenExecutionEngine(

@@ -790,6 +790,7 @@ class FillDrivenExecutionEngine:
         self._asset_id_cache: dict[tuple[str, str], int] = {}
         self._market_meta_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
         self._risk_settings_ok_cache: dict[tuple[str, str, int | None, str], RiskSettingResult] = {}
+        self._risk_settings_locks: dict[tuple[str, str, int | None], asyncio.Lock] = {}
         self._account_abstraction_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
         self.pending_intents = PendingIntentLedger()
         self._state_refresh_task: asyncio.Task | None = None
@@ -2155,20 +2156,31 @@ class FillDrivenExecutionEngine:
             if cached is not None:
                 return cached, "process_cache"
 
-        risk_settings = await ensure_hyperliquid_market_risk_settings(
-            db=db,
-            client=self.execution_client,
-            settings=self.settings,
-            account_address=account_address,
-            dex=fill.market.dex,
-            canonical_coin_value=fill.market.canonical_coin,
-            asset_id=fill.market.asset_id,
-            market_max_leverage=checklist.get("market_max_leverage"),
-            desired_default_leverage=desired_leverage,
-            action_type=order.order_action or "OPEN",
-            reduce_only=False,
-            allow_stale_confirmed_cache=True,
+        lock_key = (
+            str(fill.market.dex or "").lower(),
+            str(fill.market.canonical_coin or "").upper(),
+            effective_leverage,
         )
+        risk_lock = self._risk_settings_locks.setdefault(lock_key, asyncio.Lock())
+        async with risk_lock:
+            for cache_key in cache_keys:
+                cached = self._risk_settings_ok_cache.get(cache_key)
+                if cached is not None:
+                    return cached, "process_cache"
+            risk_settings = await ensure_hyperliquid_market_risk_settings(
+                db=db,
+                client=self.execution_client,
+                settings=self.settings,
+                account_address=account_address,
+                dex=fill.market.dex,
+                canonical_coin_value=fill.market.canonical_coin,
+                asset_id=fill.market.asset_id,
+                market_max_leverage=checklist.get("market_max_leverage"),
+                desired_default_leverage=desired_leverage,
+                action_type=order.order_action or "OPEN",
+                reduce_only=False,
+                allow_stale_confirmed_cache=True,
+            )
         if risk_settings.is_ok:
             self._risk_settings_ok_cache[
                 (
@@ -3770,6 +3782,7 @@ class HyperliquidLowLatencyWatcher:
         self._submit_queue_guard = asyncio.Lock()
         self._submit_queues: dict[str, asyncio.Queue[tuple[int, FillEvent]]] = {}
         self._submit_workers: dict[str, asyncio.Task] = {}
+        self._submit_retry_counts: dict[int, int] = {}
         self._suppressed_source_fill_guard = asyncio.Lock()
         self._suppressed_source_fill_ids: dict[str, datetime] = {}
         self._background_tasks: set[asyncio.Task] = set()
@@ -5066,51 +5079,107 @@ class HyperliquidLowLatencyWatcher:
                     return
                 continue
             try:
-                async with self.db_session_factory() as db:
-                    order = await db.get(ExecutionOrder, order_id)
-                    if order is None:
-                        continue
-                    status = str(order.status or "").upper()
-                    if status == "SUBMITTING":
-                        continue
-                    if status != "PENDING_SUBMIT":
-                        self.engine.pending_intents.release(order)
-                        continue
-                    if not self.engine.pending_intents.has_active_order(order):
-                        order.status = "BLOCKED"
-                        order.dry_run = True
-                        order.error_message = "pending intent missing before submit; blocked to prevent duplicate order"
-                        db.add(
-                            RiskEvent(
-                                severity="error",
-                                event_type="PENDING_INTENT_MISSING_BLOCKED_ORDER",
-                                symbol=order.canonical_coin or order.source_coin,
-                                leader_address=order.leader_address,
-                                message=order.error_message,
-                                metadata_json={
-                                    "order_id": order.id,
-                                    "source_fill_id": order.source_fill_id,
-                                    "cloid": order.cloid,
-                                },
-                            )
-                        )
-                        await db.commit()
-                        continue
-                    await self._wait_for_submit_barrier(order)
-                    await self.engine.submit_planned_order(db, order, event)
+                await self._process_submit_queue_item(order_id, event)
+                self._submit_retry_counts.pop(int(order_id), None)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.state.last_error = str(exc)[:200]
-                log.exception(
-                    "low_latency_submit_worker_failed",
-                    dex=key,
-                    order_id=order_id,
-                    source_fill_id=event.source_fill_id,
-                    error=str(exc),
-                )
+                retry_safe = False
+                if _is_transient_submit_exception(exc):
+                    retry_safe = await self._prepare_submit_retry_if_safe(order_id)
+                retry_count = self._submit_retry_counts.get(int(order_id), 0)
+                if retry_safe and retry_count < 3:
+                    self._submit_retry_counts[int(order_id)] = retry_count + 1
+                    log.warning(
+                        "low_latency_submit_worker_retrying",
+                        dex=key,
+                        order_id=order_id,
+                        source_fill_id=event.source_fill_id,
+                        retry_count=retry_count + 1,
+                        error=str(exc)[:300],
+                    )
+                    queue.put_nowait((order_id, event))
+                else:
+                    self._submit_retry_counts.pop(int(order_id), None)
+                    self.state.last_error = str(exc)[:200]
+                    log.exception(
+                        "low_latency_submit_worker_failed",
+                        dex=key,
+                        order_id=order_id,
+                        source_fill_id=event.source_fill_id,
+                        error=str(exc),
+                    )
             finally:
                 queue.task_done()
+
+    async def _process_submit_queue_item(self, order_id: int, event: FillEvent) -> None:
+        async with self.db_session_factory() as db:
+            order = await db.get(ExecutionOrder, order_id)
+            if order is None:
+                return
+            status = str(order.status or "").upper()
+            if status == "SUBMITTING":
+                return
+            if status != "PENDING_SUBMIT":
+                self.engine.pending_intents.release(order)
+                return
+            if not self.engine.pending_intents.has_active_order(order):
+                order.status = "BLOCKED"
+                order.dry_run = True
+                order.error_message = "pending intent missing before submit; blocked to prevent duplicate order"
+                db.add(
+                    RiskEvent(
+                        severity="error",
+                        event_type="PENDING_INTENT_MISSING_BLOCKED_ORDER",
+                        symbol=order.canonical_coin or order.source_coin,
+                        leader_address=order.leader_address,
+                        message=order.error_message,
+                        metadata_json={
+                            "order_id": order.id,
+                            "source_fill_id": order.source_fill_id,
+                            "cloid": order.cloid,
+                        },
+                    )
+                )
+                await db.commit()
+                return
+            await self._wait_for_submit_barrier(order)
+            await self.engine.submit_planned_order(db, order, event)
+
+    async def _prepare_submit_retry_if_safe(self, order_id: int) -> bool:
+        try:
+            async with self.db_session_factory() as db:
+                order = await db.get(ExecutionOrder, order_id)
+                if order is None:
+                    return False
+                status = str(order.status or "").upper()
+                if status == "PENDING_SUBMIT":
+                    return self.engine.pending_intents.has_active_order(order)
+                if status != "SUBMITTING":
+                    return False
+                if (
+                    order.order_submit_started_at is not None
+                    or order.order_submit_done_at is not None
+                    or order.order_ack_at is not None
+                    or order.order_id
+                    or order.venue_order_id
+                    or order.raw_response
+                ):
+                    return False
+                if not self.engine.pending_intents.has_active_order(order):
+                    return False
+                order.status = "PENDING_SUBMIT"
+                order.updated_at = datetime.now(timezone.utc)
+                await db.commit()
+                return True
+        except Exception as exc:
+            self.state.last_error = str(exc)[:200]
+            log.warning(
+                "low_latency_submit_worker_retry_prepare_failed",
+                order_id=order_id,
+                error=str(exc),
+            )
+            return False
 
     async def _wait_for_submit_barrier(self, order: ExecutionOrder) -> None:
         wait_started_at: datetime | None = None
@@ -6168,6 +6237,24 @@ def _is_definitely_not_submitted_hyperliquid_error(exc: Exception) -> bool:
     return isinstance(exc, (AttributeError, TypeError, ValueError)) and (
         "to_raw" in message or "quantity rounded to zero" in message
     )
+
+
+def _is_transient_submit_exception(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    transient_fragments = (
+        "deadlock detected",
+        "deadlockdetectederror",
+        "could not serialize access",
+        "serializationfailure",
+        "lock timeout",
+        "pendingrollbackerror",
+        "connection reset",
+        "connection refused",
+        "server closed the connection",
+        "connection was closed",
+        "connection is closed",
+    )
+    return any(fragment in text for fragment in transient_fragments)
 
 
 def _hyperliquid_oid(response: dict[str, Any]) -> str | None:

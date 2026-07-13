@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.models import (
     LatestAccountPosition,
@@ -241,9 +242,9 @@ async def ensure_hyperliquid_market_risk_settings(
                 asset_id=row.asset_id,
             )
         except Exception as exc:
-            if margin_mode == DESIRED_MARGIN_MODE and _cross_margin_not_allowed(exc):
+            if margin_mode == DESIRED_MARGIN_MODE and _should_try_isolated_fallback(exc):
                 primary_failure = str(exc)
-                fallback_warning = "cross margin unsupported; using isolated margin for this market"
+                fallback_warning = _isolated_fallback_warning(exc)
                 continue
             message = f"failed to set {margin_mode.lower()} {attempt_effective}x: {exc}"
             _mark_failed(row, REASON_RISK_SETTING_UPDATE_FAILED, message, now=now)
@@ -257,9 +258,9 @@ async def ensure_hyperliquid_market_risk_settings(
             )
 
         if not _update_response_confirmed(response):
-            if margin_mode == DESIRED_MARGIN_MODE and _cross_margin_not_allowed(response):
+            if margin_mode == DESIRED_MARGIN_MODE and _should_try_isolated_fallback(response):
                 primary_failure = _mask_response(response)
-                fallback_warning = "cross margin unsupported; using isolated margin for this market"
+                fallback_warning = _isolated_fallback_warning(response)
                 continue
             message = "Hyperliquid leverage update did not return confirmed ok status"
             _mark_failed(row, REASON_CONFIRMATION_UNKNOWN, message, now=now, response=response)
@@ -808,6 +809,37 @@ async def _load_or_create_row(
     )
     if row is not None:
         return row
+    if hasattr(db, "execute"):
+        insert_stmt = (
+            pg_insert(MarketRiskSetting)
+            .values(
+                execution_venue=ExecutionVenue.HYPERLIQUID.value,
+                account_address=account_address,
+                dex=dex,
+                canonical_coin=canonical_coin_value,
+                desired_margin_mode=DESIRED_MARGIN_MODE,
+                status=STATUS_UNKNOWN,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    MarketRiskSetting.execution_venue,
+                    MarketRiskSetting.account_address,
+                    MarketRiskSetting.dex,
+                    MarketRiskSetting.canonical_coin,
+                ]
+            )
+        )
+        await db.execute(insert_stmt)
+        row = await db.scalar(
+            select(MarketRiskSetting)
+            .where(MarketRiskSetting.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+            .where(MarketRiskSetting.account_address == account_address)
+            .where(MarketRiskSetting.dex == dex)
+            .where(func.upper(MarketRiskSetting.canonical_coin) == str(canonical_coin_value).upper())
+            .limit(1)
+        )
+        if row is not None:
+            return row
     row = MarketRiskSetting(
         execution_venue=ExecutionVenue.HYPERLIQUID.value,
         account_address=account_address,
@@ -937,6 +969,23 @@ def _cross_margin_not_allowed(value: Any) -> bool:
     if isinstance(value, dict):
         text = str(_mask_response(value)).lower()
     return "cross margin is not allowed" in text or "cross margin not allowed" in text
+
+
+def _invalid_leverage_value(value: Any) -> bool:
+    text = str(value).lower()
+    if isinstance(value, dict):
+        text = str(_mask_response(value)).lower()
+    return "invalid leverage value" in text
+
+
+def _should_try_isolated_fallback(value: Any) -> bool:
+    return _cross_margin_not_allowed(value) or _invalid_leverage_value(value)
+
+
+def _isolated_fallback_warning(value: Any) -> str:
+    if _cross_margin_not_allowed(value):
+        return "cross margin unsupported; using isolated margin for this market"
+    return "cross leverage rejected; using isolated margin for this market"
 
 
 def _mark_failed(

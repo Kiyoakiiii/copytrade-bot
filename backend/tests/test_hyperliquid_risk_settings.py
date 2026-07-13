@@ -228,6 +228,41 @@ def test_cross_unsupported_falls_back_to_isolated_before_open() -> None:
     assert db.row.status == STATUS_CONFIRMED
 
 
+def test_invalid_cross_leverage_falls_back_to_isolated_before_open() -> None:
+    db = FakeDb()
+    client = SequenceUpdateClient(
+        universe=[{"name": "SKHY", "maxLeverage": 10}],
+        responses=[
+            {"status": "err", "response": "Invalid leverage value"},
+            {"status": "ok"},
+        ],
+    )
+
+    result = asyncio.run(
+        ensure_hyperliquid_market_risk_settings(
+            db=db,
+            client=client,
+            settings=settings(),
+            account_address="0x" + "5" * 40,
+            dex="xyz",
+            canonical_coin_value="xyz:SKHY",
+            action_type="OPEN",
+        )
+    )
+
+    assert result.is_ok is True
+    assert result.status == STATUS_CONFIRMED
+    assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
+    assert result.desired_margin_mode == FALLBACK_MARGIN_MODE
+    assert result.desired_leverage == 4
+    assert result.effective_leverage == 4
+    assert result.warning == "cross leverage rejected; using isolated margin for this market"
+    assert client.updates == [
+        {"coin": "xyz:SKHY", "leverage": 10, "is_cross": True},
+        {"coin": "xyz:SKHY", "leverage": 4, "is_cross": False},
+    ]
+
+
 def test_isolated_fallback_uses_market_max_when_below_four() -> None:
     db = FakeDb()
     client = SequenceUpdateClient(
