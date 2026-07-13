@@ -89,11 +89,14 @@ from app.services.low_latency_watcher import (
     _snapshot_recovery_fill,
     _snapshot_recovery_should_use_allocation_checkpoint,
     _stale_zero_allocation_reason,
+    _blocked_order_preserves_allocation_state,
+    _preserve_allocation_state_after_blocked_order,
     _trace_set,
     _unmanaged_follower_position_blocker,
     _unmanaged_follower_position_from_stale_follower_state,
     _unmanaged_follower_position_qtys,
     _unmanaged_follower_position_reduce_safe,
+    _unresolved_blockers_retryable,
     derive_leader_post_position_from_fill,
     build_fill_event,
     parse_fill_to_market_key,
@@ -145,6 +148,7 @@ def fill_event(
     start_position: str = "0",
     direction: str = "Open Long",
     price: str = "100",
+    size: str = "1",
 ) -> FillEvent:
     canonical = f"{dex}:{coin}" if dex else coin
     return FillEvent(
@@ -160,12 +164,12 @@ def fill_event(
         ),
         side=side,
         price=Decimal(price),
-        size=Decimal("1"),
+        size=Decimal(size),
         time_ms=1_700_000_000_000,
         raw={
             "coin": canonical,
             "px": price,
-            "sz": "1",
+            "sz": size,
             "side": side,
             "time": 1_700_000_000_000,
             "startPosition": start_position,
@@ -5602,6 +5606,141 @@ def test_unresolved_order_query_is_scoped_to_leader_and_market() -> None:
     assert "execution_orders.canonical_coin" in text
 
 
+def test_unresolved_blockers_retry_only_transient_pending_statuses() -> None:
+    assert _unresolved_blockers_retryable([ExecutionOrder(status="PENDING_SUBMIT")]) is True
+    assert _unresolved_blockers_retryable([ExecutionOrder(status="SUBMITTING")]) is True
+    assert _unresolved_blockers_retryable([ExecutionOrder(status="UNKNOWN")]) is False
+
+
+def test_blocked_order_preserves_allocation_checkpoint_without_advancing_leader_size() -> None:
+    allocation = allocation_record(qty="115.03", notional="1740.01211")
+    allocation.last_leader_position_size = Decimal("1452.06")
+    allocation.last_leader_position_notional = Decimal("21964.15920")
+    allocation.last_source_fill_id = "prev-fill"
+    now = datetime.now(timezone.utc)
+
+    assert _blocked_order_preserves_allocation_state(
+        allocation=allocation,
+        blockers=["unresolved UNKNOWN/PENDING auto order exists for this leader/market"],
+        pending_open_activation_reason=None,
+        pending_open=False,
+        deferred_reduce=False,
+        direction_guard_preserve_allocation=False,
+    )
+
+    _preserve_allocation_state_after_blocked_order(allocation, now=now)
+
+    assert allocation.status == "OPEN"
+    assert allocation.target_notional == Decimal("1740.01211")
+    assert allocation.allocated_notional == Decimal("1740.01211")
+    assert allocation.last_leader_position_size == Decimal("1452.06")
+    assert allocation.last_leader_position_notional == Decimal("21964.15920")
+    assert allocation.last_source_fill_id == "prev-fill"
+    assert allocation.last_reconcile_at == now
+
+
+def test_unresolved_blocked_fill_does_not_advance_allocation_checkpoint() -> None:
+    allocation = allocation_record(qty="115.03", notional="1740.01211")
+    allocation.id = 424
+    allocation.hyperliquid_coin = "TRB"
+    allocation.dex = ""
+    allocation.canonical_coin = "TRB"
+    allocation.venue_symbol = "TRB"
+    allocation.last_leader_position_size = Decimal("1452.06")
+    allocation.last_leader_position_notional = Decimal("21964.15920")
+    allocation.last_leader_account_value = Decimal("250000")
+    allocation.copy_multiplier = Decimal("1")
+    allocation.last_source_fill_id = "trb-prev"
+
+    class BlockedEngine(FillDrivenExecutionEngine):
+        async def _resolved_account_value(self, *args, **kwargs):
+            return {
+                "account_value_used_for_sizing": Decimal("19809.569955"),
+                "available_collateral_used_for_margin_check": Decimal("19809.569955"),
+                "account_value_source": "test",
+                "account_abstraction_mode": "test",
+            }
+
+        async def _load_allocation(self, db, current_leader, market, side):
+            return allocation if side == PositionSide.LONG else None
+
+        async def _load_market_owner_allocation(self, db, market):
+            return None
+
+        async def _allocation_sum_qtys_with_latest_reconcile(self, db, market):
+            return ({PositionSide.LONG: Decimal("115.03"), PositionSide.SHORT: Decimal("0")}, datetime.now(timezone.utc))
+
+        async def _opposite_aggregate_allocation_exists(self, db, current_leader, market, side):
+            return False
+
+        async def _load_market_leverage_plan(self, db, market, leader_position):
+            return SimpleNamespace(
+                ok_for_open=True,
+                reason=None,
+                effective_leverage=10,
+                max_leverage=10,
+                sz_decimals=2,
+                asset_id=0,
+                market_meta={"asset_id": 0, "szDecimals": 2, "maxLeverage": 10, "minOrderValue": "10"},
+            )
+
+        async def _kill_switch_active(self, db):
+            return False
+
+    engine = BlockedEngine(
+        settings=settings(trading_enabled=True, hyperliquid_trading_enabled=True),
+        info_client=NoopInfoClient(),
+        execution_client=TimeoutExecutionClient(),
+        price_cache=LowLatencyPriceCache(stale_ms=2_000),
+    )
+    unresolved = ExecutionOrder(
+        source_type="AUTO_COPY",
+        status="UNKNOWN",
+        leader_address=("0x" + "1" * 40).lower(),
+        dex="",
+        canonical_coin="TRB",
+    )
+    db = FakeSession(rows=[unresolved])
+    fill = fill_event(
+        coin="TRB",
+        asset_id=0,
+        price="15.13",
+        size="318.68",
+        start_position="1452.06",
+        direction="Open Long",
+    )
+    base = datetime.now(timezone.utc)
+
+    order = asyncio.run(
+        engine.reconcile_leader_symbol_allocation(
+            db,
+            fill=fill,
+            leader=leader(copy_multiplier=Decimal("1"), fixed_account_value=Decimal("250000"), max_notional_per_trade=None),
+            dedupe_started_at=base,
+            dedupe_done_at=base,
+            debounce_started_at=base,
+            debounce_released_at=base,
+            lock_wait_started_at=base,
+            lock_acquired_at=base,
+            ws_received_at=fill.ws_received_at,
+            submit_order=False,
+        )
+    )
+
+    assert order is not None
+    assert order.status == "BLOCKED"
+    assert "unresolved UNKNOWN/PENDING" in (order.error_message or "")
+    assert allocation.status == "OPEN"
+    assert allocation.target_notional == Decimal("1740.01211")
+    assert allocation.allocated_notional == Decimal("1740.01211")
+    assert allocation.last_leader_position_size == Decimal("1452.06")
+    assert allocation.last_source_fill_id == "trb-prev"
+    events = [item for item in db.added if isinstance(item, AllocationEvent)]
+    assert events[-1].action == "BLOCKED_PRESERVE"
+    assert events[-1].after_notional == Decimal("1740.01211")
+    assert events[-1].metadata_json["allocation_state_preserved"] is True
+
+
 def test_account_ratio_formula_used_for_fill_driven_sizing() -> None:
     target = calculate_target_notional_by_account_ratio(
         leader_account_value=Decimal("10000"),
@@ -5755,6 +5894,44 @@ def test_order_submit_timeout_marks_unknown_without_retry() -> None:
     assert client.calls == 1
     assert order.status == "UNKNOWN"
     assert order.order_ack_at is not None
+
+
+def test_order_with_submit_marker_is_blocked_before_exchange_resubmit() -> None:
+    client = RestingExecutionClient()
+    engine = FillDrivenExecutionEngine(
+        settings=settings(),
+        info_client=NoopInfoClient(),
+        execution_client=client,
+        price_cache=LowLatencyPriceCache(stale_ms=2_000),
+    )
+    order = ExecutionOrder(
+        allocation_id=1,
+        leader_address="0x" + "1" * 40,
+        source_coin="BTC",
+        execution_venue="HYPERLIQUID",
+        side="BUY",
+        position_side="LONG",
+        order_action="OPEN",
+        order_type=HYPERLIQUID_AUTO_COPY_ORDER_TYPE,
+        quantity=Decimal("1"),
+        estimated_price=Decimal("100"),
+        cloid="0x" + "1" * 32,
+        status="PENDING_SUBMIT",
+        dry_run=False,
+        order_submit_started_at=datetime.now(timezone.utc),
+        pre_trade_checklist=valid_order_validator_payload(),
+    )
+    db = FakeSession()
+
+    asyncio.run(engine._submit_hyperliquid_order(db, order, fill_event(), reduce_only=False))
+
+    assert client.orders == []
+    assert order.status == "BLOCKED"
+    assert "already has submit markers" in (order.error_message or "")
+    assert any(
+        isinstance(item, RiskEvent) and item.event_type == "INTERNAL_SUBMIT_GUARD_BLOCKED_ORDER"
+        for item in db.added
+    )
 
 
 def test_local_sdk_payload_error_marks_failed_not_unknown() -> None:

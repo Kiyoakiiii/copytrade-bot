@@ -116,6 +116,10 @@ RECENT_CLOSED_ALLOCATION_STATE_LAG_WINDOW = timedelta(minutes=5)
 FIXED_LEADER_ACCOUNT_VALUE_SOURCE = "LEADER_CONFIG_FIXED"
 FIXED_LEADER_ACCOUNT_VALUE_MODE = "FIXED_REFERENCE"
 LOCAL_POSITION_PROJECTION_SOURCES = {"LOCAL_FILL_PROJECTION", "ORDER_RECOVERY_PROJECTION"}
+UNRESOLVED_SAME_MARKET_ORDER_BLOCKER = "unresolved UNKNOWN/PENDING auto order exists for this leader/market"
+UNRESOLVED_SAME_MARKET_RETRY_ATTEMPTS = 3
+UNRESOLVED_SAME_MARKET_RETRY_SLEEP_SECONDS = 0.05
+TRANSIENT_UNRESOLVED_ORDER_STATUSES = {"PENDING_SUBMIT", "SUBMITTING"}
 
 
 @dataclass(frozen=True)
@@ -944,25 +948,13 @@ class FillDrivenExecutionEngine:
         if price_entry is None or not order_price_fresh:
             blockers.append("price cache stale or missing for fill market")
 
-        unresolved_rows = (
-            await db.execute(
-                unresolved_same_market_order_query(
-                    leader_address=leader.leader_address,
-                    dex=fill.market.dex,
-                    canonical_coin=fill.market.canonical_coin,
-                )
-            )
-        ).scalars().all()
-        blocking_unresolved = [
-            row
-            for row in unresolved_rows
-            if not (
-                str(row.status or "").upper() in {"PENDING_SUBMIT", "SUBMITTING"}
-                and self.pending_intents.has_active_order(row)
-            )
-        ]
+        blocking_unresolved = await self._blocking_unresolved_same_market_orders(
+            db,
+            leader_address=leader.leader_address,
+            market=fill.market,
+        )
         if blocking_unresolved:
-            blockers.append("unresolved UNKNOWN/PENDING auto order exists for this leader/market")
+            blockers.append(UNRESOLVED_SAME_MARKET_ORDER_BLOCKER)
 
         account_cache_read_at = datetime.now(timezone.utc)
         follower_value = await self._resolved_account_value(
@@ -1481,6 +1473,14 @@ class FillDrivenExecutionEngine:
             and not blockers
         )
         status = "NOOP" if noop and not blockers else "BLOCKED" if blockers else ("DRY_RUN" if dry_run else "PENDING_SUBMIT")
+        blocked_order_preserves_allocation = _blocked_order_preserves_allocation_state(
+            allocation=current_allocation,
+            blockers=blockers,
+            pending_open_activation_reason=pending_open_activation_reason,
+            pending_open=pending_open,
+            deferred_reduce=deferred_reduce,
+            direction_guard_preserve_allocation=direction_guard_preserve_allocation,
+        )
         if _should_fast_forward_below_min_pending_open_lifecycle(
             allocation=current_allocation,
             transition_plan=transition_plan,
@@ -1684,6 +1684,7 @@ class FillDrivenExecutionEngine:
                 "pending_open_activation_reason": pending_open_activation_reason,
                 "missed_reduce_catchup": missed_reduce_catchup,
                 "fill_direction_guard_reason": fill_direction_guard_reason,
+                "blocked_order_preserves_allocation_state": blocked_order_preserves_allocation,
                 "final_close_min_order_override": final_close_min_order_override,
                 "sizing_guard_error": sizing_guard_error,
                 "reduce_quantity_guard": {
@@ -1814,6 +1815,11 @@ class FillDrivenExecutionEngine:
                     source_fill_id=fill.source_fill_id,
                     now=datetime.now(timezone.utc),
                 )
+            elif blocked_order_preserves_allocation:
+                _preserve_allocation_state_after_blocked_order(
+                    current_allocation,
+                    now=datetime.now(timezone.utc),
+                )
             else:
                 current_allocation.target_notional = state_target_notional
                 current_allocation.last_leader_account_value = leader_account_value
@@ -1875,11 +1881,15 @@ class FillDrivenExecutionEngine:
                 order=order,
                 action="DIRECTION_GUARD_BLOCKED"
                 if direction_guard_preserve_allocation
+                else "BLOCKED_PRESERVE"
+                if blocked_order_preserves_allocation
                 else "DEFERRED_REDUCE"
                 if deferred_reduce
                 else transition_plan.action.value,
                 before_notional=transition_plan.current_allocation_notional,
-                after_notional=state_target_notional,
+                after_notional=Decimal(current_allocation.allocated_notional or 0)
+                if blocked_order_preserves_allocation
+                else state_target_notional,
                 before_qty=Decimal(current_allocation.allocated_qty or 0),
                 after_qty=Decimal(current_allocation.allocated_qty or 0),
                 metadata={
@@ -1892,15 +1902,15 @@ class FillDrivenExecutionEngine:
                     "formula_inputs": transition_plan.formula_inputs,
                     "allocation_mismatch": allocation_mismatch,
                     "allocation_mismatch_state_lag": allocation_mismatch_state_lag,
-                    "allocation_state_preserved": direction_guard_preserve_allocation,
+                    "allocation_state_preserved": direction_guard_preserve_allocation
+                    or blocked_order_preserves_allocation,
                 },
             )
 
         if status == "PENDING_SUBMIT":
             self.pending_intents.reserve(order, current_allocation)
             if submit_order:
-                await self._submit_hyperliquid_order(db, order, fill, reduce_only=reduce_only)
-                await self._apply_allocation_fill(db, order)
+                await self.submit_planned_order(db, order, fill)
         elif blockers:
             db.add(
                 RiskEvent(
@@ -1978,6 +1988,41 @@ class FillDrivenExecutionEngine:
         for order_id in order_ids:
             if int(order_id) not in active:
                 self.pending_intents.release_order_id(int(order_id))
+
+    async def _blocking_unresolved_same_market_orders(
+        self,
+        db: Any,
+        *,
+        leader_address: str,
+        market: MarketKey,
+    ) -> list[ExecutionOrder]:
+        blocking: list[ExecutionOrder] = []
+        for attempt in range(UNRESOLVED_SAME_MARKET_RETRY_ATTEMPTS):
+            unresolved_rows = (
+                await db.execute(
+                    unresolved_same_market_order_query(
+                        leader_address=leader_address,
+                        dex=market.dex,
+                        canonical_coin=market.canonical_coin,
+                    )
+                )
+            ).scalars().all()
+            blocking = [
+                row
+                for row in unresolved_rows
+                if not (
+                    str(row.status or "").upper() in TRANSIENT_UNRESOLVED_ORDER_STATUSES
+                    and self.pending_intents.has_active_order(row)
+                )
+            ]
+            if not blocking:
+                return []
+            if not _unresolved_blockers_retryable(blocking):
+                return blocking
+            if attempt >= UNRESOLVED_SAME_MARKET_RETRY_ATTEMPTS - 1:
+                return blocking
+            await asyncio.sleep(UNRESOLVED_SAME_MARKET_RETRY_SLEEP_SECONDS)
+        return blocking
 
     async def _record_lifecycle_ignored_order(
         self,
@@ -2253,6 +2298,41 @@ class FillDrivenExecutionEngine:
         *,
         reduce_only: bool,
     ) -> None:
+        already_submitted = (
+            order.order_submit_started_at is not None
+            or order.order_submit_done_at is not None
+            or order.order_ack_at is not None
+            or bool(order.order_id)
+            or bool(order.venue_order_id)
+            or bool(order.raw_response)
+        )
+        if already_submitted or (isinstance(db, AsyncSession) and str(order.status or "").upper() != "SUBMITTING"):
+            order.status = "BLOCKED"
+            order.dry_run = True
+            order.error_message = (
+                "INTERNAL_SUBMIT_GUARD: order already has submit markers"
+                if already_submitted
+                else "INTERNAL_SUBMIT_GUARD: order was not claimed before submit"
+            )
+            db.add(
+                RiskEvent(
+                    severity="error",
+                    event_type="INTERNAL_SUBMIT_GUARD_BLOCKED_ORDER",
+                    symbol=fill.market.canonical_coin,
+                    leader_address=order.leader_address,
+                    message=order.error_message,
+                    metadata_json={
+                        "order_id": order.id,
+                        "source_fill_id": order.source_fill_id,
+                        "cloid": order.cloid,
+                        "status": order.status,
+                        "already_submitted": already_submitted,
+                    },
+                )
+            )
+            await self._close_zero_allocation_after_unsubmitted_open(db, order, fill, reason=order.error_message)
+            _set_latency_fields(order)
+            return
         if not order.cloid or not order.estimated_price or order.quantity <= 0:
             order.status = "BLOCKED"
             order.dry_run = True
@@ -6083,6 +6163,12 @@ def unresolved_same_market_order_query(*, leader_address: str, dex: str, canonic
     )
 
 
+def _unresolved_blockers_retryable(rows: list[ExecutionOrder]) -> bool:
+    if not rows:
+        return False
+    return all(str(row.status or "").upper() in TRANSIENT_UNRESOLVED_ORDER_STATUSES for row in rows)
+
+
 def _fills_from_message(channel: str | None, data: Any) -> list[dict[str, Any]]:
     if not isinstance(data, dict):
         return []
@@ -6511,6 +6597,28 @@ def _direction_guard_preserves_allocation(
     return allocation is not None and str(fill_direction_guard_reason or "").startswith("FILL_DIRECTION_GUARD:")
 
 
+def _blocked_order_preserves_allocation_state(
+    *,
+    allocation: LeaderPositionAllocationRecord | None,
+    blockers: list[str],
+    pending_open_activation_reason: str | None,
+    pending_open: bool,
+    deferred_reduce: bool,
+    direction_guard_preserve_allocation: bool,
+) -> bool:
+    if allocation is None or not blockers:
+        return False
+    if (
+        pending_open_activation_reason
+        or pending_open
+        or deferred_reduce
+        or direction_guard_preserve_allocation
+        or _allocation_needs_manual_review(allocation)
+    ):
+        return False
+    return True
+
+
 def _preserve_allocation_state_after_direction_guard(
     allocation: LeaderPositionAllocationRecord,
     *,
@@ -6527,6 +6635,22 @@ def _preserve_allocation_state_after_direction_guard(
     allocation.last_leader_position_size = leader_position_size
     allocation.copy_multiplier = copy_multiplier
     allocation.last_source_fill_id = source_fill_id
+    allocation.last_reconcile_at = now
+    if _allocation_needs_manual_review(allocation):
+        allocation.status = "NEEDS_MANUAL_REVIEW"
+        return
+    if _decimal_from_value(allocation.pending_reduce_qty) and _decimal_from_value(allocation.pending_reduce_qty) > 0:
+        allocation.status = "REDUCING"
+    elif str(allocation.status or "").upper() == "BLOCKED":
+        allocation.status = "OPEN"
+
+
+def _preserve_allocation_state_after_blocked_order(
+    allocation: LeaderPositionAllocationRecord,
+    *,
+    now: datetime,
+) -> None:
+    allocation.target_notional = Decimal(allocation.allocated_notional or 0)
     allocation.last_reconcile_at = now
     if _allocation_needs_manual_review(allocation):
         allocation.status = "NEEDS_MANUAL_REVIEW"
