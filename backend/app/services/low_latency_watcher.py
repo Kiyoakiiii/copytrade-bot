@@ -5913,20 +5913,52 @@ def _coalesce_legacy_same_batch_fills(events: list[FillEvent]) -> tuple[list[Fil
 
 
 def _aggregate_same_order_fills(events: list[FillEvent]) -> tuple[list[FillEvent], list[FillEvent], bool]:
-    groups: dict[tuple[str, str, str, str, str, str], list[int]] = {}
+    selected_by_index: dict[int, FillEvent] = {}
+    skipped: list[FillEvent] = []
+    handled_indexes: set[int] = set()
+    has_order_keys = False
+
+    time_action_groups: dict[tuple[str, ...], list[int]] = {}
+    for idx, event in enumerate(events):
+        key = _same_action_time_key(event)
+        if key is not None:
+            time_action_groups.setdefault(key, []).append(idx)
+
+    for indexes in time_action_groups.values():
+        if len(indexes) <= 1:
+            continue
+        unique_indexes = _unique_order_segment_indexes(events, indexes)
+        if len(unique_indexes) <= 1 or not _can_aggregate_same_action_time_group(events, unique_indexes):
+            continue
+        has_order_keys = True
+        handled_indexes.update(indexes)
+        unique_index_set = set(unique_indexes)
+        skipped.extend(events[idx] for idx in indexes if idx not in unique_index_set)
+        for segment in _same_order_lifecycle_segments(events, unique_indexes):
+            if len(segment) == 1:
+                selected_by_index[segment[0]] = events[segment[0]]
+                continue
+            selected_idx, synthetic = _aggregate_order_segment(events, segment)
+            selected_by_index[selected_idx] = synthetic
+            skipped.extend(events[idx] for idx in segment if idx != selected_idx)
+
+    groups: dict[tuple[str, ...], list[int]] = {}
     passthrough: dict[int, FillEvent] = {}
     for idx, event in enumerate(events):
+        if idx in handled_indexes:
+            continue
         key = _same_order_key(event)
         if key is None:
             passthrough[idx] = event
             continue
         groups.setdefault(key, []).append(idx)
 
-    if not groups:
+    if not groups and not has_order_keys:
         return events, [], False
 
-    selected_by_index: dict[int, FillEvent] = dict(passthrough)
-    skipped: list[FillEvent] = []
+    selected_by_index.update(passthrough)
+    if groups:
+        has_order_keys = True
     for indexes in groups.values():
         unique_indexes = _unique_order_segment_indexes(events, indexes)
         unique_index_set = set(unique_indexes)
@@ -5941,15 +5973,40 @@ def _aggregate_same_order_fills(events: list[FillEvent]) -> tuple[list[FillEvent
             skipped.extend(events[idx] for idx in segment if idx != selected_idx)
 
     selected = [selected_by_index[idx] for idx in range(len(events)) if idx in selected_by_index]
-    return selected, skipped, True
+    return selected, skipped, has_order_keys
 
 
-def _same_order_key(event: FillEvent) -> tuple[str, str, str, str, str, str] | None:
+def _same_action_time_key(event: FillEvent) -> tuple[str, ...] | None:
+    raw = event.raw or {}
+    time_value = raw.get("time") or event.time_ms
+    direction = str(raw.get("dir") or "").strip().lower()
+    side = str(raw.get("side") or event.side or "").upper()
+    if not time_value or not direction or not side:
+        return None
+    return (
+        str(event.leader_address or "").lower(),
+        str(event.market.dex or "").lower(),
+        event.market.canonical_coin.upper(),
+        str(raw.get("coin") or event.market.raw_coin or event.market.coin),
+        side,
+        direction,
+        str(time_value),
+    )
+
+
+def _can_aggregate_same_action_time_group(events: list[FillEvent], indexes: list[int]) -> bool:
+    segment = [events[idx] for idx in indexes]
+    union = _position_interval_union(segment)
+    return union is not None and union[1] == 0
+
+
+def _same_order_key(event: FillEvent) -> tuple[str, ...] | None:
     raw = event.raw or {}
     oid = raw.get("oid")
     order_hash = raw.get("hash")
     if oid is not None:
         return (
+            str(event.leader_address or "").lower(),
             event.market.dex,
             event.market.canonical_coin.upper(),
             str(raw.get("coin") or event.market.raw_coin or event.market.coin),
@@ -5960,6 +6017,7 @@ def _same_order_key(event: FillEvent) -> tuple[str, str, str, str, str, str] | N
     if order_hash is None:
         return None
     return (
+        str(event.leader_address or "").lower(),
         event.market.dex,
         event.market.canonical_coin.upper(),
         str(raw.get("coin") or event.market.raw_coin or event.market.coin),
@@ -6000,8 +6058,14 @@ def _aggregate_order_segment(events: list[FillEvent], indexes: list[int]) -> tup
     segment = [events[idx] for idx in indexes]
     representative_idx = _order_segment_representative_index(events, indexes)
     representative = events[representative_idx]
-    total_size = sum(abs(event.size) for event in segment)
-    total_notional = sum(abs(event.price * event.size) for event in segment)
+    raw_total_size = sum(abs(event.size) for event in segment)
+    raw_total_notional = sum(abs(event.price * event.size) for event in segment)
+    total_size = _effective_segment_size(segment, raw_total_size)
+    total_notional = (
+        raw_total_notional * total_size / raw_total_size
+        if raw_total_size > 0 and total_size > 0
+        else raw_total_notional
+    )
     vwap = total_notional / total_size if total_size > 0 else representative.price
     start_position = _order_segment_start_position(segment)
 
@@ -6022,6 +6086,60 @@ def _aggregate_order_segment(events: list[FillEvent], indexes: list[int]) -> tup
         size=total_size,
         raw=raw,
     )
+
+
+def _effective_segment_size(segment: list[FillEvent], fallback_size: Decimal) -> Decimal:
+    union = _position_interval_union(segment)
+    if union is None:
+        return fallback_size
+    union_size, _gaps = union
+    if union_size > 0 and union_size <= fallback_size + ALLOCATION_TRANSITION_TOLERANCE:
+        return union_size
+    return fallback_size
+
+
+def _position_interval_union(segment: list[FillEvent]) -> tuple[Decimal, int] | None:
+    intervals: list[tuple[Decimal, Decimal]] = []
+    for event in segment:
+        interval = _fill_position_interval(event)
+        if interval is None:
+            return None
+        lo, hi = interval
+        if hi - lo <= ALLOCATION_TRANSITION_TOLERANCE:
+            continue
+        intervals.append((lo, hi))
+    if not intervals:
+        return None
+
+    intervals.sort(key=lambda item: (item[0], item[1]))
+    union_size = Decimal("0")
+    gaps = 0
+    current_lo, current_hi = intervals[0]
+    for lo, hi in intervals[1:]:
+        if lo > current_hi + ALLOCATION_TRANSITION_TOLERANCE:
+            union_size += current_hi - current_lo
+            gaps += 1
+            current_lo, current_hi = lo, hi
+            continue
+        if hi > current_hi:
+            current_hi = hi
+    union_size += current_hi - current_lo
+    return union_size, gaps
+
+
+def _fill_position_interval(event: FillEvent) -> tuple[Decimal, Decimal] | None:
+    start = _decimal_from_value((event.raw or {}).get("startPosition"))
+    if start is None:
+        return None
+    size = abs(event.size)
+    side = str((event.raw or {}).get("side") or event.side or "").upper()
+    if side == "B":
+        after = start + size
+    elif side == "A":
+        after = start - size
+    else:
+        return None
+    return (min(start, after), max(start, after))
 
 
 def _order_segment_representative_index(events: list[FillEvent], indexes: list[int]) -> int:

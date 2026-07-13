@@ -1316,6 +1316,61 @@ def test_same_order_fragments_with_different_hashes_still_aggregate_by_oid() -> 
     assert implied.is_close
 
 
+def test_same_order_overlapping_fragments_use_position_interval_net_size() -> None:
+    leader_addr = "0x" + "1" * 40
+    base = {
+        "coin": "TRB",
+        "side": "A",
+        "time": 1,
+        "oid": 123,
+        "hash": "0xabc",
+        "dir": "Close Long",
+        "px": "15",
+    }
+    events = [
+        build_fill_event(leader_addr, {**base, "tid": 1, "sz": "60", "startPosition": "100"}, is_snapshot=False),
+        build_fill_event(leader_addr, {**base, "tid": 2, "sz": "20", "startPosition": "80"}, is_snapshot=False),
+        build_fill_event(leader_addr, {**base, "tid": 3, "sz": "20", "startPosition": "60"}, is_snapshot=False),
+    ]
+
+    selected, skipped = _coalesce_same_batch_fills(events)
+    implied = derive_leader_post_position_from_fill(selected[0])
+
+    assert len(selected) == 1
+    assert skipped == events[1:]
+    assert selected[0].size == Decimal("60")
+    assert _fill_notional_for_sizing(selected[0]) == Decimal("900")
+    assert implied.is_reduce
+    assert implied.size_after == Decimal("40")
+
+
+def test_same_timestamp_multi_oid_fragments_coalesce_to_net_position_delta() -> None:
+    leader_addr = "0x" + "1" * 40
+    base = {
+        "coin": "TRB",
+        "side": "A",
+        "time": 1,
+        "dir": "Close Long",
+        "px": "15",
+    }
+    events = [
+        build_fill_event(leader_addr, {**base, "oid": 101, "hash": "0xa", "tid": 1, "sz": "40", "startPosition": "100"}, is_snapshot=False),
+        build_fill_event(leader_addr, {**base, "oid": 102, "hash": "0xb", "tid": 2, "sz": "40", "startPosition": "60"}, is_snapshot=False),
+        build_fill_event(leader_addr, {**base, "oid": 101, "hash": "0xa", "tid": 3, "sz": "20", "startPosition": "80"}, is_snapshot=False),
+        build_fill_event(leader_addr, {**base, "oid": 101, "hash": "0xa", "tid": 4, "sz": "20", "startPosition": "60"}, is_snapshot=False),
+    ]
+
+    selected, skipped = _coalesce_same_batch_fills(events)
+    implied = derive_leader_post_position_from_fill(selected[0])
+
+    assert len(selected) == 1
+    assert skipped == events[1:]
+    assert selected[0].size == Decimal("80")
+    assert _fill_notional_for_sizing(selected[0]) == Decimal("1200")
+    assert implied.is_reduce
+    assert implied.size_after == Decimal("20")
+
+
 def test_same_batch_close_then_reopen_keeps_lifecycle_boundary() -> None:
     leader_addr = "0x" + "1" * 40
     base = {"coin": "xyz:GME", "side": "B", "time": 1, "oid": 123, "hash": "0xabc"}
@@ -3134,6 +3189,43 @@ def test_runtime_coalesces_ten_close_fragments_from_same_leader_order() -> None:
         expected_size="1000.0",
         expected_implied_flag="is_close",
     )
+
+
+def test_runtime_coalesces_same_timestamp_multi_oid_fragments_to_one_submit_event() -> None:
+    address = ("0x" + "1" * 40).lower()
+    watcher = HyperliquidLowLatencyWatcher(
+        settings=settings(),
+        info_client=NoopInfoClient(),
+        execution_client=TimeoutExecutionClient(),
+        db_session_factory=FakeSessionFactory(),
+    )
+    engine = RecordingEngine()
+    watcher.engine = engine
+    watcher.state.active_leaders[address] = leader(address)
+    watcher.state.ws_leaders.add(address)
+    base = {
+        "coin": "TRB",
+        "side": "A",
+        "time": 1,
+        "dir": "Close Long",
+        "px": "15",
+    }
+    fills = [
+        {**base, "oid": 101, "hash": "0xa", "tid": 1, "sz": "40", "startPosition": "100"},
+        {**base, "oid": 102, "hash": "0xb", "tid": 2, "sz": "40", "startPosition": "60"},
+        {**base, "oid": 101, "hash": "0xa", "tid": 3, "sz": "20", "startPosition": "80"},
+        {**base, "oid": 101, "hash": "0xa", "tid": 4, "sz": "20", "startPosition": "60"},
+    ]
+    message = {"channel": "userFills", "data": {"user": address, "fills": fills}}
+
+    asyncio.run(handle_ws_and_drain(watcher, message))
+
+    expected_events = [build_fill_event(address, fill, is_snapshot=False) for fill in fills]
+    assert [call[0].source_fill_id for call in engine.calls] == [expected_events[0].source_fill_id]
+    assert [call[0].size for call in engine.calls] == [Decimal("80")]
+    assert engine.recorded_source_fills == [
+        (event.source_fill_id, True) for event in expected_events[1:]
+    ]
 
 
 def test_runtime_does_not_coalesce_different_order_fills() -> None:
