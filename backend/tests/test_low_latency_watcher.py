@@ -1673,6 +1673,24 @@ def test_fill_direction_guard_allows_reduce_fill_close_when_plan_targets_flat_le
     )
 
 
+def test_fill_direction_guard_allows_live_flat_close_without_formula_inputs() -> None:
+    reduce_fill = SimpleNamespace(
+        confidence="HIGH",
+        is_open=False,
+        is_increase=False,
+        is_reduce=True,
+        is_close=False,
+        is_flip=False,
+    )
+    live_flat_close_plan = SimpleNamespace(
+        action=AllocationTransitionAction.CLOSE,
+        target_notional=Decimal("0"),
+        formula_inputs=None,
+    )
+
+    assert _fill_direction_action_block_reason(reduce_fill, live_flat_close_plan) is None
+
+
 def test_fill_direction_guard_blocks_open_or_increase_fill_from_reducing() -> None:
     open_fill = SimpleNamespace(confidence="HIGH", is_open=True, is_increase=False, is_reduce=False, is_close=False, is_flip=False)
     increase_fill = SimpleNamespace(confidence="HIGH", is_open=False, is_increase=True, is_reduce=False, is_close=False, is_flip=False)

@@ -8003,9 +8003,16 @@ def _fill_direction_action_block_reason(
 def _transition_plan_targets_flat_leader(transition_plan: Any | None) -> bool:
     if transition_plan is None:
         return False
+    action = getattr(transition_plan, "action", None)
+    action_value = action.value if hasattr(action, "value") else str(action or "").upper()
     target_notional = _decimal_from_value(getattr(transition_plan, "target_notional", None))
     if target_notional is None or abs(target_notional) > ALLOCATION_TRANSITION_TOLERANCE:
         return False
+    if action_value in {
+        AllocationTransitionAction.CLOSE.value,
+        AllocationTransitionAction.FLIP_CLOSE_FIRST.value,
+    }:
+        return True
     formula_inputs = getattr(transition_plan, "formula_inputs", None)
     if not isinstance(formula_inputs, dict):
         return False
