@@ -5934,6 +5934,50 @@ def test_order_with_submit_marker_is_blocked_before_exchange_resubmit() -> None:
     )
 
 
+def test_submit_started_marker_is_persisted_before_exchange_call() -> None:
+    marker_state = {"persisted": False}
+
+    class MarkerClient(FilledExecutionClient):
+        async def place_market_order(self, **kwargs):
+            assert marker_state["persisted"] is True
+            return await super().place_market_order(**kwargs)
+
+    class MarkerEngine(FillDrivenExecutionEngine):
+        async def _persist_submit_started_marker(self, db, order, started_at):
+            await super()._persist_submit_started_marker(db, order, started_at)
+            marker_state["persisted"] = True
+
+    client = MarkerClient()
+    engine = MarkerEngine(
+        settings=settings(),
+        info_client=NoopInfoClient(),
+        execution_client=client,
+        price_cache=LowLatencyPriceCache(stale_ms=2_000),
+    )
+    order = ExecutionOrder(
+        allocation_id=1,
+        leader_address="0x" + "1" * 40,
+        source_coin="BTC",
+        execution_venue="HYPERLIQUID",
+        side="BUY",
+        position_side="LONG",
+        order_action="OPEN",
+        order_type=HYPERLIQUID_AUTO_COPY_ORDER_TYPE,
+        quantity=Decimal("1"),
+        estimated_price=Decimal("100"),
+        cloid="0x" + "1" * 32,
+        status="PENDING_SUBMIT",
+        dry_run=False,
+        pre_trade_checklist=valid_order_validator_payload(),
+    )
+
+    asyncio.run(engine._submit_hyperliquid_order(FakeSession(), order, fill_event(), reduce_only=False))
+
+    assert marker_state["persisted"] is True
+    assert order.order_submit_started_at is not None
+    assert client.orders
+
+
 def test_local_sdk_payload_error_marks_failed_not_unknown() -> None:
     client = LocalSdkPayloadErrorExecutionClient()
     engine = FillDrivenExecutionEngine(

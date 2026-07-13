@@ -2479,10 +2479,7 @@ class FillDrivenExecutionEngine:
                 "limit_px": payload["limit_px"],
             })
             exchange_submit_started_at = datetime.now(timezone.utc)
-            order.order_submit_started_at = exchange_submit_started_at
-            order.binance_order_submit_at = exchange_submit_started_at
-            _trace_set(order, "order_submit_started_at", exchange_submit_started_at)
-            _trace_set(order, "exchange_submit_call_started_at", exchange_submit_started_at)
+            await self._persist_submit_started_marker(db, order, exchange_submit_started_at)
             response = await self.execution_client.place_market_order(**payload, _latency_trace=submit_trace)
             exchange_submit_done_at = datetime.now(timezone.utc)
             _trace_merge_submit_trace(order, submit_trace)
@@ -2574,6 +2571,35 @@ class FillDrivenExecutionEngine:
             await self._close_allocation_after_absent_reduce_rejection(db, order, fill)
             await self._close_zero_allocation_after_unsubmitted_open(db, order, fill, reason=order.error_message or order.status)
         _set_latency_fields(order)
+
+    async def _persist_submit_started_marker(
+        self,
+        db: Any,
+        order: ExecutionOrder,
+        started_at: datetime,
+    ) -> None:
+        if isinstance(db, AsyncSession) and order.id is not None:
+            result = await db.execute(
+                update(ExecutionOrder)
+                .where(ExecutionOrder.id == order.id)
+                .where(ExecutionOrder.status == "SUBMITTING")
+                .where(ExecutionOrder.order_submit_started_at.is_(None))
+                .values(
+                    order_submit_started_at=started_at,
+                    binance_order_submit_at=started_at,
+                    request_payload_masked=order.request_payload_masked,
+                    pre_trade_checklist=order.pre_trade_checklist,
+                    updated_at=started_at,
+                )
+                .returning(ExecutionOrder.id)
+            )
+            if result.scalar_one_or_none() is None:
+                raise AutoCopyOrderPolicyError("INTERNAL_SUBMIT_GUARD: submit-start marker was not claimable")
+            await db.commit()
+        order.order_submit_started_at = started_at
+        order.binance_order_submit_at = started_at
+        _trace_set(order, "order_submit_started_at", started_at)
+        _trace_set(order, "exchange_submit_call_started_at", started_at)
 
     async def _guard_reduce_submit_against_live_allocation(
         self,

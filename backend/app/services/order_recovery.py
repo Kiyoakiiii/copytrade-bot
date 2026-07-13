@@ -16,12 +16,15 @@ from app.services.execution_router import ExecutionVenue
 from app.services.hyperliquid_execution import HyperliquidExecutionClient, recover_hyperliquid_unknown_order
 from app.services.allocation_fill import apply_filled_order_to_allocation_state
 from app.services.low_latency_watcher import (
+    _close_zero_allocation_lifecycle,
     _hyperliquid_error,
     _hyperliquid_fill_qty_price,
     _hyperliquid_oid,
     _hyperliquid_status,
+    _open_like_action,
     _record_allocation_event,
     _set_latency_fields,
+    _stale_zero_allocation_reason,
 )
 
 log = structlog.get_logger(__name__)
@@ -112,21 +115,13 @@ async def recover_unresolved_orders(
                         )
                         if _is_hyperliquid_unknown_oid(response):
                             now = datetime.now(timezone.utc)
-                            if _should_resubmit_unstarted_hyperliquid_order(order):
-                                response = await _resubmit_unstarted_hyperliquid_order(client, order)
-                            elif _should_defer_unknown_oid_recovery(
+                            if _should_defer_unknown_oid_recovery(
                                 order,
                                 now=now,
                                 unknown_oid_resubmit_age_seconds=unknown_oid_resubmit_age_seconds,
                             ):
                                 order.error_message = "Hyperliquid cloid not found yet; recovery deferred"
                                 continue
-                            elif _should_resubmit_stale_unknown_oid_order(
-                                order,
-                                now=now,
-                                unknown_oid_resubmit_age_seconds=unknown_oid_resubmit_age_seconds,
-                            ):
-                                response = await _resubmit_unstarted_hyperliquid_order(client, order)
                     except Exception as exc:
                         db.add(
                             RiskEvent(
@@ -141,6 +136,12 @@ async def recover_unresolved_orders(
                         continue
                     previous_executed_qty = order.executed_qty or Decimal("0")
                     _apply_hyperliquid_order_response(order, response)
+                    if _is_hyperliquid_unknown_oid(response):
+                        await _close_zero_allocation_after_unsubmitted_hyperliquid_open(
+                            db,
+                            order,
+                            reason=order.error_message,
+                        )
                     await _apply_hyperliquid_allocation_delta(
                         db,
                         order,
@@ -218,7 +219,7 @@ def _apply_hyperliquid_order_response(order: ExecutionOrder, response: dict[str,
     if status == "UNKNOWNOID":
         order.status = "FAILED"
         order.order_finalized_at = datetime.now(timezone.utc)
-        order.error_message = "Hyperliquid order not found by cloid; treating as not submitted"
+        order.error_message = "Hyperliquid order not found by cloid; auto resubmit disabled to prevent duplicate order"
         return
     if status == "ORDER":
         status = "SUBMITTED"
@@ -286,13 +287,7 @@ def _is_hyperliquid_unknown_oid(response: dict[str, Any]) -> bool:
 
 
 def _should_resubmit_unstarted_hyperliquid_order(order: ExecutionOrder) -> bool:
-    return (
-        order.execution_venue == ExecutionVenue.HYPERLIQUID.value
-        and str(order.status or "").upper() in {"PENDING_SUBMIT", "SUBMITTING"}
-        and order.order_submit_started_at is None
-        and bool(order.cloid)
-        and bool((order.pre_trade_checklist or {}).get("order_validator") or order.request_payload_masked)
-    )
+    return False
 
 
 def _should_defer_unknown_oid_recovery(
@@ -301,7 +296,7 @@ def _should_defer_unknown_oid_recovery(
     now: datetime,
     unknown_oid_resubmit_age_seconds: float | None,
 ) -> bool:
-    if not _can_resubmit_hyperliquid_order(order):
+    if not _can_defer_hyperliquid_unknown_oid(order):
         return False
     if _unknown_oid_resubmit_age(order, now=now) >= _unknown_oid_resubmit_threshold(
         unknown_oid_resubmit_age_seconds
@@ -316,21 +311,13 @@ def _should_resubmit_stale_unknown_oid_order(
     now: datetime,
     unknown_oid_resubmit_age_seconds: float | None,
 ) -> bool:
-    if not _can_resubmit_hyperliquid_order(order):
-        return False
-    status = str(order.status or "").upper()
-    if status not in RECOVERY_ORDER_STATUSES:
-        return False
-    return _unknown_oid_resubmit_age(order, now=now) >= _unknown_oid_resubmit_threshold(
-        unknown_oid_resubmit_age_seconds
-    )
+    return False
 
 
-def _can_resubmit_hyperliquid_order(order: ExecutionOrder) -> bool:
+def _can_defer_hyperliquid_unknown_oid(order: ExecutionOrder) -> bool:
     return (
         order.execution_venue == ExecutionVenue.HYPERLIQUID.value
         and bool(order.cloid)
-        and bool((order.pre_trade_checklist or {}).get("order_validator") or order.request_payload_masked)
     )
 
 
@@ -353,37 +340,65 @@ async def _resubmit_unstarted_hyperliquid_order(
     client: HyperliquidExecutionClient,
     order: ExecutionOrder,
 ) -> dict[str, Any]:
-    payload = _hyperliquid_recovery_order_payload(order)
+    raise RuntimeError("Hyperliquid auto-copy recovery resubmit is disabled to prevent duplicate orders")
+
+
+async def _close_zero_allocation_after_unsubmitted_hyperliquid_open(
+    db: Any,
+    order: ExecutionOrder,
+    *,
+    reason: str | None,
+) -> None:
+    if not _open_like_action(order.order_action) or bool(order.reduce_only) or order.allocation_id is None:
+        return
+    allocation = await _load_allocation_for_recovery_update(db, order.allocation_id)
+    stale_reason = _stale_zero_allocation_reason(allocation)
+    if not stale_reason:
+        return
     now = datetime.now(timezone.utc)
-    order.order_submit_started_at = now
-    order.binance_order_submit_at = now
-    response = await client.place_market_order(**payload)
-    done = datetime.now(timezone.utc)
-    order.order_submit_done_at = done
-    order.order_ack_at = done
-    order.binance_order_ack_at = done
-    return response
-
-
-def _hyperliquid_recovery_order_payload(order: ExecutionOrder) -> dict[str, Any]:
-    validator_payload = ((order.pre_trade_checklist or {}).get("order_validator") or {})
-    payload = dict(validator_payload.get("payload_masked") or order.request_payload_masked or {})
-    if not payload:
-        raise ValueError("Hyperliquid recovery cannot resubmit order without stored payload")
-    coin = payload.get("coin") or order.hyperliquid_coin or order.venue_symbol or order.source_coin
-    cloid = payload.get("cloid") or order.cloid
-    if not coin or not cloid:
-        raise ValueError("Hyperliquid recovery payload missing coin or cloid")
-    return {
-        "coin": str(coin),
-        "dex": str(payload.get("dex") if payload.get("dex") is not None else order.dex or "").lower(),
-        "is_buy": bool(payload.get("is_buy")),
-        "sz": Decimal(str(payload.get("sz") or payload.get("quantity") or order.quantity)),
-        "limit_px": Decimal(str(payload.get("limit_px") or order.estimated_price or order.price)),
-        "order_type": {"limit": {"tif": "Ioc"}},
-        "reduce_only": bool(payload.get("reduce_only", order.reduce_only)),
-        "cloid": str(cloid),
-    }
+    close_reason = f"{stale_reason}: {reason or 'Hyperliquid order was not submitted'}"
+    before_notional = Decimal(allocation.allocated_notional or 0)
+    before_qty = Decimal(allocation.allocated_qty or 0)
+    _close_zero_allocation_lifecycle(allocation, reason=close_reason, now=now)
+    db.add(
+        AllocationEvent(
+            allocation_id=allocation.id,
+            execution_order_id=order.id,
+            leader_id=allocation.leader_id,
+            leader_address=allocation.leader_address,
+            source_fill_id=order.source_fill_id,
+            execution_venue=allocation.execution_venue,
+            dex=allocation.dex,
+            canonical_coin=allocation.canonical_coin,
+            position_side=allocation.position_side,
+            action="RECOVERY_ZERO_OPEN_ABORTED",
+            before_notional=before_notional,
+            after_notional=Decimal("0"),
+            before_qty=before_qty,
+            after_qty=Decimal("0"),
+            metadata_json={
+                "order_id": order.id,
+                "order_status": order.status,
+                "order_action": order.order_action,
+                "reason": close_reason,
+            },
+        )
+    )
+    db.add(
+        RiskEvent(
+            severity="warning",
+            event_type="RECOVERY_ZERO_OPEN_ABORTED",
+            symbol=order.canonical_coin or order.hyperliquid_coin or order.venue_symbol,
+            leader_address=order.leader_address,
+            message=close_reason,
+            metadata_json={
+                "allocation_id": allocation.id,
+                "order_id": order.id,
+                "source_fill_id": order.source_fill_id,
+                "cloid": order.cloid,
+            },
+        )
+    )
 
 
 async def _apply_allocation_delta(

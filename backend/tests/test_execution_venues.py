@@ -33,7 +33,6 @@ from app.services.hyperliquid_execution import (
 from app.services.order_recovery import (
     _apply_hyperliquid_allocation_delta,
     _apply_hyperliquid_order_response,
-    _hyperliquid_recovery_order_payload,
     _recovery_order_due,
     _resubmit_unstarted_hyperliquid_order,
     _should_defer_unknown_oid_recovery,
@@ -1283,7 +1282,7 @@ def test_hyperliquid_recovery_unknown_oid_marks_failed() -> None:
     assert order.order_finalized_at is not None
 
 
-def test_hyperliquid_unstarted_pending_submit_recovery_resubmits_same_cloid() -> None:
+def test_hyperliquid_unstarted_pending_submit_recovery_does_not_resubmit() -> None:
     cloid = "0x" + "6" * 32
     order = ExecutionOrder(
         execution_venue=ExecutionVenue.HYPERLIQUID.value,
@@ -1315,13 +1314,10 @@ def test_hyperliquid_unstarted_pending_submit_recovery_resubmits_same_cloid() ->
         },
     )
 
-    assert _should_resubmit_unstarted_hyperliquid_order(order) is True
-    payload = _hyperliquid_recovery_order_payload(order)
-    assert payload["cloid"] == cloid
-    assert payload["reduce_only"] is True
+    assert _should_resubmit_unstarted_hyperliquid_order(order) is False
 
 
-def test_hyperliquid_recovery_resubmit_records_submit_timestamps() -> None:
+def test_hyperliquid_recovery_resubmit_is_disabled() -> None:
     class Client:
         def __init__(self):
             self.payload = None
@@ -1372,12 +1368,13 @@ def test_hyperliquid_recovery_resubmit_records_submit_timestamps() -> None:
     )
 
     client = Client()
-    response = asyncio.run(_resubmit_unstarted_hyperliquid_order(client, order))
 
-    assert client.payload["cloid"] == cloid
-    assert response["status"] == "ok"
-    assert order.order_submit_started_at is not None
-    assert order.order_ack_at is not None
+    with pytest.raises(RuntimeError, match="resubmit is disabled"):
+        asyncio.run(_resubmit_unstarted_hyperliquid_order(client, order))
+
+    assert client.payload is None
+    assert order.order_submit_started_at is None
+    assert order.order_ack_at is None
 
 
 def test_hyperliquid_recovery_filled_response_updates_reduce_allocation() -> None:
@@ -1732,7 +1729,7 @@ def test_unknown_oid_recovery_defers_fresh_started_order() -> None:
     assert _should_resubmit_stale_unknown_oid_order(order, now=now, unknown_oid_resubmit_age_seconds=30) is False
 
 
-def test_unknown_oid_recovery_resubmits_stale_started_order_with_same_cloid() -> None:
+def test_unknown_oid_recovery_never_resubmits_stale_started_order() -> None:
     cloid = "0x" + "9" * 32
     order = ExecutionOrder(
         execution_venue=ExecutionVenue.HYPERLIQUID.value,
@@ -1756,8 +1753,7 @@ def test_unknown_oid_recovery_resubmits_stale_started_order_with_same_cloid() ->
     now = datetime.now(timezone.utc)
 
     assert _should_defer_unknown_oid_recovery(order, now=now, unknown_oid_resubmit_age_seconds=30) is False
-    assert _should_resubmit_stale_unknown_oid_order(order, now=now, unknown_oid_resubmit_age_seconds=30) is True
-    assert _hyperliquid_recovery_order_payload(order)["cloid"] == cloid
+    assert _should_resubmit_stale_unknown_oid_order(order, now=now, unknown_oid_resubmit_age_seconds=30) is False
 
 
 def test_unknown_oid_recovery_does_not_resubmit_without_payload() -> None:
