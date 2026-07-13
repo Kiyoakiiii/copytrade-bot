@@ -1635,6 +1635,40 @@ def test_fill_direction_guard_blocks_reduce_or_close_fill_from_opening() -> None
     assert _fill_direction_action_block_reason(close_fill, close_plan) is None
 
 
+def test_fill_direction_guard_allows_reduce_fill_close_when_plan_targets_flat_leader() -> None:
+    reduce_fill = SimpleNamespace(
+        confidence="HIGH",
+        is_open=False,
+        is_increase=False,
+        is_reduce=True,
+        is_close=False,
+        is_flip=False,
+    )
+    flat_close_plan = SimpleNamespace(
+        action=AllocationTransitionAction.CLOSE,
+        target_notional=Decimal("0"),
+        formula_inputs={
+            "leader_side": "FLAT",
+            "leader_position_size": "0",
+            "leader_position_notional": "0",
+        },
+    )
+    partial_close_plan = SimpleNamespace(
+        action=AllocationTransitionAction.CLOSE,
+        target_notional=Decimal("10"),
+        formula_inputs={
+            "leader_side": "SHORT",
+            "leader_position_size": "-100",
+            "leader_position_notional": "-1000",
+        },
+    )
+
+    assert _fill_direction_action_block_reason(reduce_fill, flat_close_plan) is None
+    assert "partial reduce fill cannot close" in (
+        _fill_direction_action_block_reason(reduce_fill, partial_close_plan) or ""
+    )
+
+
 def test_fill_direction_guard_blocks_open_or_increase_fill_from_reducing() -> None:
     open_fill = SimpleNamespace(confidence="HIGH", is_open=True, is_increase=False, is_reduce=False, is_close=False, is_flip=False)
     increase_fill = SimpleNamespace(confidence="HIGH", is_open=False, is_increase=True, is_reduce=False, is_close=False, is_flip=False)
@@ -3730,7 +3764,7 @@ def test_allocation_sync_closes_flat_leader_close_intent_when_follower_actual_is
     assert allocation.allocated_notional == Decimal("0")
     assert allocation.target_notional == Decimal("0")
     events = [item for item in db.added if isinstance(item, AllocationEvent)]
-    assert events[-1].action == "ALLOCATION_AUTO_CLOSED_FLAT_LEADER_AND_FOLLOWER"
+    assert events[-1].action == "AUTO_CLOSE_LEADER_FOLLOWER_FLAT"
 
 
 def test_allocation_sync_keeps_flat_leader_close_intent_reducing_when_follower_residual_exists() -> None:
@@ -3788,7 +3822,7 @@ def test_allocation_sync_keeps_flat_leader_close_intent_reducing_when_follower_r
     assert allocation.allocated_qty == Decimal("50.00000000")
     assert allocation.allocated_notional == Decimal("12.50000000")
     events = [item for item in db.added if isinstance(item, AllocationEvent)]
-    assert events[-1].action == "ALLOCATION_AUTO_SYNCED_FLAT_LEADER_CLOSE_INTENT"
+    assert events[-1].action == "AUTO_SYNC_FLAT_LEADER_CLOSE"
 
 
 def test_allocation_sync_waits_until_leader_flat_after_follower_manually_flattens_active_lifecycle() -> None:
@@ -3884,8 +3918,8 @@ def test_allocation_sync_closes_multiple_same_scope_allocations_when_follower_ac
     assert first.allocated_qty == second.allocated_qty == Decimal("0")
     events = [item for item in db.added if isinstance(item, AllocationEvent)]
     assert [event.action for event in events[:2]] == [
-        "ALLOCATION_AUTO_CLOSED_MULTIPLE_SCOPE_FOLLOWER_FLAT",
-        "ALLOCATION_AUTO_CLOSED_MULTIPLE_SCOPE_FOLLOWER_FLAT",
+        "AUTO_CLOSE_MULTI_SCOPE_FLAT",
+        "AUTO_CLOSE_MULTI_SCOPE_FLAT",
     ]
     baselines = [item for item in db.added if isinstance(item, LeaderPositionBaseline)]
     assert len(baselines) == 1
@@ -6030,13 +6064,14 @@ def test_reduce_only_rejected_when_position_absent_closes_allocation() -> None:
     assert allocation.pending_reduce_qty is None
     assert allocation.last_reconcile_at is not None
     assert any(
-        getattr(item, "action", "") == "ALLOCATION_CLOSED_AFTER_ABSENT_REDUCE_REJECTION"
+        getattr(item, "action", "") == "ABSENT_REDUCE_REJECT_CLOSE"
         for item in db.added
     )
     assert any(
-        getattr(item, "event_type", "") == "ALLOCATION_CLOSED_AFTER_ABSENT_REDUCE_REJECTION"
+        getattr(item, "event_type", "") == "ABSENT_REDUCE_REJECT_CLOSE"
         for item in db.added
     )
+    assert all(len(getattr(item, "action", "")) <= 40 for item in db.added if isinstance(item, AllocationEvent))
 
 
 def test_reduce_only_submit_clamps_qty_to_remaining_allocation() -> None:
@@ -6305,7 +6340,7 @@ def test_recovery_finalized_pending_intent_is_released_before_next_market_plan()
     assert engine.pending_intents.overlay_allocation(allocation).allocated_qty == Decimal("1")
 
 
-def test_submit_queue_key_parallelizes_increases_and_reduces() -> None:
+def test_submit_queue_key_serializes_same_scope_increases_and_reduces() -> None:
     watcher = HyperliquidLowLatencyWatcher(
         settings=settings(),
         info_client=NoopInfoClient(),
@@ -6317,14 +6352,21 @@ def test_submit_queue_key_parallelizes_increases_and_reduces() -> None:
     second_increase = submit_barrier_order(order_id=632, action="INCREASE")
     first_reduce = submit_barrier_order(order_id=633, action="REDUCE", reduce_only=True)
     second_reduce = submit_barrier_order(order_id=634, action="REDUCE", reduce_only=True)
+    other_coin = submit_barrier_order(order_id=635, action="INCREASE")
+    other_coin.canonical_coin = "xyz:OTHER"
+    other_coin.hyperliquid_coin = "OTHER"
 
-    assert watcher._submit_queue_key(event, order=first_increase) != watcher._submit_queue_key(
+    assert watcher._submit_queue_key(event, order=first_increase) == watcher._submit_queue_key(
         event,
         order=second_increase,
     )
-    assert watcher._submit_queue_key(event, order=first_reduce) != watcher._submit_queue_key(
+    assert watcher._submit_queue_key(event, order=first_reduce) == watcher._submit_queue_key(
         event,
         order=second_reduce,
+    )
+    assert watcher._submit_queue_key(event, order=first_increase) != watcher._submit_queue_key(
+        event,
+        order=other_coin,
     )
 
 

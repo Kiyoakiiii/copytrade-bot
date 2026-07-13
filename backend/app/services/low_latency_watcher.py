@@ -2740,7 +2740,7 @@ class FillDrivenExecutionEngine:
                 dex=allocation.dex,
                 canonical_coin=allocation.canonical_coin,
                 position_side=allocation.position_side,
-                action="ALLOCATION_CLOSED_AFTER_ABSENT_REDUCE_REJECTION",
+                action="ABSENT_REDUCE_REJECT_CLOSE",
                 before_notional=before_notional,
                 after_notional=Decimal("0"),
                 before_qty=before_qty,
@@ -2756,7 +2756,7 @@ class FillDrivenExecutionEngine:
         db.add(
             RiskEvent(
                 severity="warning",
-                event_type="ALLOCATION_CLOSED_AFTER_ABSENT_REDUCE_REJECTION",
+                event_type="ABSENT_REDUCE_REJECT_CLOSE",
                 symbol=fill.market.canonical_coin,
                 leader_address=order.leader_address,
                 message=(
@@ -4078,7 +4078,7 @@ class HyperliquidLowLatencyWatcher:
                         await self._close_allocation_after_follower_flat(
                             db,
                             allocation=allocation,
-                            event_type="ALLOCATION_AUTO_CLOSED_MULTIPLE_SCOPE_FOLLOWER_FLAT",
+                            event_type="AUTO_CLOSE_MULTI_SCOPE_FLAT",
                             message=(
                                 "multiple allocations shared a follower scope, but follower actual position is flat; "
                                 "closed stale allocation to prevent residual lifecycle reuse"
@@ -4401,7 +4401,7 @@ class HyperliquidLowLatencyWatcher:
             allocation.target_notional = Decimal("0")
             allocation.status = "CLOSED"
             _clear_deferred_reduce(allocation)
-            event_type = "ALLOCATION_AUTO_CLOSED_FLAT_LEADER_AND_FOLLOWER"
+            event_type = "AUTO_CLOSE_LEADER_FOLLOWER_FLAT"
             message = "flat leader close-intent allocation auto-closed after follower actual position became flat"
         elif abs(actual_qty - before_qty) > ALLOCATION_TRANSITION_TOLERANCE:
             allocation.allocated_qty = _q(actual_qty)
@@ -4413,7 +4413,7 @@ class HyperliquidLowLatencyWatcher:
                 allocation.allocated_notional = before_notional
             allocation.target_notional = Decimal("0")
             allocation.status = "REDUCING"
-            event_type = "ALLOCATION_AUTO_SYNCED_FLAT_LEADER_CLOSE_INTENT"
+            event_type = "AUTO_SYNC_FLAT_LEADER_CLOSE"
             message = "flat leader close-intent allocation synced down to actual follower residual; target remains zero"
         else:
             return False
@@ -5036,8 +5036,7 @@ class HyperliquidLowLatencyWatcher:
             (_open_like_action(order.order_action) and not bool(order.reduce_only))
             or _reduce_like_action(order.order_action)
         ):
-            unique = order.id or order.cloid or order.source_fill_id or order_id or id(order)
-            return f"{base}:fast:{unique}"
+            return f"{base}:serial"
         unique = order_id if order is None else None
         return f"{base}:serial" if unique is None else f"{base}:fast:{unique}"
 
@@ -7847,7 +7846,27 @@ def _fill_direction_action_block_reason(
         fill_implied_position,
         action_value,
         allow_missed_reduce_catchup=allow_missed_reduce_catchup,
+        allow_reduce_fill_close=_transition_plan_targets_flat_leader(transition_plan),
     )
+
+
+def _transition_plan_targets_flat_leader(transition_plan: Any | None) -> bool:
+    if transition_plan is None:
+        return False
+    target_notional = _decimal_from_value(getattr(transition_plan, "target_notional", None))
+    if target_notional is None or abs(target_notional) > ALLOCATION_TRANSITION_TOLERANCE:
+        return False
+    formula_inputs = getattr(transition_plan, "formula_inputs", None)
+    if not isinstance(formula_inputs, dict):
+        return False
+    leader_side = str(formula_inputs.get("leader_side") or "").upper()
+    leader_size = _decimal_from_value(formula_inputs.get("leader_position_size"))
+    leader_notional = _decimal_from_value(formula_inputs.get("leader_position_notional"))
+    if leader_side == PositionSide.FLAT.value:
+        return True
+    if leader_size is not None and abs(leader_size) <= ALLOCATION_TRANSITION_TOLERANCE:
+        return True
+    return leader_notional is not None and abs(leader_notional) <= ALLOCATION_TRANSITION_TOLERANCE
 
 
 def _fill_is_reduce_or_close(fill_implied_position: Any | None) -> bool:
@@ -7913,6 +7932,7 @@ def _fill_direction_action_value_block_reason(
     action_value: str,
     *,
     allow_missed_reduce_catchup: bool = False,
+    allow_reduce_fill_close: bool = False,
 ) -> str | None:
     action_value = str(action_value or "").upper()
     if action_value in {AllocationTransitionAction.NOOP.value, AllocationTransitionAction.BLOCK.value}:
@@ -7941,7 +7961,11 @@ def _fill_direction_action_value_block_reason(
 
     if (is_reduce or is_close) and action_value in open_actions:
         return "FILL_DIRECTION_GUARD: leader reduce/close fill cannot create or increase follower position"
-    if is_reduce and action_value in {AllocationTransitionAction.CLOSE.value, AllocationTransitionAction.FLIP_CLOSE_FIRST.value}:
+    if (
+        is_reduce
+        and action_value in {AllocationTransitionAction.CLOSE.value, AllocationTransitionAction.FLIP_CLOSE_FIRST.value}
+        and not allow_reduce_fill_close
+    ):
         return "FILL_DIRECTION_GUARD: leader partial reduce fill cannot close follower allocation"
     if is_close and action_value == AllocationTransitionAction.REDUCE.value:
         return "FILL_DIRECTION_GUARD: leader close fill must close follower allocation"
