@@ -22,7 +22,10 @@ from app.models import (
     LeaderPositionAllocationRecord,
     LeaderPositionBaseline,
 )
-from app.tasks.leader_state_poller import account_state_cache_status
+from app.tasks.leader_state_poller import (
+    account_state_cache_status,
+    monitoring_account_state_stale_seconds,
+)
 
 router = APIRouter(tags=["stream"])
 
@@ -70,7 +73,10 @@ async def _dashboard_event_generator(request: Request, settings: AppSettings):
                 snapshot = await build_dashboard_realtime_payload(
                     db=db,
                     settings=settings,
-                    state_refresh=await account_state_cache_status(settings),
+                    state_refresh=await account_state_cache_status(
+                        settings,
+                        max_age_seconds=monitoring_account_state_stale_seconds(settings),
+                    ),
                 )
             changed = _changed_components(last_components, components)
             for event_type, payload in _events_for_change(changed, snapshot):

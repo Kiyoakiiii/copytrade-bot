@@ -42,6 +42,26 @@ _refresh_lock = asyncio.Lock()
 _refresh_task: asyncio.Task | None = None
 _refresh_started_at: datetime | None = None
 _last_refresh_error: str | None = None
+MONITORING_STATE_STALE_FLOOR_SECONDS = 30
+
+
+def monitoring_account_state_stale_seconds(settings: Settings) -> int:
+    """Freshness window for cached UI snapshots, not live order validation.
+
+    A complete account-state pass makes multiple sequential exchange requests
+    across every enabled DEX and leader.  The live-trading freshness threshold
+    is deliberately much tighter, but applying it to a monitoring snapshot
+    falsely marks rows near the beginning of a healthy poll as stale and makes
+    read-only pages queue redundant refresh work.
+    """
+
+    hot_path_seconds = max(1, int(settings.account_state_stale_seconds or 1))
+    poll_seconds = max(1, int(settings.account_state_poll_seconds or 1))
+    return max(
+        MONITORING_STATE_STALE_FLOOR_SECONDS,
+        hot_path_seconds,
+        poll_seconds * 2,
+    )
 
 
 async def run_leader_state_poller(settings: Settings, *, interval_seconds: int | None = None) -> None:

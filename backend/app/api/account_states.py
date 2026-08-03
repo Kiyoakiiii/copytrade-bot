@@ -31,7 +31,15 @@ from app.services.leader_config import (
 )
 from app.services.execution_router import ExecutionVenue
 from app.services.hyperliquid_dex import HyperliquidDexRegistry, canonical_coin, dex_display_name, mask_address
-from app.tasks.leader_state_poller import schedule_account_state_refresh_if_stale
+from app.services.watcher_status import (
+    watcher_active_leaders_by_scope,
+    watcher_execution_scope,
+    watcher_statuses_by_scope,
+)
+from app.tasks.leader_state_poller import (
+    monitoring_account_state_stale_seconds,
+    schedule_account_state_refresh_if_stale,
+)
 
 router = APIRouter(prefix="/account-states", tags=["account-states"])
 
@@ -156,7 +164,10 @@ async def leader_account_states(
     settings: AppSettings,
     include_closed: bool = Query(False),
 ):
-    await schedule_account_state_refresh_if_stale(settings)
+    await schedule_account_state_refresh_if_stale(
+        settings,
+        max_age_seconds=monitoring_account_state_stale_seconds(settings),
+    )
     leaders = (await db.execute(active_leaders_statement())).scalars().all()
     return await _leader_state_payloads(db, leaders, settings=settings, include_closed=include_closed)
 
@@ -169,7 +180,10 @@ async def leader_account_state(
     settings: AppSettings,
     include_closed: bool = Query(False),
 ):
-    await schedule_account_state_refresh_if_stale(settings)
+    await schedule_account_state_refresh_if_stale(
+        settings,
+        max_age_seconds=monitoring_account_state_stale_seconds(settings),
+    )
     leader = await db.get(LeaderConfig, leader_id)
     if not leader:
         raise HTTPException(status_code=404, detail="leader not found")
@@ -191,6 +205,7 @@ async def _leader_state_payloads(
     include_allocations: bool = False,
     include_closed: bool = False,
 ) -> list[dict[str, Any]]:
+    monitoring_stale_seconds = monitoring_account_state_stale_seconds(settings)
     state_rows = (
         await db.execute(select(LatestAccountState).where(LatestAccountState.role == LEADER))
     ).scalars().all()
@@ -235,11 +250,14 @@ async def _leader_state_payloads(
         ).scalars().all()
         follower_states_by_dex = {row.dex: row for row in follower_rows}
 
-    watcher_row = await db.get(AppSetting, "watcher_status")
-    watcher_active = {
-        normalize_leader_address(address)
-        for address in ((watcher_row.value or {}).get("active_leaders", []) if watcher_row else [])
-    }
+    watcher_rows = (
+        await db.execute(
+            select(AppSetting).where(AppSetting.key.like("watcher_status%"))
+        )
+    ).scalars().all()
+    watcher_active_by_scope = watcher_active_leaders_by_scope(
+        watcher_statuses_by_scope(watcher_rows)
+    )
     baseline_by_scope = await baselines_by_scope_for_leaders(db, [leader.id for leader in leaders])
     latest_copy_orders = await latest_copy_orders_by_market(db, leaders)
 
@@ -258,7 +276,7 @@ async def _leader_state_payloads(
             account_state_payload(
                 row,
                 positions_by_state.get(row.id, []),
-                stale_seconds=settings.account_state_stale_seconds,
+                stale_seconds=monitoring_stale_seconds,
                 include_closed=include_closed,
                 extra=_account_abstraction_fields(leader_abstraction, dex=row.dex),
             )
@@ -267,11 +285,17 @@ async def _leader_state_payloads(
         base = account_state_payload(
             state,
             [],
-            stale_seconds=settings.account_state_stale_seconds,
+            stale_seconds=monitoring_stale_seconds,
             include_closed=include_closed,
             extra={
                 "leader": _leader_config_payload(leader),
-                "watcher_status": "active" if address in watcher_active else "not_subscribed",
+                "watcher_status": "active"
+                if address
+                in watcher_active_by_scope.get(
+                    watcher_execution_scope(leader.hyperliquid_vault_address),
+                    set(),
+                )
+                else "not_subscribed",
                 "dex_states": dex_state_payloads,
                 "dexStates": dex_state_payloads,
                 **_account_abstraction_fields(leader_abstraction, dex=state.dex if state else ""),
@@ -548,7 +572,13 @@ async def _account_state_payloads_for_address(
     extra_for_each: dict[str, Any] | None = None,
     account_abstraction: dict[str, Any] | None = None,
     include_closed: bool = False,
+    stale_seconds: int | None = None,
 ) -> list[dict[str, Any]]:
+    effective_stale_seconds = (
+        int(stale_seconds)
+        if stale_seconds is not None
+        else int(settings.account_state_stale_seconds)
+    )
     states = (
         await db.execute(
             select(LatestAccountState)
@@ -572,7 +602,7 @@ async def _account_state_payloads_for_address(
         account_state_payload(
             state,
             positions_by_state.get(state.id, []),
-            stale_seconds=settings.account_state_stale_seconds,
+            stale_seconds=effective_stale_seconds,
             include_closed=include_closed,
             extra={**(extra_for_each or {}), **_account_abstraction_fields(account_abstraction, dex=state.dex)},
         )

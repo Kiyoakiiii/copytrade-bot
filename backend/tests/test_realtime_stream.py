@@ -1,8 +1,15 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from app.api.dashboard import _position_with_live_price
 from app.api.stream import dashboard_data_version, sse_event
+from app.core.config import Settings
+from app.services.watcher_status import (
+    watcher_active_leaders_by_scope,
+    watcher_statuses_by_scope,
+)
+from app.tasks.leader_state_poller import monitoring_account_state_stale_seconds
 
 
 def _event_data(raw: str) -> dict:
@@ -49,6 +56,37 @@ def test_dashboard_data_version_changes_when_component_changes() -> None:
     first = dashboard_data_version({"orders": "1", "accounts": "1"})
     second = dashboard_data_version({"orders": "2", "accounts": "1"})
     assert first != second
+
+
+def test_dashboard_watcher_subscriptions_remain_isolated_by_execution_account() -> None:
+    subaccount = "0x" + "a" * 40
+    main_leader = "0x" + "1" * 40
+    sub_leader = "0x" + "2" * 40
+    rows = [
+        SimpleNamespace(
+            key="watcher_status",
+            value={"active_leaders": [main_leader]},
+        ),
+        SimpleNamespace(
+            key=f"watcher_status:{subaccount.upper()}",
+            value={"active_leaders": [sub_leader]},
+        ),
+    ]
+
+    active = watcher_active_leaders_by_scope(watcher_statuses_by_scope(rows))
+
+    assert active[""] == {main_leader}
+    assert active[subaccount] == {sub_leader}
+    assert sub_leader not in active[""]
+
+
+def test_dashboard_monitoring_freshness_does_not_reuse_hot_path_threshold() -> None:
+    settings = Settings(
+        account_state_stale_seconds=2,
+        account_state_poll_seconds=5,
+    )
+
+    assert monitoring_account_state_stale_seconds(settings) == 30
 
 
 def test_live_price_cache_updates_dashboard_position_mark_and_notional() -> None:

@@ -20,6 +20,10 @@ from app.services.leader_performance import (
     load_leader_performance_cache,
     load_single_leader_performance_cache,
 )
+from app.services.watcher_status import (
+    watcher_active_leaders_by_scope,
+    watcher_statuses_by_scope,
+)
 from app.services.leader_config import (
     ADDRESS_RE,
     allowed_coins_mode,
@@ -514,18 +518,9 @@ async def _leaders_payload(db: DbSession, leaders: list[LeaderConfig]) -> list[d
             select(AppSetting).where(AppSetting.key.like("watcher_status%"))
         )
     ).scalars().all()
-    watcher_active_by_scope: dict[str, set[str]] = {}
-    for watcher_row in watcher_rows:
-        scope = (
-            watcher_row.key.removeprefix("watcher_status:").lower()
-            if watcher_row.key.startswith("watcher_status:")
-            else ""
-        )
-        value = watcher_row.value if isinstance(watcher_row.value, dict) else {}
-        watcher_active_by_scope[scope] = {
-            normalize_leader_address(address)
-            for address in value.get("active_leaders", [])
-        }
+    watcher_active_by_scope = watcher_active_leaders_by_scope(
+        watcher_statuses_by_scope(watcher_rows)
+    )
 
     return [
         _leader_payload(

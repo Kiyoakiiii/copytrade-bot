@@ -51,7 +51,16 @@ from app.services.leader_config import (
     normalize_leader_address,
 )
 from app.services.live_readiness import small_live_start_checklist
-from app.tasks.leader_state_poller import account_state_cache_status, schedule_account_state_refresh_if_stale
+from app.services.watcher_status import (
+    watcher_active_leaders_by_scope,
+    watcher_execution_scope,
+    watcher_statuses_by_scope,
+)
+from app.tasks.leader_state_poller import (
+    account_state_cache_status,
+    monitoring_account_state_stale_seconds,
+    schedule_account_state_refresh_if_stale,
+)
 
 router = APIRouter(tags=["dashboard"])
 
@@ -88,7 +97,10 @@ async def dashboard(_: CurrentUser, db: DbSession, settings: AppSettings):
 
 @router.get("/dashboard/realtime")
 async def dashboard_realtime(_: CurrentUser, db: DbSession, settings: AppSettings):
-    state_refresh = await schedule_account_state_refresh_if_stale(settings)
+    state_refresh = await schedule_account_state_refresh_if_stale(
+        settings,
+        max_age_seconds=monitoring_account_state_stale_seconds(settings),
+    )
     return await build_dashboard_realtime_payload(db=db, settings=settings, state_refresh=state_refresh)
 
 
@@ -99,12 +111,22 @@ async def build_dashboard_realtime_payload(
     state_refresh: dict[str, object] | None = None,
 ) -> dict[str, object]:
     if state_refresh is None:
-        state_refresh = await account_state_cache_status(settings)
+        state_refresh = await account_state_cache_status(
+            settings,
+            max_age_seconds=monitoring_account_state_stale_seconds(settings),
+        )
     response_at = datetime.now(timezone.utc)
+    monitoring_stale_seconds = monitoring_account_state_stale_seconds(settings)
     risk = await get_risk_setting(db)
     kill_switch = bool(risk.get("kill_switch", False))
-    watcher_row = await db.get(AppSetting, "watcher_status")
-    watcher_status = watcher_row.value if watcher_row else {}
+    watcher_rows = (
+        await db.execute(
+            select(AppSetting).where(AppSetting.key.like("watcher_status%"))
+        )
+    ).scalars().all()
+    watcher_status_by_scope = watcher_statuses_by_scope(watcher_rows)
+    watcher_active_by_scope = watcher_active_leaders_by_scope(watcher_status_by_scope)
+    watcher_status = watcher_status_by_scope.get("", {})
     follower_migration_row = await db.get(AppSetting, FOLLOWER_RUNTIME_IDENTITY_KEY)
     follower_migration = public_follower_migration_payload(
         follower_migration_row.value if follower_migration_row else None
@@ -129,6 +151,7 @@ async def build_dashboard_realtime_payload(
             settings=settings,
             extra_for_each={"configured": True},
             account_abstraction=follower_abstraction,
+            stale_seconds=monitoring_stale_seconds,
         )
         if follower_address
         else []
@@ -150,7 +173,7 @@ async def build_dashboard_realtime_payload(
     follower = account_state_payload(
         follower_state,
         follower_positions,
-        stale_seconds=settings.account_state_stale_seconds,
+        stale_seconds=monitoring_stale_seconds,
         extra={
             "configured": bool(follower_address),
             "dex_states": follower_dex_states,
@@ -202,10 +225,6 @@ async def build_dashboard_realtime_payload(
         )
     ).scalars().all()
 
-    watcher_active = {
-        normalize_leader_address(address)
-        for address in (watcher_status.get("active_leaders", []) if watcher_status else [])
-    }
     latest_copy_orders = await latest_copy_orders_by_market(db, leaders)
     leader_payloads = []
     for leader in leaders:
@@ -217,7 +236,7 @@ async def build_dashboard_realtime_payload(
             account_state_payload(
                 row,
                 positions_by_state.get(row.id, []),
-                stale_seconds=settings.account_state_stale_seconds,
+                stale_seconds=monitoring_stale_seconds,
                 extra=_account_abstraction_fields(leader_abstraction, dex=row.dex),
             )
             for row in states
@@ -225,7 +244,7 @@ async def build_dashboard_realtime_payload(
         payload = account_state_payload(
             state,
             [],
-            stale_seconds=settings.account_state_stale_seconds,
+            stale_seconds=monitoring_stale_seconds,
             extra={
                 "leader": {
                     "id": leader.id,
@@ -241,7 +260,13 @@ async def build_dashboard_realtime_payload(
                 },
                 "dex_states": dex_state_payloads,
                 "dexStates": dex_state_payloads,
-                "watcher_status": "active" if address in watcher_active else "not_subscribed",
+                "watcher_status": "active"
+                if address
+                in watcher_active_by_scope.get(
+                    watcher_execution_scope(leader.hyperliquid_vault_address),
+                    set(),
+                )
+                else "not_subscribed",
                 **_account_abstraction_fields(leader_abstraction, dex=state.dex if state else ""),
             },
         )
