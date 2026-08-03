@@ -28,6 +28,7 @@ from app.services.leader_config import (
     normalize_blocked_symbols_for_storage,
     soft_delete_leader,
     watcher_consistency,
+    watcher_consistency_by_execution_scope,
 )
 from app.services.startup_config_validator import _leader_checks
 
@@ -152,6 +153,47 @@ def test_watcher_consistency_reports_missing_and_stale_subscriptions() -> None:
     assert result["watcher_active_leaders_count"] == 1
     assert result["leaders_not_subscribed"] == ["0x" + "1" * 40]
     assert result["subscribed_but_disabled_or_deleted"] == ["0x" + "2" * 40]
+
+
+def test_watcher_consistency_requires_leader_subscription_on_exact_execution_scope() -> None:
+    subaccount = "0x" + "a" * 40
+    main_leader = leader(id=1, leader_address="0x" + "1" * 40)
+    sub_leader = leader(
+        id=2,
+        leader_address="0x" + "2" * 40,
+        hyperliquid_vault_address=subaccount,
+    )
+
+    healthy = watcher_consistency_by_execution_scope(
+        leaders=[main_leader, sub_leader],
+        watcher_active_by_scope={
+            "": [main_leader.leader_address],
+            subaccount: [sub_leader.leader_address],
+        },
+    )
+
+    assert healthy["leaders_not_subscribed"] == []
+    assert healthy["subscribed_but_disabled_or_deleted"] == []
+    assert healthy["watcher_active_leaders_count"] == 2
+
+    wrong_account = watcher_consistency_by_execution_scope(
+        leaders=[main_leader, sub_leader],
+        watcher_active_by_scope={
+            "": [main_leader.leader_address, sub_leader.leader_address],
+            subaccount: [],
+        },
+    )
+
+    assert wrong_account["leaders_not_subscribed"] == [sub_leader.leader_address]
+    assert wrong_account["subscribed_but_disabled_or_deleted"] == [
+        sub_leader.leader_address
+    ]
+    assert wrong_account["leaders_not_subscribed_scoped"] == [
+        {
+            "execution_scope": subaccount,
+            "leader_address": sub_leader.leader_address,
+        }
+    ]
 
 
 def test_normalized_payload_empty_allowlist_does_not_default_btc_eth_sol() -> None:

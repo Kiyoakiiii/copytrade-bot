@@ -216,6 +216,60 @@ def watcher_consistency(
     }
 
 
+def watcher_consistency_by_execution_scope(
+    *,
+    leaders: Iterable[Any],
+    watcher_active_by_scope: dict[str, Iterable[str]],
+) -> dict[str, Any]:
+    """Compare subscriptions as ``(execution account, leader)`` pairs.
+
+    A flat address union is unsafe once subaccounts exist: a leader subscribed
+    by the wrong account would look healthy even though its orders would route
+    incorrectly.  The public response keeps the legacy address lists while
+    also exposing scoped details for diagnosis.
+    """
+
+    db_enabled = {
+        (
+            str(getattr(leader, "hyperliquid_vault_address", "") or "")
+            .strip()
+            .lower(),
+            normalize_leader_address(leader.leader_address),
+        )
+        for leader in leaders
+        if bool(getattr(leader, "enabled", False))
+        and not is_leader_deleted(leader)
+    }
+    watcher_active = {
+        (str(scope or "").strip().lower(), normalize_leader_address(address))
+        for scope, addresses in watcher_active_by_scope.items()
+        for address in addresses
+        if address
+    }
+    missing = sorted(db_enabled - watcher_active)
+    unexpected = sorted(watcher_active - db_enabled)
+
+    def details(rows: list[tuple[str, str]]) -> list[dict[str, str]]:
+        return [
+            {
+                "execution_scope": scope,
+                "leader_address": address,
+            }
+            for scope, address in rows
+        ]
+
+    return {
+        "db_enabled_leaders_count": len(db_enabled),
+        "watcher_active_leaders_count": len(watcher_active),
+        "leaders_not_subscribed": sorted({address for _scope, address in missing}),
+        "subscribed_but_disabled_or_deleted": sorted(
+            {address for _scope, address in unexpected}
+        ),
+        "leaders_not_subscribed_scoped": details(missing),
+        "subscribed_but_disabled_or_deleted_scoped": details(unexpected),
+    }
+
+
 def decimal_to_string(value: Decimal | None) -> str | None:
     if value is None:
         return None

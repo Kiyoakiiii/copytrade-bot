@@ -71,7 +71,7 @@ from app.services.leader_config import (
     decimal_to_string,
     is_coin_allowed,
     normalize_leader_address,
-    watcher_consistency,
+    watcher_consistency_by_execution_scope,
 )
 from app.services.live_readiness import small_live_start_checklist
 from app.services.market_coverage import build_hyperliquid_market_coverage
@@ -185,6 +185,128 @@ def _mapping_status_allows_trading(row: Any) -> bool:
     return bool(_row_value(row, "enabled", False)) and status not in {"BLOCKED", "DISABLED", "MISSING"}
 
 
+def _aggregate_watcher_statuses(
+    statuses: list[dict[str, Any]],
+    *,
+    required_scopes_present: bool,
+) -> dict[str, Any]:
+    """Build a fail-closed health view across main and subaccount watchers."""
+
+    if not statuses or not required_scopes_present:
+        return {
+            "mode": "disconnected",
+            "source": "multi_account_low_latency_watchers",
+            "low_latency_watcher_running": False,
+            "websocket_connected": False,
+            "ready_for_low_latency_live": False,
+            "active_leaders": [],
+            "ws_leaders": [],
+            "poll_fallback_leaders": [],
+            "poll_fallback_count": 0,
+            "leader_user_fills_subscribed_count": 0,
+            "dex_price_cache_status": {},
+        }
+
+    def union_list(key: str) -> list[str]:
+        return sorted(
+            {
+                normalize_leader_address(value)
+                for status in statuses
+                for value in status.get(key, [])
+                if value
+            }
+        )
+
+    def all_true(key: str) -> bool:
+        return all(bool(status.get(key)) for status in statuses)
+
+    subscribed_by_dex: dict[str, int] = {}
+    for status in statuses:
+        for dex, count in (status.get("subscribed_leaders_by_dex") or {}).items():
+            subscribed_by_dex[str(dex or "")] = (
+                subscribed_by_dex.get(str(dex or ""), 0) + int(count or 0)
+            )
+
+    price_by_dex: dict[str, dict[str, Any]] = {}
+    all_price_dexes = {
+        str(dex or "")
+        for status in statuses
+        for dex in (status.get("dex_price_cache_status") or {})
+    }
+    for dex in sorted(all_price_dexes):
+        items = [
+            (status.get("dex_price_cache_status") or {}).get(dex)
+            for status in statuses
+        ]
+        present_items = [item for item in items if isinstance(item, dict)]
+        merged = dict(present_items[0]) if present_items else {}
+        merged["fresh"] = bool(
+            len(present_items) == len(statuses)
+            and all(bool(item.get("fresh")) for item in present_items)
+        )
+        ages = [
+            int(item["age_ms"])
+            for item in present_items
+            if item.get("age_ms") is not None
+        ]
+        if ages:
+            merged["age_ms"] = max(ages)
+        price_by_dex[dex] = merged
+
+    ws_leaders = union_list("ws_leaders")
+    poll_fallback_leaders = union_list("poll_fallback_leaders")
+    last_ws_ages = [
+        int(status["last_ws_event_age_ms"])
+        for status in statuses
+        if status.get("last_ws_event_age_ms") is not None
+    ]
+    return {
+        "mode": "websocket" if all_true("websocket_connected") else "disconnected",
+        "source": "multi_account_low_latency_watchers",
+        "low_latency_watcher_running": all_true("low_latency_watcher_running"),
+        "low_latency_primary": all_true("low_latency_primary"),
+        "low_latency_ready": all_true("low_latency_ready"),
+        "websocket_connected": all_true("websocket_connected"),
+        "ready_for_low_latency_live": all_true("ready_for_low_latency_live"),
+        "active_leaders": union_list("active_leaders"),
+        "ws_leaders": ws_leaders,
+        "poll_fallback_leaders": poll_fallback_leaders,
+        "poll_fallback_count": len(poll_fallback_leaders),
+        "leader_user_fills_subscribed_count": sum(
+            int(status.get("leader_user_fills_subscribed_count") or 0)
+            for status in statuses
+        ),
+        "subscribed_leaders_by_dex": subscribed_by_dex,
+        "follower_order_updates_subscribed": all_true(
+            "follower_order_updates_subscribed"
+        ),
+        "follower_user_events_subscribed": all_true(
+            "follower_user_events_subscribed"
+        ),
+        "follower_user_fills_subscribed": all_true(
+            "follower_user_fills_subscribed"
+        ),
+        "dex_price_cache_status": price_by_dex,
+        "default_dex_price_cache_fresh": bool(
+            price_by_dex.get("", {}).get("fresh")
+        ),
+        "xyz_price_cache_fresh": bool(
+            price_by_dex.get("xyz", {}).get("fresh")
+        ),
+        "last_ws_event_at": min(
+            (
+                str(status.get("last_ws_event_at"))
+                for status in statuses
+                if status.get("last_ws_event_at")
+            ),
+            default=None,
+        ),
+        "last_ws_event_age_ms": max(last_ws_ages) if last_ws_ages else None,
+        "last_event_time_by_dex": {},
+        "recent_submit_latency": {},
+    }
+
+
 @router.get("/preflight")
 async def preflight(_: CurrentUser, db: DbSession, settings: AppSettings):
     response_at = datetime.now(timezone.utc)
@@ -242,24 +364,70 @@ async def preflight(_: CurrentUser, db: DbSession, settings: AppSettings):
     startup_config = startup_config_row.value if startup_config_row else None
     risk_settings_startup_row = await db.get(AppSetting, "risk_settings_startup_status")
     risk_settings_startup_status = risk_settings_startup_row.value if risk_settings_startup_row else None
-    watcher_row = await db.get(AppSetting, "watcher_status")
-    watcher_status = watcher_row.value if watcher_row else {}
+    watcher_rows = (
+        await db.execute(
+            select(AppSetting).where(AppSetting.key.like("watcher_status%"))
+        )
+    ).scalars().all()
+    watcher_rows_by_scope = {
+        (
+            row.key.removeprefix("watcher_status:").lower()
+            if row.key.startswith("watcher_status:")
+            else ""
+        ): row
+        for row in watcher_rows
+    }
+    watcher_status_by_scope = {
+        scope: row.value if isinstance(row.value, dict) else {}
+        for scope, row in watcher_rows_by_scope.items()
+    }
+    watcher_active_by_scope = {
+        scope: {
+            normalize_leader_address(address)
+            for address in status.get("active_leaders", [])
+            if address
+        }
+        for scope, status in watcher_status_by_scope.items()
+    }
+    required_watcher_scopes = {
+        str(leader.hyperliquid_vault_address or "").strip().lower()
+        for leader in leaders
+        if leader.enabled and leader.deleted_at is None
+    }
+    required_watcher_rows_present = all(
+        scope in watcher_rows_by_scope for scope in required_watcher_scopes
+    )
+    required_watcher_statuses = [
+        watcher_status_by_scope[scope]
+        for scope in sorted(required_watcher_scopes)
+        if scope in watcher_status_by_scope
+    ]
+    watcher_status = _aggregate_watcher_statuses(
+        required_watcher_statuses,
+        required_scopes_present=required_watcher_rows_present,
+    )
     follower_migration_row = await db.get(AppSetting, FOLLOWER_RUNTIME_IDENTITY_KEY)
     follower_migration = public_follower_migration_payload(
         follower_migration_row.value if follower_migration_row else None
     )
-    watcher_active_addresses = [
-        normalize_leader_address(address)
-        for address in watcher_status.get("active_leaders", [])
-        if address
+    watcher_status_ages = [
+        _age_seconds(watcher_rows_by_scope[scope].updated_at)
+        for scope in required_watcher_scopes
+        if scope in watcher_rows_by_scope
     ]
-    watcher_status_age = _age_seconds(watcher_row.updated_at) if watcher_row else None
+    watcher_status_age = (
+        max(age for age in watcher_status_ages if age is not None)
+        if required_watcher_rows_present
+        and watcher_status_ages
+        and all(age is not None for age in watcher_status_ages)
+        else None
+    )
     low_latency_fill_ready = bool(
         settings.low_latency_required_for_live and watcher_status.get("ready_for_low_latency_live")
     )
-    watcher_checks = watcher_consistency(
+    watcher_checks = watcher_consistency_by_execution_scope(
         leaders=leaders,
-        watcher_active_addresses=watcher_active_addresses,
+        watcher_active_by_scope=watcher_active_by_scope,
     )
     db_enabled_addresses = active_leader_addresses(leaders)
     follower_address = settings.hyperliquid_follower_account_address()
@@ -448,7 +616,11 @@ async def preflight(_: CurrentUser, db: DbSession, settings: AppSettings):
             else "disabled"
             if not leader.enabled
             else "active"
-            if address in set(watcher_active_addresses)
+            if address
+            in watcher_active_by_scope.get(
+                str(leader.hyperliquid_vault_address or "").strip().lower(),
+                set(),
+            )
             else "not_subscribed"
         )
         status = "OK"
@@ -843,6 +1015,23 @@ async def preflight(_: CurrentUser, db: DbSession, settings: AppSettings):
             "last_ws_event_at": watcher_status.get("last_ws_event_at"),
             "last_ws_event_age_ms": watcher_status.get("last_ws_event_age_ms"),
             "poll_fallback_count": watcher_status.get("poll_fallback_count"),
+            "execution_scopes": {
+                scope: {
+                    "low_latency_watcher_running": bool(
+                        status.get("low_latency_watcher_running")
+                    ),
+                    "websocket_connected": bool(status.get("websocket_connected")),
+                    "ready_for_low_latency_live": bool(
+                        status.get("ready_for_low_latency_live")
+                    ),
+                    "active_leaders": status.get("active_leaders") or [],
+                    "ws_leaders": status.get("ws_leaders") or [],
+                    "status_age": _age_seconds(
+                        watcher_rows_by_scope[scope].updated_at
+                    ),
+                }
+                for scope, status in watcher_status_by_scope.items()
+            },
         },
         "ready_for_live": ready_for_live,
         "blocking_reasons": global_blocking,
