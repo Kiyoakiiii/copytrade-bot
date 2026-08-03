@@ -157,6 +157,7 @@ FILL_OUTCOME_SUBMISSION_UNKNOWN = "SUBMISSION_UNKNOWN"
 FILL_OUTCOME_MANUAL_REVIEW = "MANUAL_REVIEW"
 FILL_OUTCOME_NO_ACTION_REQUIRED = "NO_ACTION_REQUIRED"
 EMERGENCY_KILL_SWITCH_ERROR = "EMERGENCY_KILL_SWITCH: copy trading disabled before exchange submit"
+MANUAL_MARKET_OWNER_BLOCKED = "MANUAL_MARKET_OWNER_BLOCKED"
 LEADER_FILL_BACKFILL_PAGE_SIZE = 2000
 LEADER_FILL_BACKFILL_OVERLAP_MS = 1000
 LEADER_FILL_BACKFILL_RETRY_BASE_SECONDS = 1.0
@@ -382,7 +383,11 @@ def _durable_submit_retry_delay_seconds(retry_count: int) -> float:
 
 
 def _expected_fill_retry(value: Any) -> bool:
-    return _market_serialization_retry(value) or _follower_position_freshness_retry(value)
+    return (
+        _market_serialization_retry(value)
+        or _follower_position_freshness_retry(value)
+        or str(value or "").startswith("MANUAL_FOLLOWER_POSITION_GUARD:")
+    )
 
 
 @dataclass(frozen=True)
@@ -1080,6 +1085,28 @@ class FollowerManualPositionGuard:
             allocation_qty_by_side=allocation_qty_by_side,
             follower_state_at=follower_state_at,
         )
+        follower_qtys = follower_qty_by_side or _empty_position_side_qtys()
+        allocation_qtys = allocation_qty_by_side or _empty_position_side_qtys()
+        follower_flat = all(
+            abs(Decimal(follower_qtys.get(side, 0))) <= ALLOCATION_TRANSITION_TOLERANCE
+            for side in (PositionSide.LONG, PositionSide.SHORT)
+        )
+        allocation_flat = all(
+            abs(Decimal(allocation_qtys.get(side, 0))) <= ALLOCATION_TRANSITION_TOLERANCE
+            for side in (PositionSide.LONG, PositionSide.SHORT)
+        )
+        # A restart can restore a guard after the fill-implied checkpoint has
+        # already come and gone.  Literal follower-flat plus allocation-flat is
+        # an authoritative convergence point, so keeping the guard in that
+        # state can only deadlock the next lifecycle.
+        if (
+            follower_qty_by_side is not None
+            and allocation_qty_by_side is not None
+            and follower_flat
+            and allocation_flat
+        ):
+            self.clear(market)
+            return None
         if entry.position_change_confirmed_at is None:
             return entry
         has_unmanaged = any(qty > ALLOCATION_TRANSITION_TOLERANCE for qty in unmanaged_qty_by_side.values())
@@ -1523,6 +1550,58 @@ class FillDrivenExecutionEngine:
                     price_cache_read_at=early_now,
                     price_cache_read_done_at=early_now,
                 )
+
+        manual_owner_reason = await self._standalone_manual_market_owner_blocker(
+            db,
+            fill.market,
+        )
+        if manual_owner_reason:
+            manual_owner_now = datetime.now(timezone.utc)
+            manual_owner_implied = derive_leader_post_position_from_fill(fill)
+            manual_owner_use_fill_position = _should_use_fill_derived_position(
+                None,
+                fill,
+                manual_owner_implied,
+            )
+            manual_owner_notional = (
+                manual_owner_implied.notional_after_estimate
+                if manual_owner_use_fill_position
+                else None
+            )
+            manual_owner_side = (
+                PositionSide.LONG
+                if manual_owner_notional is not None and manual_owner_notional > 0
+                else PositionSide.SHORT
+                if manual_owner_notional is not None and manual_owner_notional < 0
+                else PositionSide.FLAT
+            )
+            return await self._record_lifecycle_ignored_order(
+                db,
+                fill=fill,
+                leader=leader,
+                reason=manual_owner_reason,
+                target_side_hint=manual_owner_side,
+                leader_position_notional=manual_owner_notional,
+                leader_entry_px=(
+                    manual_owner_implied.entry_px
+                    if manual_owner_use_fill_position
+                    else None
+                ),
+                leader_account_value=_configured_leader_account_value(leader),
+                follower_account_value=None,
+                dedupe_started_at=dedupe_started_at,
+                dedupe_done_at=dedupe_done_at,
+                debounce_started_at=debounce_started_at,
+                debounce_released_at=debounce_released_at,
+                lock_wait_started_at=lock_wait_started_at,
+                lock_acquired_at=lock_acquired_at,
+                ws_received_at=ws_received_at,
+                decision_started_at=decision_started_at,
+                account_cache_read_at=manual_owner_now,
+                account_cache_read_done_at=manual_owner_now,
+                price_cache_read_at=manual_owner_now,
+                price_cache_read_done_at=manual_owner_now,
+            )
 
         follower_market_position_version = await self._follower_market_position_version_for_plan(
             db,
@@ -2991,6 +3070,64 @@ class FillDrivenExecutionEngine:
                 "the source fill remains pending and will be replanned"
             )
         return int(row.position_version or 0)
+
+    async def _standalone_manual_market_owner_blocker(
+        self,
+        db: Any,
+        market: MarketKey,
+    ) -> str | None:
+        """Reject fills that arrived while a standalone manual position owned a market.
+
+        A manual fill against an existing copy allocation is different: that
+        allocation remains the owner while the guard pauses planning until the
+        actual follower quantity is synchronized.  With no active allocation,
+        the manual position itself is the owner, so retaining leader fills for
+        replay would submit stale lifecycle actions after the manual position
+        is eventually closed.
+        """
+
+        memory_entry = (
+            self.manual_position_guard.active_entry(market)
+            if self.manual_position_guard is not None
+            else None
+        )
+        durable_guard = None
+        if memory_entry is None and isinstance(db, AsyncSession):
+            durable_guard = await db.scalar(
+                _follower_market_guard_query(
+                    market,
+                    execution_scope=self.execution_scope,
+                ).with_for_update()
+            )
+            if durable_guard is not None and bool(durable_guard.active):
+                if self.manual_position_guard is not None:
+                    self.manual_position_guard.mark(
+                        market,
+                        reason=durable_guard.reason or "durable unmatched follower fill guard",
+                        observed_at=durable_guard.observed_at,
+                        position_version=int(durable_guard.position_version or 0),
+                        expected_position_side=durable_guard.expected_position_side,
+                        expected_position_qty=durable_guard.expected_position_qty,
+                        expected_position_relation=durable_guard.expected_position_relation,
+                        position_change_confirmed_at=durable_guard.position_change_confirmed_at,
+                    )
+                memory_entry = (
+                    self.manual_position_guard.active_entry(market)
+                    if self.manual_position_guard is not None
+                    else None
+                )
+        if memory_entry is None and not bool(
+            durable_guard is not None and durable_guard.active
+        ):
+            return None
+        if await self._load_market_owner_allocation(db, market) is not None:
+            return None
+        return (
+            f"{MANUAL_MARKET_OWNER_BLOCKED}: {market.canonical_coin} is owned "
+            "by a standalone manual follower position; the leader fill that "
+            "arrived during manual ownership is intentionally ignored and "
+            "will not be replayed after release"
+        )
 
     async def _assert_follower_market_plan_current(
         self,
@@ -9234,17 +9371,11 @@ class HyperliquidLowLatencyWatcher:
         async with self.db_session_factory() as db:
             rows = (
                 await db.execute(
-                    select(SourceFill)
-                    .where(SourceFill.execution_account == self.execution_scope)
-                    .where(SourceFill.processed_at.is_(None))
-                    .where(SourceFill.is_snapshot.is_(False))
-                    .where(or_(SourceFill.next_retry_at.is_(None), SourceFill.next_retry_at <= now))
-                    # Preserve the durable websocket-arrival sequence.  Source
-                    # timestamps can tie and separate leader streams can arrive
-                    # out of order; the insertion id is our total first-arrival
-                    # order and is also used by the market FIFO claim.
-                    .order_by(SourceFill.id)
-                    .limit(limit)
+                    _durable_market_head_fill_query(
+                        execution_scope=self.execution_scope,
+                        now=now,
+                        limit=limit,
+                    )
                 )
             ).scalars().all()
             if not rows:
@@ -10614,15 +10745,24 @@ class HyperliquidLowLatencyWatcher:
                     f"durable outbox has {unresolved_order_count} unresolved order(s), oldest "
                     f"{oldest_unresolved_order_age_ms}ms"
                 )
-            liveness_signature = "; ".join(stuck_parts) or None
+            liveness_reason = "; ".join(stuck_parts) or None
+            # The human-readable age changes every status tick.  It must not be
+            # the deduplication key or one stuck row emits an error plus an
+            # expensive traceback/log write every two seconds indefinitely.
+            liveness_signature_parts: list[str] = []
+            if durable_inbox_stuck:
+                liveness_signature_parts.append(f"inbox:{pending_fill_count}")
+            if durable_outbox_stuck:
+                liveness_signature_parts.append(f"outbox:{unresolved_order_count}")
+            liveness_signature = ";".join(liveness_signature_parts) or None
             if liveness_signature != self._liveness_stuck_signature:
                 if liveness_signature:
                     log.error(
                         "durable_pipeline_liveness_stuck",
-                        reason=liveness_signature,
+                        reason=liveness_reason,
                         threshold_ms=stuck_threshold_ms,
                     )
-                    self.state.last_error = f"DURABLE_PIPELINE_STUCK: {liveness_signature}"
+                    self.state.last_error = f"DURABLE_PIPELINE_STUCK: {liveness_reason}"
                 else:
                     if str(self.state.last_error or "").startswith("DURABLE_PIPELINE_STUCK:"):
                         self.state.last_error = None
@@ -10632,7 +10772,7 @@ class HyperliquidLowLatencyWatcher:
             if liveness_signature:
                 # Other background diagnostics must not make a stuck durable
                 # pipeline disappear from the primary health/error field.
-                self.state.last_error = f"DURABLE_PIPELINE_STUCK: {liveness_signature}"
+                self.state.last_error = f"DURABLE_PIPELINE_STUCK: {liveness_reason}"
             ready = (
                 self.state.websocket_connected
                 and bool(active)
@@ -11620,6 +11760,49 @@ def _earlier_unprocessed_market_fill_query(
         .where(func.upper(SourceFill.canonical_coin) == market.canonical_coin.upper())
         .order_by(SourceFill.id.asc())
         .limit(1)
+    )
+
+
+def _durable_market_head_fill_query(
+    *,
+    execution_scope: str,
+    now: datetime,
+    limit: int,
+):
+    """Return only each market's earliest unfinished fill when it is due.
+
+    Filtering by ``next_retry_at`` before choosing the market head lets later
+    rows leapfrog a blocked predecessor into the worker merely to fail the FIFO
+    assertion.  Under a long manual-position guard that becomes one database
+    write per successor every 500 ms.  Rank the complete pending set first,
+    then apply the due-time filter to the head only.
+    """
+
+    market_heads = (
+        select(
+            SourceFill.id.label("source_fill_pk"),
+            func.row_number()
+            .over(
+                partition_by=(
+                    SourceFill.dex,
+                    func.upper(func.coalesce(SourceFill.canonical_coin, SourceFill.coin)),
+                ),
+                order_by=SourceFill.id.asc(),
+            )
+            .label("market_rank"),
+        )
+        .where(SourceFill.execution_account == str(execution_scope or "").lower())
+        .where(SourceFill.processed_at.is_(None))
+        .where(SourceFill.is_snapshot.is_(False))
+        .subquery()
+    )
+    return (
+        select(SourceFill)
+        .join(market_heads, market_heads.c.source_fill_pk == SourceFill.id)
+        .where(market_heads.c.market_rank == 1)
+        .where(or_(SourceFill.next_retry_at.is_(None), SourceFill.next_retry_at <= now))
+        .order_by(SourceFill.id.asc())
+        .limit(max(1, int(limit)))
     )
 
 
@@ -14471,8 +14654,10 @@ def _economic_dust_reopen_follower_flat_blocker(
 def _expected_no_action_block(error_message: str | None) -> bool:
     """Classify intentional first-owner rejection separately from true failures."""
     message = str(error_message or "")
-    return message.startswith("MARKET_OWNER_BLOCKED:") or message.startswith(
-        MAX_POSITION_NOTIONAL_CAP_EXCEEDED
+    return (
+        message.startswith("MARKET_OWNER_BLOCKED:")
+        or message.startswith(f"{MANUAL_MARKET_OWNER_BLOCKED}:")
+        or message.startswith(MAX_POSITION_NOTIONAL_CAP_EXCEEDED)
     )
 
 

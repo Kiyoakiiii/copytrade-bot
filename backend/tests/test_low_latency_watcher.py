@@ -58,6 +58,7 @@ from app.services.low_latency_watcher import (
     _durable_fill_retry_delay_seconds,
     _durable_replay_should_scan,
     _durable_replay_wait_seconds,
+    _durable_market_head_fill_query,
     _durable_submit_retry_delay_seconds,
     _earlier_unprocessed_market_fill_query,
     _economic_dust_reopen_follower_flat_blocker,
@@ -5281,6 +5282,26 @@ def test_authoritative_durable_replay_bypasses_stale_memory_completion_hint() ->
     assert [call[0].source_fill_id for call in engine.calls] == [event.source_fill_id]
 
 
+def test_durable_replay_selects_market_head_before_applying_retry_deadline() -> None:
+    statement = _durable_market_head_fill_query(
+        execution_scope="",
+        now=datetime(2026, 8, 3, 12, 47, 20, tzinfo=timezone.utc),
+        limit=1000,
+    )
+    sql = " ".join(compiled_sql(statement).lower().split())
+
+    assert "row_number() over (partition by source_fills.dex" in sql
+    assert "order by source_fills.id asc" in sql
+    assert "market_rank =" in sql
+    assert "source_fills.next_retry_at is null" in sql
+    # The retry deadline belongs to the outer/head query, not the ranked
+    # pending-set subquery. Otherwise a sleeping head is skipped and every
+    # successor hot-spins against MARKET_FILL_FIFO_WAIT.
+    ranked_end = sql.index(") as anon_1")
+    retry_filter = sql.index("source_fills.next_retry_at is null")
+    assert retry_filter > ranked_end
+
+
 def test_order_none_result_is_not_treated_as_durably_completed() -> None:
     address = ("0x" + "1" * 40).lower()
     watcher = HyperliquidLowLatencyWatcher(
@@ -7995,6 +8016,166 @@ def test_manual_position_guard_stays_active_while_allocation_differs_from_follow
 
     assert entry is not None
     assert guard.active_entry(market) is not None
+
+
+def test_confirmed_standalone_manual_position_keeps_market_locked_while_nonflat() -> None:
+    guard = FollowerManualPositionGuard()
+    market = MarketKey(
+        dex="",
+        coin="CASHCAT",
+        canonical_coin="CASHCAT",
+        raw_coin="CASHCAT",
+        asset_id=None,
+        venue_symbol="CASHCAT",
+    )
+    created_at = datetime(2026, 8, 2, 21, 0, 13, tzinfo=timezone.utc)
+    guard.mark(
+        market,
+        reason="standalone manual short",
+        observed_at=created_at,
+        position_version=26,
+        expected_position_side=PositionSide.SHORT,
+        expected_position_qty=Decimal("19662"),
+        expected_position_relation="AT_LEAST",
+    )
+
+    result = guard.reconcile(
+        market,
+        unmanaged_qty_by_side={
+            PositionSide.LONG: Decimal("0"),
+            PositionSide.SHORT: Decimal("19662"),
+        },
+        follower_state_at=created_at + timedelta(seconds=2),
+        allocation_mismatch=True,
+        follower_qty_by_side={
+            PositionSide.LONG: Decimal("0"),
+            PositionSide.SHORT: Decimal("19662"),
+        },
+        allocation_qty_by_side={
+            PositionSide.LONG: Decimal("0"),
+            PositionSide.SHORT: Decimal("0"),
+        },
+    )
+
+    assert result is not None
+    assert result.position_change_confirmed_at is not None
+    assert guard.active_entry(market) is not None
+
+
+def test_restored_manual_guard_releases_at_authoritative_flat_even_if_checkpoint_was_missed() -> None:
+    guard = FollowerManualPositionGuard()
+    market = MarketKey(
+        dex="",
+        coin="CASHCAT",
+        canonical_coin="CASHCAT",
+        raw_coin="CASHCAT",
+        asset_id=None,
+        venue_symbol="CASHCAT",
+    )
+    created_at = datetime(2026, 8, 2, 21, 0, 13, tzinfo=timezone.utc)
+    guard.mark(
+        market,
+        reason="restored manual add guard",
+        observed_at=created_at,
+        position_version=26,
+        expected_position_side=PositionSide.SHORT,
+        expected_position_qty=Decimal("19662"),
+        expected_position_relation="AT_LEAST",
+    )
+
+    result = guard.reconcile(
+        market,
+        unmanaged_qty_by_side={
+            PositionSide.LONG: Decimal("0"),
+            PositionSide.SHORT: Decimal("0"),
+        },
+        follower_state_at=created_at + timedelta(hours=1),
+        allocation_mismatch=False,
+        follower_qty_by_side={
+            PositionSide.LONG: Decimal("0"),
+            PositionSide.SHORT: Decimal("0"),
+        },
+        allocation_qty_by_side={
+            PositionSide.LONG: Decimal("0"),
+            PositionSide.SHORT: Decimal("0"),
+        },
+    )
+
+    assert result is None
+    assert guard.active_entry(market) is None
+
+
+def test_standalone_manual_position_is_market_owner_but_manual_allocation_adjustment_is_not() -> None:
+    guard = FollowerManualPositionGuard()
+    engine = FillDrivenExecutionEngine(
+        settings=settings(),
+        info_client=NoopInfoClient(),
+        execution_client=TimeoutExecutionClient(),
+        price_cache=LowLatencyPriceCache(stale_ms=2_000),
+        manual_position_guard=guard,
+    )
+    market = fill_event(coin="CASHCAT").market
+    guard.mark(market, reason="standalone manual position")
+    engine._load_market_owner_allocation = AsyncMock(return_value=None)
+
+    standalone_reason = asyncio.run(
+        engine._standalone_manual_market_owner_blocker(FakeSession(), market)
+    )
+
+    assert standalone_reason is not None
+    assert standalone_reason.startswith("MANUAL_MARKET_OWNER_BLOCKED:")
+
+    existing_copy_owner = allocation_record(qty="1", notional="100", status="OPEN")
+    engine._load_market_owner_allocation = AsyncMock(
+        return_value=existing_copy_owner
+    )
+
+    adjustment_reason = asyncio.run(
+        engine._standalone_manual_market_owner_blocker(FakeSession(), market)
+    )
+
+    assert adjustment_reason is None
+
+
+def test_leader_fill_during_standalone_manual_ownership_is_terminally_ignored() -> None:
+    guard = FollowerManualPositionGuard()
+    engine = FillDrivenExecutionEngine(
+        settings=settings(),
+        info_client=NoopInfoClient(),
+        execution_client=TimeoutExecutionClient(),
+        price_cache=LowLatencyPriceCache(stale_ms=2_000),
+        manual_position_guard=guard,
+    )
+    current_fill = fill_event(coin="CASHCAT", start_position="0", size="100")
+    guard.mark(current_fill.market, reason="standalone manual position")
+    engine._load_market_owner_allocation = AsyncMock(return_value=None)
+    ignored_order = SimpleNamespace(status="IGNORED")
+    engine._record_lifecycle_ignored_order = AsyncMock(return_value=ignored_order)
+    engine._follower_market_position_version_for_plan = AsyncMock(
+        side_effect=AssertionError("manual owner fill reached copy planning")
+    )
+    base = datetime.now(timezone.utc)
+
+    result = asyncio.run(
+        engine.reconcile_leader_symbol_allocation(
+            FakeSession(),
+            fill=current_fill,
+            leader=leader(),
+            dedupe_started_at=base,
+            dedupe_done_at=base,
+            debounce_started_at=base,
+            debounce_released_at=base,
+            lock_wait_started_at=base,
+            lock_acquired_at=base,
+            ws_received_at=current_fill.ws_received_at,
+            submit_order=False,
+        )
+    )
+
+    assert result is ignored_order
+    assert engine._follower_market_position_version_for_plan.await_count == 0
+    reason = engine._record_lifecycle_ignored_order.await_args.kwargs["reason"]
+    assert reason.startswith("MANUAL_MARKET_OWNER_BLOCKED:")
 
 
 def test_watcher_reconcile_manual_position_guards_clears_after_manual_flat() -> None:
