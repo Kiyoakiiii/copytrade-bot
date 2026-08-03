@@ -2,14 +2,23 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
+import hashlib
+import json
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.core.config import Settings
+from app.core.logging import redact_text
 from app.db.session import SessionLocal
-from app.models import AllocationEvent, ExecutionOrder, LeaderPositionAllocationRecord, RiskEvent
+from app.models import (
+    AllocationEvent,
+    ExecutionOrder,
+    LeaderPositionAllocationRecord,
+    RiskEvent,
+    SourceFillOutcome,
+)
 from app.services.auto_copy import RECOVERY_ORDER_STATUSES, extract_market_fill
 from app.services.binance_client import BinanceFuturesClient
 from app.services.execution_router import ExecutionVenue
@@ -66,6 +75,7 @@ async def recover_unresolved_orders(
             order
             for order in rows
             if order.execution_venue == ExecutionVenue.HYPERLIQUID.value and order.cloid
+            and not _is_unstarted_hyperliquid_outbox_order(order)
         ]
 
         if settings.binance_api_key and settings.binance_api_secret and binance_rows:
@@ -84,7 +94,7 @@ async def recover_unresolved_orders(
                                 event_type="ORDER_RECOVERY_FAILED",
                                 symbol=order.binance_symbol or order.venue_symbol,
                                 leader_address=order.leader_address,
-                                message=f"could not recover Binance order status: {exc}",
+                                message=f"could not recover Binance order status: {redact_text(exc)}",
                                 metadata_json={"client_order_id": order.client_order_id},
                             )
                         )
@@ -98,15 +108,27 @@ async def recover_unresolved_orders(
                 await client.close()
 
         if settings.enable_hyperliquid_execution and hyperliquid_rows:
-            client = HyperliquidExecutionClient(
-                info_url=f"{settings.hyperliquid_execution_base_url()}/info",
-                private_key=settings.hyperliquid_private_key_value(),
-                account_address=settings.hyperliquid_account_address or settings.hyperliquid_signer_address(),
-                vault_address=settings.hyperliquid_vault_address,
-                network=settings.hyperliquid_execution_network,
-            )
+            clients: dict[str, HyperliquidExecutionClient] = {}
             try:
                 for order in hyperliquid_rows:
+                    execution_scope = str(order.venue_account or "").lower()
+                    client = clients.get(execution_scope)
+                    if client is None:
+                        client = HyperliquidExecutionClient(
+                            info_url=f"{settings.hyperliquid_execution_base_url()}/info",
+                            private_key=settings.hyperliquid_private_key_value(),
+                            account_address=(
+                                settings.hyperliquid_account_address
+                                or settings.hyperliquid_signer_address()
+                            ),
+                            vault_address=(
+                                execution_scope
+                                if execution_scope
+                                else settings.hyperliquid_execution_vault_address()
+                            ),
+                            network=settings.hyperliquid_execution_network,
+                        )
+                        clients[execution_scope] = client
                     try:
                         response = await recover_hyperliquid_unknown_order(
                             client,
@@ -114,22 +136,44 @@ async def recover_unresolved_orders(
                             cloid=order.cloid or "",
                         )
                         if _is_hyperliquid_unknown_oid(response):
-                            now = datetime.now(timezone.utc)
-                            if _should_defer_unknown_oid_recovery(
-                                order,
-                                now=now,
-                                unknown_oid_resubmit_age_seconds=unknown_oid_resubmit_age_seconds,
-                            ):
-                                order.error_message = "Hyperliquid cloid not found yet; recovery deferred"
-                                continue
+                            if order.signed_action_envelope:
+                                response = await _replay_persisted_hyperliquid_action(
+                                    client,
+                                    order,
+                                )
+                                if _hyperliquid_error(response):
+                                    response = await recover_hyperliquid_unknown_order(
+                                        client,
+                                        coin=order.hyperliquid_coin or order.venue_symbol or order.source_coin,
+                                        cloid=order.cloid or "",
+                                    )
+                                if _is_hyperliquid_unknown_oid(response):
+                                    order.status = "UNKNOWN"
+                                    order.error_message = (
+                                        "persisted signed action replayed but cloid remains unknown; "
+                                        "kept for recovery without creating a new order"
+                                    )
+                                    await _update_source_fill_outcome(db, order, "SUBMISSION_UNKNOWN")
+                                    continue
+                            else:
+                                now = datetime.now(timezone.utc)
+                                if _should_defer_unknown_oid_recovery(
+                                    order,
+                                    now=now,
+                                    unknown_oid_resubmit_age_seconds=unknown_oid_resubmit_age_seconds,
+                                ):
+                                    order.error_message = "Hyperliquid cloid not found yet; recovery deferred"
+                                    await _update_source_fill_outcome(db, order, "SUBMISSION_UNKNOWN")
+                                    continue
                     except Exception as exc:
+                        safe_error = redact_text(exc)
                         db.add(
                             RiskEvent(
                                 severity="warning",
                                 event_type="ORDER_RECOVERY_FAILED",
                                 symbol=order.hyperliquid_coin or order.venue_symbol,
                                 leader_address=order.leader_address,
-                                message=f"could not recover Hyperliquid order status: {exc}",
+                                message=f"could not recover Hyperliquid order status: {safe_error}",
                                 metadata_json={"cloid": order.cloid},
                             )
                         )
@@ -147,14 +191,73 @@ async def recover_unresolved_orders(
                         order,
                         previous_executed_qty,
                     )
+                    await _update_source_fill_outcome_from_order(db, order)
                     recovered += 1
             finally:
-                await client.close()
+                for client in clients.values():
+                    await client.close()
 
         await db.commit()
     if recovered:
         log.info("recovered_unresolved_orders", count=recovered)
     return recovered
+
+
+async def _replay_persisted_hyperliquid_action(
+    client: HyperliquidExecutionClient,
+    order: ExecutionOrder,
+) -> dict[str, Any]:
+    envelope = order.signed_action_envelope
+    if not isinstance(envelope, dict):
+        raise RuntimeError("persisted signed action envelope is invalid")
+    if order.signed_action_hash and _signed_action_hash(envelope) != order.signed_action_hash:
+        raise RuntimeError("persisted signed action envelope integrity check failed")
+    envelope_nonce = ((envelope.get("payload") or {}).get("nonce"))
+    if order.submit_nonce is None or int(envelope_nonce) != int(order.submit_nonce):
+        raise RuntimeError("persisted signed action nonce does not match its outbox row")
+    if order.submit_signer_scope and order.submit_signer_scope != client.signer_scope:
+        raise RuntimeError("persisted signed action belongs to a different signer scope")
+    return await client.submit_market_order_envelope(envelope)
+
+
+def _signed_action_hash(envelope: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        envelope,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+async def _update_source_fill_outcome_from_order(db: Any, order: ExecutionOrder) -> None:
+    status = str(order.status or "").upper()
+    executed_qty = Decimal(order.executed_qty or 0)
+    if executed_qty > 0:
+        disposition = "EXECUTED"
+    elif status in {"UNKNOWN", "PENDING_SUBMIT", "SUBMITTING", "SUBMITTED", "OPEN", "RESTING"}:
+        disposition = "SUBMISSION_UNKNOWN"
+    elif status in {"REJECTED", "FAILED", "BLOCKED"}:
+        disposition = "MANUAL_REVIEW"
+    else:
+        disposition = "NO_ACTION_REQUIRED"
+    await _update_source_fill_outcome(db, order, disposition)
+
+
+async def _update_source_fill_outcome(
+    db: Any,
+    order: ExecutionOrder,
+    disposition: str,
+) -> None:
+    await db.execute(
+        update(SourceFillOutcome)
+        .where(SourceFillOutcome.execution_order_id == order.id)
+        .values(
+            disposition=disposition,
+            reason=redact_text(order.error_message)[:2000] if order.error_message else None,
+            updated_at=datetime.now(timezone.utc),
+        )
+    )
 
 
 def _recovery_order_due(
@@ -172,6 +275,18 @@ def _recovery_order_due(
     if reference.tzinfo is None:
         reference = reference.replace(tzinfo=timezone.utc)
     return now - reference >= timedelta(seconds=max(0.0, float(min_pending_submit_age_seconds)))
+
+
+def _is_unstarted_hyperliquid_outbox_order(order: ExecutionOrder) -> bool:
+    return (
+        str(order.status or "").upper() in {"PENDING_SUBMIT", "SUBMITTING"}
+        and order.order_submit_started_at is None
+        and order.order_submit_done_at is None
+        and order.order_ack_at is None
+        and not order.order_id
+        and not order.venue_order_id
+        and not order.raw_response
+    )
 
 
 def _apply_order_response(order: ExecutionOrder, response: dict[str, Any]) -> None:

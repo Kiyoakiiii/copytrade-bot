@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from hashlib import sha256
@@ -14,6 +15,16 @@ import websockets
 from app.services.hyperliquid_dex import parse_coin
 
 log = structlog.get_logger(__name__)
+
+
+def _info_retry_delay_seconds(response: httpx.Response, attempt: int) -> float:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return min(max(float(retry_after), 0.05), 2.0)
+        except (TypeError, ValueError):
+            pass
+    return min(0.1 * (2**attempt), 0.8)
 
 
 @dataclass(frozen=True)
@@ -48,14 +59,51 @@ class HyperliquidInfoClient:
     def __init__(self, info_url: str, timeout: float = 10.0) -> None:
         self._client = httpx.AsyncClient(timeout=timeout)
         self._info_url = info_url
+        # Position refresh, leader backfill and metadata warmup share this
+        # client. Bound their concurrency so one startup/reconnect burst cannot
+        # turn a single 429 into several synchronized retry loops.
+        self._request_slots = asyncio.Semaphore(2)
+        self._rate_limit_guard = asyncio.Lock()
+        self._retry_not_before = 0.0
 
     async def close(self) -> None:
         await self._client.aclose()
 
     async def post_info(self, payload: dict[str, Any]) -> Any:
-        response = await self._client.post(self._info_url, json=payload)
-        response.raise_for_status()
-        return response.json()
+        async with self._request_slots:
+            response: httpx.Response | None = None
+            for attempt in range(4):
+                await self._wait_for_rate_limit_backoff()
+                response = await self._client.post(self._info_url, json=payload)
+                if response.status_code != 429 and response.status_code < 500:
+                    response.raise_for_status()
+                    return response.json()
+                delay = _info_retry_delay_seconds(response, attempt)
+                if response.status_code == 429:
+                    # Add jitter so the dedicated watcher and backend poller on
+                    # the same host do not remain phase-locked after a shared-IP
+                    # rate-limit response. The client-wide deadline also makes
+                    # queued callers join one backoff rather than start a storm.
+                    delay += random.uniform(0.0, min(0.25, delay * 0.25))
+                    await self._defer_info_requests(delay)
+                if attempt >= 3:
+                    response.raise_for_status()
+                if response.status_code != 429:
+                    await asyncio.sleep(delay)
+        raise RuntimeError("Hyperliquid info request retry loop exited unexpectedly")
+
+    async def _wait_for_rate_limit_backoff(self) -> None:
+        while True:
+            async with self._rate_limit_guard:
+                delay = self._retry_not_before - asyncio.get_running_loop().time()
+            if delay <= 0:
+                return
+            await asyncio.sleep(delay)
+
+    async def _defer_info_requests(self, delay_seconds: float) -> None:
+        retry_at = asyncio.get_running_loop().time() + max(0.0, float(delay_seconds))
+        async with self._rate_limit_guard:
+            self._retry_not_before = max(self._retry_not_before, retry_at)
 
     async def user_fills(self, user: str, aggregate_by_time: bool = False) -> list[dict[str, Any]]:
         data = await self.post_info(
@@ -121,6 +169,10 @@ class HyperliquidInfoClient:
 
     async def portfolio(self, user: str) -> Any:
         return await self.post_info({"type": "portfolio", "user": user})
+
+    async def sub_accounts(self, user: str) -> list[dict[str, Any]]:
+        data = await self.post_info({"type": "subAccounts", "user": user})
+        return list(data or [])
 
 
 class HyperliquidWatcher:

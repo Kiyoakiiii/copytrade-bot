@@ -70,6 +70,9 @@ class LeaderConfig(Base, TimestampMixin):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     delete_reason: Mapped[str | None] = mapped_column(Text)
+    performance_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
     leader_address: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     copy_multiplier: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=Decimal("0.1"))
     fixed_account_value: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
@@ -148,6 +151,7 @@ class SourceFill(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     source_fill_id: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    execution_account: Mapped[str] = mapped_column(String(64), default="", server_default="", index=True)
     leader_address: Mapped[str] = mapped_column(String(64), index=True)
     coin: Mapped[str] = mapped_column(String(80), index=True)
     side: Mapped[str] = mapped_column(String(16))
@@ -162,6 +166,106 @@ class SourceFill(Base, TimestampMixin):
     raw_fill: Mapped[dict] = mapped_column(JSON)
     is_snapshot: Mapped[bool] = mapped_column(Boolean, default=False)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_processing_error: Mapped[str | None] = mapped_column(Text)
+
+
+class SourceFillOutcome(Base, TimestampMixin):
+    __tablename__ = "source_fill_outcomes"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_fill_id: Mapped[str] = mapped_column(
+        ForeignKey("source_fills.source_fill_id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    execution_order_id: Mapped[int | None] = mapped_column(
+        ForeignKey("execution_orders.id", ondelete="SET NULL"),
+        index=True,
+    )
+    disposition: Mapped[str] = mapped_column(String(40), index=True)
+    reason: Mapped[str | None] = mapped_column(Text)
+
+
+class LeaderFillCursor(Base, TimestampMixin):
+    __tablename__ = "leader_fill_cursors"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    leader_address: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    last_fill_time_ms: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    last_fill_tid: Mapped[int | None] = mapped_column(BigInteger)
+    backfilled_through_ms: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+
+
+class SignerNonceState(Base, TimestampMixin):
+    __tablename__ = "signer_nonce_states"
+
+    signer_scope: Mapped[str] = mapped_column(String(96), primary_key=True)
+    last_nonce: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+
+
+class FollowerMarketGuard(Base, TimestampMixin):
+    __tablename__ = "follower_market_guards"
+    __table_args__ = (
+        UniqueConstraint(
+            "execution_account",
+            "execution_venue",
+            "dex",
+            "canonical_coin",
+            name="uq_follower_market_guard_scope",
+        ),
+        Index(
+            "ix_follower_market_guards_active_scope",
+            "active",
+            "execution_account",
+            "execution_venue",
+            "dex",
+            "canonical_coin",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    execution_account: Mapped[str] = mapped_column(String(64), default="", server_default="", index=True)
+    execution_venue: Mapped[str] = mapped_column(String(16), default="HYPERLIQUID", index=True)
+    dex: Mapped[str] = mapped_column(String(32), default="", index=True)
+    canonical_coin: Mapped[str] = mapped_column(String(160), index=True)
+    position_version: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    active: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", index=True)
+    reason: Mapped[str | None] = mapped_column(Text)
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_unmatched_fill_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    last_cloid: Mapped[str | None] = mapped_column(String(34))
+    last_order_id: Mapped[str | None] = mapped_column(String(80))
+    expected_position_side: Mapped[str | None] = mapped_column(String(8))
+    expected_position_qty: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    expected_position_relation: Mapped[str | None] = mapped_column(String(16))
+    position_change_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class UnmatchedFollowerFill(Base, TimestampMixin):
+    __tablename__ = "unmatched_follower_fills"
+    __table_args__ = (
+        Index(
+            "ix_unmatched_follower_fills_scope_time",
+            "execution_venue",
+            "execution_account",
+            "dex",
+            "canonical_coin",
+            "observed_at",
+        ),
+    )
+
+    follower_fill_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    execution_account: Mapped[str] = mapped_column(String(64), default="", server_default="", index=True)
+    execution_venue: Mapped[str] = mapped_column(String(16), default="HYPERLIQUID", index=True)
+    dex: Mapped[str] = mapped_column(String(32), default="", index=True)
+    canonical_coin: Mapped[str] = mapped_column(String(160), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    cloid: Mapped[str | None] = mapped_column(String(34))
+    order_id: Mapped[str | None] = mapped_column(String(80))
 
 
 class LeaderFillChannelObservation(Base, TimestampMixin):
@@ -229,7 +333,7 @@ class LeaderPositionAllocationRecord(Base, TimestampMixin):
     canonical_coin: Mapped[str | None] = mapped_column(String(160), index=True)
     binance_symbol: Mapped[str | None] = mapped_column(String(32), index=True)
     execution_venue: Mapped[str] = mapped_column(String(16), default="BINANCE", index=True)
-    venue_account: Mapped[str | None] = mapped_column(String(64), index=True)
+    venue_account: Mapped[str] = mapped_column(String(64), default="", server_default="", index=True)
     venue_symbol: Mapped[str] = mapped_column(String(80), index=True)
     position_side: Mapped[str] = mapped_column(String(8), index=True)
     target_notional: Mapped[Decimal] = mapped_column(Numeric(30, 12), default=Decimal("0"))
@@ -358,6 +462,11 @@ class ExecutionOrder(Base, TimestampMixin):
     __tablename__ = "execution_orders"
     __table_args__ = (
         Index("ix_execution_orders_leader_symbol_status", "leader_address", "binance_symbol", "status"),
+        UniqueConstraint(
+            "submit_signer_scope",
+            "submit_nonce",
+            name="uq_execution_orders_signer_nonce",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -370,6 +479,7 @@ class ExecutionOrder(Base, TimestampMixin):
     source_type: Mapped[str] = mapped_column(String(24), default="AUTO_COPY", index=True)
     source_coin: Mapped[str] = mapped_column(String(80), index=True)
     execution_venue: Mapped[str] = mapped_column(String(16), default="BINANCE", index=True)
+    venue_account: Mapped[str] = mapped_column(String(64), default="", server_default="", index=True)
     dex: Mapped[str] = mapped_column(String(32), default="", index=True)
     canonical_coin: Mapped[str | None] = mapped_column(String(160), index=True)
     raw_coin_from_fill: Mapped[str | None] = mapped_column(String(160))
@@ -403,6 +513,10 @@ class ExecutionOrder(Base, TimestampMixin):
     raw_response: Mapped[dict | None] = mapped_column(JSON)
     request_payload_masked: Mapped[dict | None] = mapped_column(JSON)
     response_payload_masked: Mapped[dict | None] = mapped_column(JSON)
+    signed_action_envelope: Mapped[dict | None] = mapped_column(JSON)
+    signed_action_hash: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    submit_signer_scope: Mapped[str | None] = mapped_column(String(96), index=True)
+    submit_nonce: Mapped[int | None] = mapped_column(BigInteger, index=True)
     pre_trade_checklist: Mapped[dict | None] = mapped_column(JSON)
     hyperliquid_event_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     event_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -491,7 +605,10 @@ class LatestAccountState(Base, TimestampMixin):
     total_margin_used: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
     raw_payload_masked: Mapped[dict | None] = mapped_column(JSON)
     source: Mapped[str] = mapped_column(String(32), default="info_endpoint")
-    last_update_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    # This is a high-frequency freshness heartbeat.  Keeping it out of an index
+    # allows PostgreSQL HOT updates and avoids account-state churn competing
+    # with durable order commits.
+    last_update_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
 
     positions: Mapped[list[LatestAccountPosition]] = relationship(

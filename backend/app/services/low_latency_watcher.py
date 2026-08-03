@@ -1,38 +1,46 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 import structlog
 import websockets
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
+from app.core.logging import redact_text
 from app.db.session import SessionLocal
 from app.models import (
     AppSetting,
     AllocationEvent,
     ExecutionOrder,
+    FollowerMarketGuard,
     LatestAccountPosition,
     LatestAccountState,
     LeaderConfig,
+    LeaderFillCursor,
     LeaderPositionAllocationRecord,
     LeaderPositionBaseline,
     MarketRiskSetting,
     RiskEvent,
     SourceFill,
+    SourceFillOutcome,
+    SignerNonceState,
+    UnmatchedFollowerFill,
 )
 from app.services.account_abstraction import (
     AccountAbstractionService,
     MODE_DEX_ABSTRACTION,
+    MODE_UNIFIED,
     SOURCE_ACCOUNT_TOTAL,
     SOURCE_CLEARINGHOUSE,
     account_abstraction_setting_key,
@@ -42,11 +50,18 @@ from app.services.account_abstraction import (
     resolve_account_value_for_sizing,
     save_account_abstraction_state,
 )
-from app.services.account_state import FOLLOWER, LEADER, AccountStateService, save_account_state
+from app.services.account_state import (
+    FOLLOWER,
+    LEADER,
+    AccountStateService,
+    parse_account_state,
+    save_account_state,
+)
 from app.services.allocations import (
     ALLOCATION_TRANSITION_TOLERANCE,
     LEGACY_SIZE_MISSING_NOTIONAL_RATIO_FALLBACK,
     MAX_POSITION_NOTIONAL_CAP_APPLIED,
+    MAX_POSITION_NOTIONAL_CAP_EXCEEDED,
     AllocationScopeError,
     AllocationTransitionAction,
     assert_allocation_scope,
@@ -64,6 +79,10 @@ from app.services.calculator import (
     calculate_target_notional_by_account_ratio,
 )
 from app.services.execution_router import ExecutionVenue
+from app.services.execution_alerts import (
+    HYPERLIQUID_NETWORK_UPGRADE_POST_ONLY_REJECTION,
+    is_hyperliquid_network_upgrade_post_only_error,
+)
 from app.services.hyperliquid import HyperliquidInfoClient, fill_unique_id
 from app.services.hyperliquid_dex import (
     HyperliquidDexRegistry,
@@ -86,7 +105,11 @@ from app.services.hyperliquid_risk_settings import (
     FALLBACK_MARGIN_MODE,
     RiskSettingResult,
     STATUS_CONFIRMED,
+    desired_leverage_for_margin_mode,
+    effective_leverage_for_margin_mode,
     ensure_hyperliquid_market_risk_settings,
+    market_requires_isolated_margin,
+    one_x_leverage_required,
 )
 from app.services.leader_config import active_leaders_statement, is_coin_allowed, normalize_leader_address
 from app.services.order_policy import (
@@ -94,6 +117,7 @@ from app.services.order_policy import (
     HYPERLIQUID_AUTO_COPY_ORDER_TYPE,
     assert_hyperliquid_auto_copy_order,
 )
+from app.services.runtime_control import acquire_copy_trading_control_lock
 from app.services.sizing_guard import SizingGuardError, assert_sizing_mode_account_ratio
 from app.services.task_status import store_task_status
 from app.services.target_position import PositionSide
@@ -104,6 +128,10 @@ log = structlog.get_logger(__name__)
 PENDING_OPEN_STATUS = "PENDING_OPEN"
 PENDING_OPEN_REASON = "BELOW_MIN_ORDER_VALUE_PENDING_OPEN"
 ACCOUNT_VALUE_PENDING_OPEN_REASON = "ACCOUNT_VALUE_UNAVAILABLE_PENDING_OPEN"
+MINIMUM_RESIDUAL_ECONOMIC_FLAT_REASON = "MINIMUM_RESIDUAL_ECONOMIC_FLAT"
+MINIMUM_RESIDUAL_ECONOMIC_FLAT_PENDING_REASON = (
+    "MINIMUM_RESIDUAL_ECONOMIC_FLAT_PENDING"
+)
 _COALESCED_FILL_NOTIONAL_KEY = "_copytrade_coalesced_fill_notional"
 _COALESCED_FILL_SIZE_KEY = "_copytrade_coalesced_fill_size"
 _COALESCED_FILL_COUNT_KEY = "_copytrade_coalesced_fill_count"
@@ -111,6 +139,8 @@ _COALESCED_SOURCE_IDS_KEY = "_copytrade_coalesced_source_fill_ids"
 _SNAPSHOT_RECOVERY_KEY = "_copytrade_snapshot_recovery"
 _SNAPSHOT_RECOVERY_REASON_KEY = "_copytrade_snapshot_recovery_reason"
 HYPERLIQUID_WS_APP_PING_SECONDS = 30.0
+HYPERLIQUID_WS_MAX_QUEUE = 256
+HYPERLIQUID_WS_MAX_MESSAGE_BYTES = 2 * 1024 * 1024
 LEADER_FILL_PRICE_FALLBACK_SOURCE = "LEADER_FILL_PRICE_FALLBACK"
 RECENT_CLOSED_ALLOCATION_STATE_LAG_WINDOW = timedelta(minutes=5)
 FIXED_LEADER_ACCOUNT_VALUE_SOURCE = "LEADER_CONFIG_FIXED"
@@ -118,8 +148,85 @@ FIXED_LEADER_ACCOUNT_VALUE_MODE = "FIXED_REFERENCE"
 LOCAL_POSITION_PROJECTION_SOURCES = {"LOCAL_FILL_PROJECTION", "ORDER_RECOVERY_PROJECTION"}
 UNRESOLVED_SAME_MARKET_ORDER_BLOCKER = "unresolved UNKNOWN/PENDING auto order exists for this leader/market"
 UNRESOLVED_SAME_MARKET_RETRY_ATTEMPTS = 3
-UNRESOLVED_SAME_MARKET_RETRY_SLEEP_SECONDS = 0.05
+UNRESOLVED_SAME_MARKET_RETRY_SLEEP_SECONDS = 0.01
 TRANSIENT_UNRESOLVED_ORDER_STATUSES = {"PENDING_SUBMIT", "SUBMITTING"}
+FILL_OUTCOME_ORDER_PLANNED = "ORDER_PLANNED"
+FILL_OUTCOME_EXECUTED = "EXECUTED"
+FILL_OUTCOME_MIN_NOTIONAL_EXEMPT = "MIN_NOTIONAL_EXEMPT"
+FILL_OUTCOME_SUBMISSION_UNKNOWN = "SUBMISSION_UNKNOWN"
+FILL_OUTCOME_MANUAL_REVIEW = "MANUAL_REVIEW"
+FILL_OUTCOME_NO_ACTION_REQUIRED = "NO_ACTION_REQUIRED"
+EMERGENCY_KILL_SWITCH_ERROR = "EMERGENCY_KILL_SWITCH: copy trading disabled before exchange submit"
+LEADER_FILL_BACKFILL_PAGE_SIZE = 2000
+LEADER_FILL_BACKFILL_OVERLAP_MS = 1000
+LEADER_FILL_BACKFILL_RETRY_BASE_SECONDS = 1.0
+LEADER_FILL_BACKFILL_RETRY_MAX_SECONDS = 15.0
+PER_FILL_INTERNAL_LATENCY_WARN_MS = 200
+RECENT_COMPLETED_SOURCE_FILL_MAX = 100_000
+DURABLE_REPLAY_MAX_HOT_PATH_DEFER_SECONDS = 0.25
+FOLLOWER_POSITION_STREAM_TRUST_SECONDS = 15.0
+PRICE_FALLBACK_RECENT_EVENT_SECONDS = 60.0
+# Hyperliquid clearinghouseState can briefly lag a just-observed user fill even
+# though the REST response itself is timestamped after the websocket event.
+# Keep an unmatched-fill guard through at least one full refresh interval so a
+# pre-fill snapshot cannot be mistaken for a reconciled post-fill position.
+UNMATCHED_FOLLOWER_FILL_STATE_SETTLE_SECONDS = 1.0
+MANUAL_FILL_POSITION_AT_LEAST = "AT_LEAST"
+MANUAL_FILL_POSITION_AT_MOST = "AT_MOST"
+MANUAL_FILL_POSITION_EXACT = "EXACT"
+SHARED_MARKET_META_CACHE_VERSION = "v1"
+SHARED_MARKET_META_LOCK_PREFIX = "copytrade:hyperliquid:market-meta"
+SHARED_PERP_DEX_DIRECTORY_CACHE_VERSION = "v1"
+SHARED_PERP_DEX_DIRECTORY_LOCK_PREFIX = "copytrade:hyperliquid:perp-dex-directory"
+
+
+def _durable_replay_wait_seconds(
+    *,
+    active_interval: float,
+    idle_interval: float,
+    order_resume_interval: float,
+    now: float,
+    next_order_resume_at: float,
+    replayed: int,
+    resumed: int,
+) -> float:
+    """Choose a recovery poll delay without slowing a known pending item.
+
+    A non-empty replay/resume pass stays on the short active cadence.  Empty
+    scans back off, capped by the next outbox recovery scan.  Exact fill retry
+    deadlines bypass this timeout through ``_durable_replay_wakeup``.
+    """
+    active = max(0.01, float(active_interval))
+    if int(replayed or 0) > 0 or int(resumed or 0) > 0:
+        return active
+    idle = max(active, float(idle_interval))
+    resume = max(active, float(order_resume_interval))
+    until_resume = max(active, float(next_order_resume_at) - float(now))
+    return min(idle, resume, until_resume)
+
+
+def _durable_replay_should_scan(
+    *,
+    hot_path_busy: bool,
+    wakeup_requested: bool,
+    now: float,
+    last_scan_at: float,
+    max_hot_path_defer_seconds: float = DURABLE_REPLAY_MAX_HOT_PATH_DEFER_SECONDS,
+) -> bool:
+    """Bound recovery starvation without making every hot-path tick hit SQL."""
+
+    if not hot_path_busy or wakeup_requested:
+        return True
+    max_defer = max(0.01, float(max_hot_path_defer_seconds))
+    return float(now) - float(last_scan_at) >= max_defer
+
+
+def _leader_fill_backfill_retry_delay_seconds(consecutive_failures: int) -> float:
+    exponent = min(max(int(consecutive_failures), 1) - 1, 10)
+    return min(
+        LEADER_FILL_BACKFILL_RETRY_BASE_SECONDS * (2**exponent),
+        LEADER_FILL_BACKFILL_RETRY_MAX_SECONDS,
+    )
 
 
 @dataclass(frozen=True)
@@ -146,12 +253,136 @@ class FillEvent:
     ws_received_at: datetime
     parse_started_at: datetime | None = None
     parse_done_at: datetime | None = None
+    queue_enqueued_at: datetime | None = None
+    fill_worker_started_at: datetime | None = None
+    ingress_channel: str | None = None
 
     @property
     def hyperliquid_event_time(self) -> datetime | None:
         if not self.time_ms:
             return None
         return datetime.fromtimestamp(self.time_ms / 1000, timezone.utc)
+
+
+class RetryableFillProcessingError(RuntimeError):
+    """The fill remains in the durable inbox and must be planned again."""
+
+
+class MarketFillFifoWait(RetryableFillProcessingError):
+    """An earlier durable fill for this follower market must finish first."""
+
+
+class MarketOwnershipHandoffPending(RetryableFillProcessingError):
+    """The current owner is releasing/confirming the market; retry without dropping the fill."""
+
+
+class RetryablePreExchangeSubmitError(RuntimeError):
+    """The exchange was not called, so the durable outbox is safe to retry."""
+
+
+class OrderSubmitClaimLost(RuntimeError):
+    """Another worker/recovery path won the durable pre-send order CAS."""
+
+
+class StaleFollowerMarketPlanInvalidated(RuntimeError):
+    """An unsubmitted stale plan was returned to the durable fill inbox."""
+
+
+def _follower_position_freshness_retry(value: Any) -> bool:
+    return "follower position state is stale" in str(value or "").lower()
+
+
+def _follower_position_state_is_fresh(
+    *,
+    state_at: datetime | None,
+    now: datetime,
+    stale_seconds: float,
+    stream_trusted: bool,
+) -> bool:
+    """Accept either a recent snapshot or a live causally ordered state feed."""
+
+    if stream_trusted:
+        return True
+    return bool(
+        state_at is not None
+        and state_at >= now - timedelta(seconds=max(0.5, float(stale_seconds)))
+    )
+
+
+def _market_serialization_retry(value: Any) -> bool:
+    return isinstance(value, (MarketFillFifoWait, MarketOwnershipHandoffPending)) or str(
+        value or ""
+    ).startswith("MARKET_FILL_FIFO_WAIT")
+
+
+def _durable_fill_retry_delay_seconds(
+    value: Any,
+    *,
+    attempt: int,
+    base: float,
+    cap: float,
+) -> float:
+    """Choose a retry deadline that preserves liveness without hot-spinning.
+
+    A follower-position refresh happens after a stale-state failure.  Letting
+    the ordinary exponential retry reach five seconds while position freshness
+    expires after two seconds creates a phase-locked livelock: every retry sees
+    the refresh only after it has become stale again.  Retry this condition in
+    a short fixed window so the next plan observes the completed refresh.
+
+    Market FIFO/handoff waits are normally very short, but a genuinely blocked
+    predecessor must not make its successors write the database twenty times a
+    second forever.  Back off those waits only to 500 ms; normal in-memory FIFO
+    processing and explicit completion wakeups remain unchanged.
+    """
+    retry_base = max(0.01, float(base))
+    retry_cap = max(retry_base, float(cap))
+    if _follower_position_freshness_retry(value):
+        return min(retry_cap, max(retry_base, 0.25))
+    if _market_serialization_retry(value):
+        adaptive = retry_base * (2 ** min(max(int(attempt) - 1, 0), 16))
+        return min(retry_cap, max(retry_base, min(0.5, adaptive)))
+    return min(
+        retry_cap,
+        retry_base * (2 ** min(max(int(attempt) - 1, 0), 16)),
+    )
+
+
+def _submit_barrier_poll_delay_seconds(waited_ms: int | float) -> float:
+    """Poll aggressively for normal sub-second sequencing, then back off."""
+    elapsed = max(0.0, float(waited_ms))
+    if elapsed < 100:
+        return 0.005
+    if elapsed < 1_000:
+        return 0.02
+    return 0.1
+
+
+def _submit_barrier_reconcile_interval_seconds(waited_ms: int | float) -> float:
+    """Keep the normal self-heal fast without polling SQL forever.
+
+    A completed predecessor releases its in-memory barrier immediately.  The
+    database query is only a fallback for a lost callback, so progressively
+    reducing that fallback's frequency cannot add latency to the normal path
+    and prevents an unresolved exchange outcome from becoming a SQL livelock.
+    """
+
+    elapsed = max(0.0, float(waited_ms))
+    if elapsed < 1_000:
+        return 0.25
+    if elapsed < 10_000:
+        return 1.0
+    return 5.0
+
+
+def _durable_submit_retry_delay_seconds(retry_count: int) -> float:
+    """Back off persistent pre-send failures after three immediate attempts."""
+    deferred_attempt = max(0, int(retry_count) - 4)
+    return min(5.0, 0.25 * (2 ** min(deferred_attempt, 16)))
+
+
+def _expected_fill_retry(value: Any) -> bool:
+    return _market_serialization_retry(value) or _follower_position_freshness_retry(value)
 
 
 @dataclass(frozen=True)
@@ -235,32 +466,52 @@ class LowLatencyPriceCache:
     def __init__(self, *, stale_ms: int) -> None:
         self.stale_ms = stale_ms
         self._prices: dict[str, PriceEntry] = {}
+        # Keep the normalized market grouping alongside the price map.  The
+        # watcher receives roughly 1,100 mids across several DEXes; reparsing
+        # every canonical coin once per DEX in each health/freshness pass used
+        # unnecessary CPU on the same event loop that receives leader fills.
+        self._markets_by_dex: dict[str, set[str]] = {}
 
-    def set_price(self, *, dex: str, coin: str, price: Decimal | str, source: str = "REST") -> None:
+    def set_price(
+        self,
+        *,
+        dex: str,
+        coin: str,
+        price: Decimal | str,
+        source: str = "REST",
+    ) -> str | None:
         parsed = parse_coin(coin, default_dex=dex)
         value = Decimal(str(price))
         if value <= 0:
-            return
+            return None
         self._prices[parsed.canonical_coin] = PriceEntry(
             price=value,
             updated_at=datetime.now(timezone.utc),
             source=source,
         )
+        self._markets_by_dex.setdefault(parsed.dex, set()).add(parsed.canonical_coin)
+        return parsed.canonical_coin
 
     def update_mids(self, *, dex: str, mids: dict[str, Any], source: str, replace: bool = False) -> None:
         updated: set[str] = set()
         for raw_coin, value in mids.items():
             try:
-                parsed = parse_coin(str(raw_coin), default_dex=dex)
-                self.set_price(dex=dex, coin=parsed.canonical_coin, price=Decimal(str(value)), source=source)
-                updated.add(parsed.canonical_coin)
+                canonical = self.set_price(
+                    dex=dex,
+                    coin=str(raw_coin),
+                    price=Decimal(str(value)),
+                    source=source,
+                )
+                if canonical is not None:
+                    updated.add(canonical)
             except Exception:
                 continue
         if replace and updated:
             target_dex = str(dex or "").lower()
-            for canonical in list(self._prices):
-                if parse_coin(canonical).dex == target_dex and canonical not in updated:
-                    self._prices.pop(canonical, None)
+            known = self._markets_by_dex.setdefault(target_dex, set())
+            for canonical in known - updated:
+                self._prices.pop(canonical, None)
+            self._markets_by_dex[target_dex] = set(updated)
 
     def get(self, canonical: str) -> PriceEntry | None:
         return self._prices.get(parse_coin(canonical).canonical_coin)
@@ -269,10 +520,11 @@ class LowLatencyPriceCache:
         now = now or datetime.now(timezone.utc)
         result: dict[str, Decimal] = {}
         target_dex = str(dex or "").lower()
-        for canonical, entry in self._prices.items():
-            parsed = parse_coin(canonical)
-            if parsed.dex != target_dex:
+        for canonical in self._markets_by_dex.get(target_dex, set()):
+            entry = self._prices.get(canonical)
+            if entry is None:
                 continue
+            parsed = parse_coin(canonical)
             if int((now - entry.updated_at).total_seconds() * 1000) > self.stale_ms:
                 continue
             result[parsed.canonical_coin] = entry.price
@@ -298,14 +550,15 @@ class LowLatencyPriceCache:
         now = datetime.now(timezone.utc)
         result: dict[str, dict[str, Any]] = {}
         for dex in dexes:
+            target_dex = str(dex or "").lower()
             entries = [
                 (coin, entry)
-                for coin, entry in self._prices.items()
-                if parse_coin(coin).dex == str(dex or "").lower()
+                for coin in self._markets_by_dex.get(target_dex, set())
+                if (entry := self._prices.get(coin)) is not None
             ]
             ages = [int((now - entry.updated_at).total_seconds() * 1000) for _, entry in entries]
             stale = [coin for coin, entry in entries if int((now - entry.updated_at).total_seconds() * 1000) > self.stale_ms]
-            result[str(dex or "").lower()] = {
+            result[target_dex] = {
                 "markets_count": len(entries),
                 "fresh": bool(entries) and not stale,
                 "stale_markets_count": len(stale),
@@ -313,11 +566,29 @@ class LowLatencyPriceCache:
             }
         return result
 
-    def snapshot(self, dexes: list[str]) -> dict[str, Any]:
+    def snapshot(
+        self,
+        dexes: list[str],
+        *,
+        canonical_coins: set[str] | None = None,
+    ) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         allowed = {str(dex or "").lower() for dex in dexes}
+        selected = (
+            {parse_coin(value).canonical_coin for value in canonical_coins if value}
+            if canonical_coins is not None
+            else None
+        )
         prices: dict[str, dict[str, Any]] = {}
-        for canonical, entry in self._prices.items():
+        candidates = (
+            selected
+            if selected is not None
+            else set().union(*(self._markets_by_dex.get(dex, set()) for dex in allowed))
+        )
+        for canonical in candidates:
+            entry = self._prices.get(canonical)
+            if entry is None:
+                continue
             parsed = parse_coin(canonical)
             if parsed.dex not in allowed:
                 continue
@@ -479,6 +750,9 @@ class PendingIntentLedger:
             return True
         return False
 
+    def has_active_order_id(self, order_id: int) -> bool:
+        return int(order_id) in self._by_order_id
+
     def has_cloid(self, cloid: str | None) -> bool:
         return bool(cloid and str(cloid) in self._by_cloid)
 
@@ -488,6 +762,12 @@ class PendingIntentLedger:
 
     def submit_barriers_before(self, order: ExecutionOrder | None) -> list[PendingIntent]:
         current = self.intent_for_order(order)
+        return self._submit_barriers_before_intent(current)
+
+    def submit_barriers_before_order_id(self, order_id: int) -> list[PendingIntent]:
+        return self._submit_barriers_before_intent(self._by_order_id.get(int(order_id)))
+
+    def _submit_barriers_before_intent(self, current: PendingIntent | None) -> list[PendingIntent]:
         if current is None:
             return []
         barriers: list[PendingIntent] = []
@@ -693,11 +973,17 @@ class FollowerManualPositionGuardEntry:
     canonical_coin: str
     created_at: datetime
     reason: str
+    position_version: int = 0
+    expected_position_side: PositionSide | None = None
+    expected_position_qty: Decimal | None = None
+    expected_position_relation: str | None = None
+    position_change_confirmed_at: datetime | None = None
 
     def blocker_message(self) -> str:
         return (
-            "MANUAL_FOLLOWER_POSITION_GUARD: follower has a manual/unallocated "
-            f"{self.canonical_coin} position; copy actions are disabled until that follower position is flat"
+            "MANUAL_FOLLOWER_POSITION_GUARD: follower has an unmatched "
+            f"{self.canonical_coin} fill; copy actions are disabled until the follower position "
+            "and allocation ledger are reconciled"
         )
 
 
@@ -705,13 +991,33 @@ class FollowerManualPositionGuard:
     def __init__(self) -> None:
         self._by_market: dict[tuple[str, str], FollowerManualPositionGuardEntry] = {}
 
-    def mark(self, market: MarketKey, *, reason: str, observed_at: datetime | None = None) -> None:
+    def mark(
+        self,
+        market: MarketKey,
+        *,
+        reason: str,
+        observed_at: datetime | None = None,
+        position_version: int = 0,
+        expected_position_side: PositionSide | str | None = None,
+        expected_position_qty: Decimal | None = None,
+        expected_position_relation: str | None = None,
+        position_change_confirmed_at: datetime | None = None,
+    ) -> None:
         key = self._key(market)
         self._by_market[key] = FollowerManualPositionGuardEntry(
             dex=key[0],
             canonical_coin=key[1],
             created_at=_datetime_or_none(observed_at) or datetime.now(timezone.utc),
             reason=reason[:500],
+            position_version=max(int(position_version or 0), 0),
+            expected_position_side=_position_side_or_none(expected_position_side),
+            expected_position_qty=(
+                abs(Decimal(expected_position_qty))
+                if expected_position_qty is not None
+                else None
+            ),
+            expected_position_relation=str(expected_position_relation or "").upper() or None,
+            position_change_confirmed_at=_datetime_or_none(position_change_confirmed_at),
         )
 
     def active_entry(self, market: MarketKey) -> FollowerManualPositionGuardEntry | None:
@@ -723,21 +1029,61 @@ class FollowerManualPositionGuard:
     def entries(self) -> list[FollowerManualPositionGuardEntry]:
         return list(self._by_market.values())
 
+    def confirm_if_observed(
+        self,
+        market: MarketKey,
+        *,
+        follower_qty_by_side: dict[PositionSide, Decimal],
+        allocation_qty_by_side: dict[PositionSide, Decimal] | None = None,
+        follower_state_at: datetime | None,
+    ) -> datetime | None:
+        entry = self.active_entry(market)
+        if entry is None:
+            return None
+        if entry.position_change_confirmed_at is not None:
+            return entry.position_change_confirmed_at
+        observed_state_at = _datetime_or_none(follower_state_at)
+        trustworthy_after = entry.created_at + timedelta(
+            seconds=UNMATCHED_FOLLOWER_FILL_STATE_SETTLE_SECONDS
+        )
+        if observed_state_at is None or observed_state_at < trustworthy_after:
+            return None
+        absolute_checkpoint_seen = _manual_fill_position_checkpoint_satisfied(
+            entry, follower_qty_by_side=follower_qty_by_side
+        )
+        allocation_delta_seen = _manual_fill_allocation_delta_satisfied(
+            entry,
+            follower_qty_by_side=follower_qty_by_side,
+            allocation_qty_by_side=allocation_qty_by_side,
+        )
+        if not absolute_checkpoint_seen and not allocation_delta_seen:
+            return None
+        entry.position_change_confirmed_at = observed_state_at
+        return observed_state_at
+
     def reconcile(
         self,
         market: MarketKey,
         *,
         unmanaged_qty_by_side: dict[PositionSide, Decimal],
         follower_state_at: datetime | None,
+        allocation_mismatch: bool = False,
+        follower_qty_by_side: dict[PositionSide, Decimal] | None = None,
+        allocation_qty_by_side: dict[PositionSide, Decimal] | None = None,
     ) -> FollowerManualPositionGuardEntry | None:
         entry = self.active_entry(market)
         if entry is None:
             return None
-        observed_state_at = _datetime_or_none(follower_state_at)
-        if observed_state_at is None or observed_state_at < entry.created_at:
+        self.confirm_if_observed(
+            market,
+            follower_qty_by_side=follower_qty_by_side or _empty_position_side_qtys(),
+            allocation_qty_by_side=allocation_qty_by_side,
+            follower_state_at=follower_state_at,
+        )
+        if entry.position_change_confirmed_at is None:
             return entry
         has_unmanaged = any(qty > ALLOCATION_TRANSITION_TOLERANCE for qty in unmanaged_qty_by_side.values())
-        if has_unmanaged:
+        if has_unmanaged or allocation_mismatch:
             return entry
         self.clear(market)
         return None
@@ -756,6 +1102,89 @@ class FollowerManualPositionGuard:
     @staticmethod
     def _key(market: MarketKey) -> tuple[str, str]:
         return str(market.dex or "").lower(), str(market.canonical_coin or "").upper()
+
+
+def _manual_fill_position_confirmation_spec(
+    fill: dict[str, Any],
+) -> tuple[PositionSide, Decimal, str] | None:
+    start = _decimal_from_value(fill.get("startPosition"))
+    size = _decimal_from_value(fill.get("sz"))
+    side = str(fill.get("side") or "").upper()
+    if start is None or size is None or size <= 0 or side not in {"A", "B"}:
+        return None
+    after = start + size if side == "B" else start - size
+    before_abs = abs(start)
+    after_abs = abs(after)
+    before_side = PositionSide.LONG if start > 0 else PositionSide.SHORT if start < 0 else None
+    after_side = PositionSide.LONG if after > 0 else PositionSide.SHORT if after < 0 else None
+    if before_side is not None and after_side is not None and before_side != after_side:
+        # A manual flip cannot safely be attributed to the old copy lifecycle.
+        return None
+    if after_abs > before_abs + ALLOCATION_TRANSITION_TOLERANCE:
+        return (
+            after_side or before_side or PositionSide.FLAT,
+            _q(after_abs),
+            MANUAL_FILL_POSITION_AT_LEAST,
+        )
+    if after_abs < before_abs - ALLOCATION_TRANSITION_TOLERANCE:
+        return (
+            before_side or after_side or PositionSide.FLAT,
+            _q(after_abs),
+            MANUAL_FILL_POSITION_AT_MOST,
+        )
+    checkpoint_side = after_side or before_side
+    if checkpoint_side is None:
+        return None
+    return checkpoint_side, _q(after_abs), MANUAL_FILL_POSITION_EXACT
+
+
+def _manual_fill_position_checkpoint_satisfied(
+    entry: FollowerManualPositionGuardEntry,
+    *,
+    follower_qty_by_side: dict[PositionSide, Decimal],
+) -> bool:
+    side = entry.expected_position_side
+    expected = entry.expected_position_qty
+    relation = str(entry.expected_position_relation or "").upper()
+    if side not in {PositionSide.LONG, PositionSide.SHORT} or expected is None:
+        return False
+    opposite = _opposite_side(side)
+    if Decimal(follower_qty_by_side.get(opposite, 0)) > ALLOCATION_TRANSITION_TOLERANCE:
+        return False
+    actual = abs(Decimal(follower_qty_by_side.get(side, 0)))
+    if relation == MANUAL_FILL_POSITION_AT_LEAST:
+        return actual >= expected - ALLOCATION_TRANSITION_TOLERANCE
+    if relation == MANUAL_FILL_POSITION_AT_MOST:
+        return actual <= expected + ALLOCATION_TRANSITION_TOLERANCE
+    if relation == MANUAL_FILL_POSITION_EXACT:
+        return abs(actual - expected) <= ALLOCATION_TRANSITION_TOLERANCE
+    return False
+
+
+def _manual_fill_allocation_delta_satisfied(
+    entry: FollowerManualPositionGuardEntry,
+    *,
+    follower_qty_by_side: dict[PositionSide, Decimal],
+    allocation_qty_by_side: dict[PositionSide, Decimal] | None,
+) -> bool:
+    if allocation_qty_by_side is None:
+        return False
+    side = entry.expected_position_side
+    relation = str(entry.expected_position_relation or "").upper()
+    if side not in {PositionSide.LONG, PositionSide.SHORT}:
+        return False
+    opposite = _opposite_side(side)
+    if Decimal(follower_qty_by_side.get(opposite, 0)) > ALLOCATION_TRANSITION_TOLERANCE:
+        return False
+    actual = abs(Decimal(follower_qty_by_side.get(side, 0)))
+    allocated = abs(Decimal(allocation_qty_by_side.get(side, 0)))
+    if relation == MANUAL_FILL_POSITION_AT_LEAST:
+        return actual > allocated + ALLOCATION_TRANSITION_TOLERANCE
+    if relation == MANUAL_FILL_POSITION_AT_MOST:
+        return actual < allocated - ALLOCATION_TRANSITION_TOLERANCE
+    if relation == MANUAL_FILL_POSITION_EXACT:
+        return abs(actual - allocated) <= ALLOCATION_TRANSITION_TOLERANCE
+    return False
 
 
 def parse_fill_to_market_key(fill: dict[str, Any], *, default_dex: str = "") -> MarketKey:
@@ -781,21 +1210,42 @@ class FillDrivenExecutionEngine:
         *,
         settings: Settings,
         info_client: HyperliquidInfoClient,
+        account_info_client: HyperliquidInfoClient | None = None,
         execution_client: HyperliquidExecutionClient,
         price_cache: LowLatencyPriceCache,
         manual_position_guard: FollowerManualPositionGuard | None = None,
+        follower_position_stream_trusted: Callable[[str], bool] | None = None,
+        shared_db_session_factory: Callable[[], Any] | None = None,
     ) -> None:
         self.settings = settings
+        execution_scope = getattr(settings, "low_latency_execution_scope", None)
+        self.execution_scope = (
+            str(execution_scope() or "").lower()
+            if callable(execution_scope)
+            else ""
+        )
         self.info_client = info_client
+        # Balance polling has its own HTTP connection pool and rate-limit
+        # queue. It can never occupy the info-client slots needed by a fill
+        # that encounters a genuinely new market or needs live recovery data.
+        self.account_info_client = account_info_client or info_client
         self.execution_client = execution_client
         self.price_cache = price_cache
         self.manual_position_guard = manual_position_guard
+        self._follower_position_stream_trusted = follower_position_stream_trusted
+        self._shared_db_session_factory = shared_db_session_factory or SessionLocal
         self.market_leverage_plan_cache: dict[tuple[str, str], Any] = {}
         self._asset_id_cache: dict[tuple[str, str], int] = {}
+        self._market_asset_offsets: dict[str, int] = {}
+        self._perp_dex_directory_refreshed_at: datetime | None = None
         self._market_meta_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
+        self._market_meta_refresh_locks: dict[str, asyncio.Lock] = {}
+        self._market_meta_force_refresh_at: dict[str, datetime] = {}
         self._risk_settings_ok_cache: dict[tuple[str, str, int | None, str], RiskSettingResult] = {}
         self._risk_settings_locks: dict[tuple[str, str, int | None], asyncio.Lock] = {}
         self._account_abstraction_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
+        self._account_abstraction_refresh_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._account_abstraction_full_refresh_at: dict[tuple[str, str], datetime] = {}
         self.pending_intents = PendingIntentLedger()
         self._state_refresh_task: asyncio.Task | None = None
         self._account_abstraction_refresh_tasks: dict[tuple[str, str, str], asyncio.Task] = {}
@@ -813,13 +1263,33 @@ class FillDrivenExecutionEngine:
                 .where(MarketRiskSetting.effective_leverage.is_not(None))
             )
         ).scalars().all()
+        warmed = 0
         for row in rows:
+            persisted_effective = _int_or_none(row.effective_leverage)
+            if one_x_leverage_required(
+                margin_mode=row.actual_margin_mode or row.desired_margin_mode,
+                canonical_coin_value=row.canonical_coin,
+            ):
+                policy_effective = 1
+            else:
+                policy_effective = (
+                    _int_or_none(row.market_max_leverage)
+                    or int(self.settings.hyperliquid_default_leverage or 10)
+                )
+            if (
+                persisted_effective != policy_effective
+                or _int_or_none(row.actual_leverage) != policy_effective
+            ):
+                # Never reuse a legacy >1x isolated/CXMT confirmation.  The
+                # first risk-increasing order must reconfirm the 1x policy at
+                # the exchange before it can submit.
+                continue
             result = _risk_setting_result_from_row(row)
             self._risk_settings_ok_cache[
                 (
                     str(row.dex or "").lower(),
                     str(row.canonical_coin or "").upper(),
-                    row.effective_leverage,
+                    policy_effective,
                     row.desired_margin_mode or DESIRED_MARGIN_MODE,
                 )
             ] = result
@@ -828,11 +1298,12 @@ class FillDrivenExecutionEngine:
                     (
                         str(row.dex or "").lower(),
                         str(row.canonical_coin or "").upper(),
-                        row.effective_leverage,
+                        policy_effective,
                         row.actual_margin_mode,
                     )
                 ] = result
-        return len(rows)
+            warmed += 1
+        return warmed
 
     async def warm_account_abstraction_cache(self, db: Any, *, leader_addresses: list[str]) -> int:
         warmed = 0
@@ -871,10 +1342,11 @@ class FillDrivenExecutionEngine:
             fill = _snapshot_recovery_fill(fill, reason=recovery_reason)
         dedupe_started_at = datetime.now(timezone.utc)
         ws_received_at = fill.ws_received_at
-        inserted = await self._record_source_fill(db, fill, processed=True)
+        inserted = await self._claim_source_fill_group(db, fill)
         dedupe_done_at = datetime.now(timezone.utc)
         if not inserted:
             return None
+        await self._assert_market_fill_fifo(db, fill)
         debounce_ms = min(max(int(self.settings.max_fill_debounce_ms), 0), 1000)
         debounce_started_at = datetime.now(timezone.utc)
         if debounce_ms:
@@ -914,9 +1386,150 @@ class FillDrivenExecutionEngine:
         decision_started_at = datetime.now(timezone.utc)
         event_time = fill.hyperliquid_event_time
         blockers: list[str] = []
+        lifecycle_checkpoint_flip_open = False
+        lifecycle_economic_dust_reopen = False
+        lifecycle_economic_dust_reopen_mode: str | None = None
+        lifecycle_allocation: LeaderPositionAllocationRecord | None = None
+        minimum_tradeable_notional = Decimal(
+            str(self.settings.hyperliquid_min_order_value_usd)
+        )
 
-        if not is_coin_allowed(leader, fill.market.canonical_coin):
-            blockers.append("coin not allowed for leader")
+        # Ownership acquisition has a deliberately dependency-free fast gate.
+        # Once a market is released, an unrelated leader's add/reduce/close/flip
+        # belongs to a lifecycle that began while somebody else owned the market.
+        # Complete it as IGNORED before metadata, prices, account values, follower
+        # guards, or handoff waits so it cannot head-of-line block a later genuine
+        # startPosition=0 open.  A same-side increase from an economically flat
+        # (< venue minimum) leader remainder is also a genuine new lifecycle once
+        # it crosses back into tradeable size; the authoritative follower-flat and
+        # ownership checks still run later before any order can be submitted.
+        if isinstance(db, AsyncSession):
+            await self._release_resolved_pending_intents_for_market(db, fill.market)
+            lifecycle_allocation = await self._peek_allocation_for_lifecycle_gate(
+                db,
+                leader,
+                fill.market,
+            )
+            lifecycle_planning_allocation = self.pending_intents.overlay_allocation(
+                lifecycle_allocation
+            )
+            early_fill_implied_position = derive_leader_post_position_from_fill(fill)
+            pending_checkpoint_dust_reopen = (
+                _fill_is_minimum_residual_pending_checkpoint_reopen(
+                    lifecycle_allocation,
+                    early_fill_implied_position,
+                )
+            )
+            lifecycle_has_durable_unresolved_order = bool(
+                lifecycle_allocation is not None
+                and (
+                    not _allocation_lifecycle_active(
+                        lifecycle_planning_allocation
+                    )
+                    or pending_checkpoint_dust_reopen
+                )
+                and await self._allocation_has_durable_unresolved_order(
+                    db,
+                    lifecycle_allocation,
+                )
+            )
+            if (
+                pending_checkpoint_dust_reopen
+                and lifecycle_has_durable_unresolved_order
+            ):
+                raise MarketOwnershipHandoffPending(
+                    "MINIMUM_RESIDUAL_HANDOFF_PENDING: the follower economic "
+                    "close is unresolved; this dust reopen remains durable and "
+                    "will compete from its original FIFO position after release"
+                )
+            absolute_dust_reopen = _fill_is_economic_dust_reopen(
+                early_fill_implied_position,
+                reference_price=fill.price,
+                min_order_value=minimum_tradeable_notional,
+            )
+            checkpoint_dust_reopen = (
+                _fill_is_minimum_residual_checkpoint_reopen(
+                    lifecycle_planning_allocation,
+                    early_fill_implied_position,
+                )
+            )
+            lifecycle_economic_dust_reopen = bool(
+                not _allocation_lifecycle_active(lifecycle_planning_allocation)
+                and (absolute_dust_reopen or checkpoint_dust_reopen)
+            )
+            lifecycle_economic_dust_reopen_mode = (
+                "FOLLOWER_MINIMUM_RESIDUAL_CHECKPOINT"
+                if lifecycle_economic_dust_reopen and checkpoint_dust_reopen
+                else "LEADER_ABSOLUTE_DUST"
+                if lifecycle_economic_dust_reopen and absolute_dust_reopen
+                else None
+            )
+            early_lifecycle_ignore_reason = (
+                None
+                if lifecycle_has_durable_unresolved_order
+                else _ignore_without_allocation_reason(
+                    lifecycle_planning_allocation,
+                    early_fill_implied_position,
+                    allow_economic_dust_reopen=lifecycle_economic_dust_reopen,
+                )
+            )
+            lifecycle_checkpoint_flip_open = _fill_is_checkpoint_contiguous_flip_open(
+                lifecycle_planning_allocation,
+                early_fill_implied_position,
+            )
+            if early_lifecycle_ignore_reason:
+                early_now = datetime.now(timezone.utc)
+                early_use_fill_position = _should_use_fill_derived_position(
+                    None,
+                    fill,
+                    early_fill_implied_position,
+                )
+                early_leader_notional = (
+                    early_fill_implied_position.notional_after_estimate
+                    if early_use_fill_position
+                    else None
+                )
+                early_side = (
+                    PositionSide.LONG
+                    if early_leader_notional is not None and early_leader_notional > 0
+                    else PositionSide.SHORT
+                    if early_leader_notional is not None and early_leader_notional < 0
+                    else PositionSide.FLAT
+                )
+                return await self._record_lifecycle_ignored_order(
+                    db,
+                    fill=fill,
+                    leader=leader,
+                    reason=early_lifecycle_ignore_reason,
+                    target_side_hint=early_side,
+                    leader_position_notional=early_leader_notional,
+                    leader_entry_px=(
+                        early_fill_implied_position.entry_px
+                        if early_use_fill_position
+                        else None
+                    ),
+                    leader_account_value=_configured_leader_account_value(leader),
+                    follower_account_value=None,
+                    dedupe_started_at=dedupe_started_at,
+                    dedupe_done_at=dedupe_done_at,
+                    debounce_started_at=debounce_started_at,
+                    debounce_released_at=debounce_released_at,
+                    lock_wait_started_at=lock_wait_started_at,
+                    lock_acquired_at=lock_acquired_at,
+                    ws_received_at=ws_received_at,
+                    decision_started_at=decision_started_at,
+                    account_cache_read_at=early_now,
+                    account_cache_read_done_at=early_now,
+                    price_cache_read_at=early_now,
+                    price_cache_read_done_at=early_now,
+                )
+
+        follower_market_position_version = await self._follower_market_position_version_for_plan(
+            db,
+            fill.market,
+        )
+
+        coin_allowed_by_config = is_coin_allowed(leader, fill.market.canonical_coin)
         asset_id_hydrate_started_at = None
         asset_id_hydrate_done_at = None
         asset_id_source = "fill"
@@ -931,7 +1544,10 @@ class FillDrivenExecutionEngine:
                 asset_id_source = "meta_rest" if fill.market.asset_id is not None else "unresolved"
             asset_id_hydrate_done_at = datetime.now(timezone.utc)
             if fill.market.asset_id is None:
-                blockers.append("could not resolve Hyperliquid asset id for fill market")
+                raise RetryableFillProcessingError(
+                    "could not resolve Hyperliquid asset id for fill market"
+                )
+        await self._ensure_market_execution_metadata(fill.market)
 
         price_cache_read_at = datetime.now(timezone.utc)
         cached_price_entry = await self._load_hot_path_price(fill.market)
@@ -946,7 +1562,7 @@ class FillDrivenExecutionEngine:
             )
         )
         if price_entry is None or not order_price_fresh:
-            blockers.append("price cache stale or missing for fill market")
+            raise RetryableFillProcessingError("price cache stale or missing for fill market")
 
         blocking_unresolved = await self._blocking_unresolved_same_market_orders(
             db,
@@ -954,7 +1570,7 @@ class FillDrivenExecutionEngine:
             market=fill.market,
         )
         if blocking_unresolved:
-            blockers.append(UNRESOLVED_SAME_MARKET_ORDER_BLOCKER)
+            raise RetryableFillProcessingError(UNRESOLVED_SAME_MARKET_ORDER_BLOCKER)
 
         account_cache_read_at = datetime.now(timezone.utc)
         follower_value = await self._resolved_account_value(
@@ -1086,15 +1702,31 @@ class FillDrivenExecutionEngine:
             )
             existing_allocation = None
             planning_allocation = None
-        market_owner_allocation = await self._load_market_owner_allocation(db, fill.market)
-        market_owner_blocker = _market_owner_blocker(
-            market_owner_allocation,
-            leader=leader,
-            current_allocation=planning_allocation,
+        absolute_dust_reopen = _fill_is_economic_dust_reopen(
+            fill_implied_position,
+            reference_price=fill.price,
+            min_order_value=minimum_tradeable_notional,
         )
-        if market_owner_blocker:
-            blockers.append(market_owner_blocker)
-        lifecycle_ignore_reason = _ignore_without_allocation_reason(planning_allocation, fill_implied_position)
+        checkpoint_dust_reopen = _fill_is_minimum_residual_checkpoint_reopen(
+            lifecycle_allocation,
+            fill_implied_position,
+        )
+        lifecycle_economic_dust_reopen = bool(
+            not _allocation_lifecycle_active(planning_allocation)
+            and (absolute_dust_reopen or checkpoint_dust_reopen)
+        )
+        lifecycle_economic_dust_reopen_mode = (
+            "FOLLOWER_MINIMUM_RESIDUAL_CHECKPOINT"
+            if lifecycle_economic_dust_reopen and checkpoint_dust_reopen
+            else "LEADER_ABSOLUTE_DUST"
+            if lifecycle_economic_dust_reopen and absolute_dust_reopen
+            else None
+        )
+        lifecycle_ignore_reason = _ignore_without_allocation_reason(
+            planning_allocation,
+            fill_implied_position,
+            allow_economic_dust_reopen=lifecycle_economic_dust_reopen,
+        )
         if lifecycle_ignore_reason:
             return await self._record_lifecycle_ignored_order(
                 db,
@@ -1119,6 +1751,20 @@ class FillDrivenExecutionEngine:
                 price_cache_read_at=price_cache_read_at,
                 price_cache_read_done_at=price_cache_read_done_at,
             )
+        market_owner_allocation = await self._load_market_owner_allocation(db, fill.market)
+        market_owner_blocker = _market_owner_blocker(
+            market_owner_allocation,
+            leader=leader,
+            current_allocation=planning_allocation,
+        )
+        if market_owner_blocker:
+            if await self._market_owner_handoff_pending(db, market_owner_allocation):
+                raise MarketOwnershipHandoffPending(
+                    "MARKET_OWNER_HANDOFF_PENDING: the prior owner is closing or its first order "
+                    "is still unresolved; this fill remains durable and will claim the market "
+                    "immediately after the prior lifecycle is finalized"
+                )
+            blockers.append(market_owner_blocker)
         if leader_position_notional is None and planning_allocation is not None:
             leader_position_notional = Decimal("0")
             leader_position_size = Decimal("0")
@@ -1165,13 +1811,69 @@ class FillDrivenExecutionEngine:
         except ValueError as exc:
             transition_plan = None
             blockers.append(str(exc))
+        if lifecycle_economic_dust_reopen and transition_plan is not None:
+            formula_inputs = dict(transition_plan.formula_inputs or {})
+            formula_inputs.update(
+                {
+                    "economic_dust_reopen": True,
+                    "economic_dust_reopen_mode": lifecycle_economic_dust_reopen_mode,
+                    "economic_dust_start_notional": str(
+                        abs(
+                            Decimal(fill_implied_position.start_position or 0)
+                            * Decimal(fill.price)
+                        )
+                    ),
+                    "economic_dust_post_notional": str(
+                        abs(fill_implied_position.notional_after_estimate)
+                    ),
+                    "minimum_tradeable_notional": str(
+                        minimum_tradeable_notional
+                    ),
+                    "economic_dust_reopen_formula": (
+                        "leader startPosition was below the venue minimum and "
+                        "the same-side increase crossed back into tradeable size; "
+                        "treat follower-flat state as a new account-ratio lifecycle"
+                    ),
+                }
+            )
+            transition_plan = replace(
+                transition_plan,
+                formula_inputs=formula_inputs,
+            )
         sizing_done_at = datetime.now(timezone.utc)
+
+        coin_allowed_for_fill = _coin_config_allows_fill(
+            config_allowed=coin_allowed_by_config,
+            allocation=planning_allocation,
+            fill_implied_position=fill_implied_position,
+            transition_plan=transition_plan,
+        )
+        if not coin_allowed_for_fill:
+            blockers.append("coin not allowed for leader")
 
         if transition_plan is not None and transition_plan.action == AllocationTransitionAction.BLOCK:
             blockers.append(transition_plan.reason)
+        position_cap_rejected = bool(
+            transition_plan is not None
+            and transition_plan.action == AllocationTransitionAction.BLOCK
+            and str(transition_plan.reason or "").startswith(
+                MAX_POSITION_NOTIONAL_CAP_EXCEEDED
+            )
+        )
         if _transition_requires_account_value(transition_plan):
-            blockers.extend(account_value_blockers)
+            if account_value_blockers:
+                raise RetryableFillProcessingError(
+                    "account value required for sizing is temporarily unavailable: "
+                    + "; ".join(account_value_blockers)
+                )
         plan_warnings = _allocation_plan_warnings(transition_plan)
+        transition_plan, minimum_residual_early_close = (
+            _close_instead_of_leaving_untradeable_residual(
+                transition_plan=transition_plan,
+                current_allocation=planning_allocation,
+                min_order_value=Decimal(str(self.settings.hyperliquid_min_order_value_usd)),
+            )
+        )
         current_allocation = existing_allocation
         pending_open_activation_reason = _pending_open_activation_block_reason(
             planning_allocation,
@@ -1189,6 +1891,7 @@ class FillDrivenExecutionEngine:
             fill_implied_position,
             transition_plan,
             allow_missed_reduce_catchup=missed_reduce_catchup,
+            allow_checkpoint_flip_open=lifecycle_checkpoint_flip_open,
         )
         if fill_direction_guard_reason:
             blockers.append(fill_direction_guard_reason)
@@ -1212,8 +1915,21 @@ class FillDrivenExecutionEngine:
         aggregate_follower_state_at: datetime | None = None
         allocation_sum_qty: Decimal | None = None
         allocation_latest_reconcile_at: datetime | None = None
+        persisted_allocation_qty_by_side: dict[PositionSide, Decimal] | None = None
+        aggregate_allocation_read_started_at: datetime | None = None
+        aggregate_allocation_read_done_at: datetime | None = None
+        follower_position_read_started_at: datetime | None = None
+        follower_position_read_done_at: datetime | None = None
+        opposite_allocation_guard_started_at: datetime | None = None
+        opposite_allocation_guard_done_at: datetime | None = None
+        market_leverage_plan_started_at: datetime | None = None
+        market_leverage_plan_done_at: datetime | None = None
+        sizing_guard_started_at: datetime | None = None
+        sizing_guard_done_at: datetime | None = None
         allocation_mismatch = False
         allocation_mismatch_state_lag = False
+        allocation_mismatch_reduce_safe = False
+        follower_below_allocation = False
         unmanaged_follower_position = False
         unmanaged_follower_position_state_lag = False
         unmanaged_follower_position_reduce_safe = False
@@ -1221,24 +1937,138 @@ class FillDrivenExecutionEngine:
         manual_follower_position_guard = False
         manual_follower_position_guard_reason: str | None = None
         manual_follower_position_guard_created_at: datetime | None = None
+        follower_position_state_fresh: bool | None = None
+        follower_position_stream_trusted = False
+        economic_dust_reopen_follower_flat: bool | None = None
         if aggregate_side != PositionSide.FLAT:
+            aggregate_allocation_read_started_at = datetime.now(timezone.utc)
             allocation_qty_by_side, allocation_latest_reconcile_at = await self._allocation_sum_qtys_with_latest_reconcile(
                 db,
                 fill.market,
+            )
+            aggregate_allocation_read_done_at = datetime.now(timezone.utc)
+            persisted_allocation_qty_by_side = dict(allocation_qty_by_side)
+            follower_position_read_started_at = aggregate_allocation_read_done_at
+            follower_qty_by_side, aggregate_follower_state_at = await self._follower_position_qtys_with_state_at(
+                db,
+                fill.market,
+            )
+            follower_position_read_done_at = datetime.now(timezone.utc)
+            follower_qty_by_side = self.pending_intents.effective_qtys(
+                dex=fill.market.dex,
+                canonical_coin=fill.market.canonical_coin,
+                base_qtys=follower_qty_by_side,
             )
             allocation_qty_by_side = self.pending_intents.effective_qtys(
                 dex=fill.market.dex,
                 canonical_coin=fill.market.canonical_coin,
                 base_qtys=allocation_qty_by_side,
             )
+            aggregate_follower_qty = follower_qty_by_side.get(aggregate_side, Decimal("0"))
             allocation_sum_qty = allocation_qty_by_side.get(aggregate_side, Decimal("0"))
+            allocation_mismatch = any(
+                abs(
+                    Decimal(follower_qty_by_side.get(side, 0))
+                    - Decimal(allocation_qty_by_side.get(side, 0))
+                )
+                > ALLOCATION_TRANSITION_TOLERANCE
+                for side in (PositionSide.LONG, PositionSide.SHORT)
+            )
+            allocation_mismatch_state_lag = _allocation_mismatch_from_stale_follower_state(
+                allocation_mismatch=allocation_mismatch,
+                follower_state_at=aggregate_follower_state_at,
+                allocation_latest_reconcile_at=allocation_latest_reconcile_at,
+            )
+            unmanaged_qty_by_side = _unmanaged_follower_position_qtys(
+                follower_qty_by_side=follower_qty_by_side,
+                allocation_qty_by_side=allocation_qty_by_side,
+            )
+            unmanaged_follower_position = any(
+                qty > ALLOCATION_TRANSITION_TOLERANCE for qty in unmanaged_qty_by_side.values()
+            )
+            unmanaged_follower_position_state_lag = _unmanaged_follower_position_from_stale_follower_state(
+                unmanaged_follower_position=unmanaged_follower_position,
+                follower_state_at=aggregate_follower_state_at,
+                allocation_latest_reconcile_at=allocation_latest_reconcile_at,
+            )
+            unmanaged_follower_position_reduce_safe = _unmanaged_follower_position_reduce_safe(
+                transition_plan=transition_plan,
+                unmanaged_qty_by_side=unmanaged_qty_by_side,
+            )
+            follower_below_allocation = any(
+                Decimal(follower_qty_by_side.get(side, 0))
+                < Decimal(allocation_qty_by_side.get(side, 0)) - ALLOCATION_TRANSITION_TOLERANCE
+                for side in (PositionSide.LONG, PositionSide.SHORT)
+            )
+            allocation_mismatch_reduce_safe = bool(
+                allocation_mismatch
+                and not follower_below_allocation
+                and unmanaged_follower_position_reduce_safe
+            )
+            unmanaged_follower_position_qty_by_side = _position_side_qtys_payload(unmanaged_qty_by_side)
+            stale_seconds = max(
+                0.5,
+                float(getattr(self.settings, "account_state_stale_seconds", 2) or 2),
+            )
+            if self._follower_position_stream_trusted is not None:
+                try:
+                    follower_position_stream_trusted = bool(
+                        self._follower_position_stream_trusted(fill.market.dex)
+                    )
+                except Exception:
+                    follower_position_stream_trusted = False
+            follower_position_state_fresh = _follower_position_state_is_fresh(
+                state_at=aggregate_follower_state_at,
+                now=datetime.now(timezone.utc),
+                stale_seconds=stale_seconds,
+                stream_trusted=follower_position_stream_trusted,
+            )
+            economic_dust_reopen_flat_blocker = (
+                _economic_dust_reopen_follower_flat_blocker(
+                    economic_dust_reopen=lifecycle_economic_dust_reopen,
+                    follower_qty_by_side=follower_qty_by_side,
+                )
+            )
+            if lifecycle_economic_dust_reopen:
+                economic_dust_reopen_follower_flat = (
+                    economic_dust_reopen_flat_blocker is None
+                )
+            if economic_dust_reopen_flat_blocker:
+                blockers.append(economic_dust_reopen_flat_blocker)
+
+            actionable_transition = bool(
+                transition_plan is not None
+                and transition_plan.action not in {AllocationTransitionAction.NOOP, AllocationTransitionAction.BLOCK}
+            )
+            if actionable_transition and not follower_position_state_fresh:
+                if _allocation_lifecycle_active(planning_allocation):
+                    raise RetryableFillProcessingError(
+                        "follower position state is stale while an active allocation is being changed"
+                    )
+                raise RetryableFillProcessingError(
+                    "follower position state is stale before a released market can be opened"
+                )
+            if actionable_transition and _allocation_lifecycle_active(planning_allocation):
+                if allocation_mismatch and not allocation_mismatch_state_lag and follower_below_allocation:
+                    raise RetryableFillProcessingError(
+                        "follower actual position is below the allocation ledger; waiting for allocation reconciliation"
+                    )
+
+            unmanaged_blocker = _unmanaged_follower_position_blocker(
+                transition_plan=transition_plan,
+                unmanaged_qty_by_side=unmanaged_qty_by_side,
+                unmanaged_position_state_lag=unmanaged_follower_position_state_lag,
+                canonical_coin=fill.market.canonical_coin,
+            )
+            if unmanaged_blocker:
+                blockers.append(unmanaged_blocker)
             if (
                 self.manual_position_guard is not None
                 and transition_plan is not None
                 and transition_plan.action not in {AllocationTransitionAction.NOOP, AllocationTransitionAction.BLOCK}
             ):
                 guard_entry = self.manual_position_guard.active_entry(fill.market)
-                if guard_entry is not None and not _allocation_lifecycle_active(planning_allocation):
+                if guard_entry is not None:
                     manual_follower_position_guard = True
                     manual_follower_position_guard_reason = guard_entry.reason
                     manual_follower_position_guard_created_at = guard_entry.created_at
@@ -1254,7 +2084,23 @@ class FillDrivenExecutionEngine:
             AllocationTransitionAction.INCREASE,
             AllocationTransitionAction.FLIP_OPEN_SECOND,
         }:
-            if await self._opposite_aggregate_allocation_exists(db, leader, fill.market, transition_plan.new_side):
+            opposite_allocation_guard_started_at = datetime.now(timezone.utc)
+            if persisted_allocation_qty_by_side is not None:
+                opposite_allocation_exists = _opposite_allocation_exists_in_snapshot(
+                    allocation_qty_by_side=persisted_allocation_qty_by_side,
+                    current_allocation=planning_allocation,
+                    current_leader_id=leader.id,
+                    new_side=transition_plan.new_side,
+                )
+            else:
+                opposite_allocation_exists = await self._opposite_aggregate_allocation_exists(
+                    db,
+                    leader,
+                    fill.market,
+                    transition_plan.new_side,
+                )
+            opposite_allocation_guard_done_at = datetime.now(timezone.utc)
+            if opposite_allocation_exists:
                 blockers.append("Opposite aggregate allocation exists on same Hyperliquid account")
         if transition_plan is not None and transition_plan.action in {
             AllocationTransitionAction.REDUCE,
@@ -1278,8 +2124,22 @@ class FillDrivenExecutionEngine:
                 )
             except AllocationScopeError as exc:
                 blockers.append(str(exc))
-        leverage_plan = await self._load_market_leverage_plan(db, fill.market, leader_position)
-        effective_leverage = leverage_plan.effective_leverage or self.settings.hyperliquid_default_leverage
+        market_leverage_plan_started_at = datetime.now(timezone.utc)
+        leverage_plan = await self._load_market_leverage_plan(
+            db,
+            fill.market,
+            leader_position,
+            reduce_only=reduce_only,
+        )
+        market_leverage_plan_done_at = datetime.now(timezone.utc)
+        market_only_isolated = market_requires_isolated_margin(leverage_plan.market_meta)
+        required_margin_mode = FALLBACK_MARGIN_MODE if market_only_isolated else DESIRED_MARGIN_MODE
+        effective_leverage = _resolved_market_effective_leverage(
+            leverage_plan,
+            configured_default_leverage=self.settings.hyperliquid_default_leverage,
+            required_margin_mode=required_margin_mode,
+            canonical_coin_value=fill.market.canonical_coin,
+        )
         if target_delta_abs > 0 and not reduce_only and not leverage_plan.ok_for_open:
             blockers.append(leverage_plan.reason or "market max leverage not confirmed")
         leader_margin_mode_observed = _observed_margin_mode(leader_position)
@@ -1294,17 +2154,15 @@ class FillDrivenExecutionEngine:
             if not margin_ok:
                 blockers.append("insufficient available collateral for target delta")
 
-        kill_switch_active = await self._kill_switch_active(db)
-        if (
-            kill_switch_active
-            and not reduce_only
-            and target_delta_abs > ALLOCATION_TRANSITION_TOLERANCE
-            and transition_plan is not None
-            and transition_plan.action not in {AllocationTransitionAction.NOOP, AllocationTransitionAction.BLOCK}
-        ):
-            blockers.append("kill switch active")
+        # The authoritative emergency-switch check is serialized with /off at
+        # the final exchange-submit boundary.  Reading it here as well added a
+        # database round trip to every open/increase without making the race any
+        # safer: a switch can change immediately after this planning read.  Let
+        # the final guard alone decide whether an order may reach the exchange.
+        kill_switch_active = False
 
         sizing_guard_error: str | None = None
+        sizing_guard_started_at = datetime.now(timezone.utc)
         if (
             target_delta_abs > Decimal("0.00000001")
             and not reduce_only
@@ -1342,6 +2200,7 @@ class FillDrivenExecutionEngine:
             except SizingGuardError as exc:
                 sizing_guard_error = str(exc)
                 blockers.append(f"ACCOUNT_RATIO guard failed: {exc}")
+        sizing_guard_done_at = datetime.now(timezone.utc)
 
         order_side_value = _order_side(target_side=order_position_side, reduce_only=reduce_only)
         quantity = _order_quantity_for_transition(
@@ -1409,11 +2268,7 @@ class FillDrivenExecutionEngine:
                 "allow_target_notional_price_drift": allow_target_notional_price_drift,
             },
         )
-        validator_result, final_close_min_order_override = _override_final_close_min_order_validator(
-            reduce_only=reduce_only,
-            transition_plan=transition_plan,
-            validator_result=validator_result,
-        )
+        final_close_min_order_override = False
         reduce_quantity_guard_blockers = _reduce_quantity_guard_blockers(
             reduce_only=reduce_only,
             transition_plan=transition_plan,
@@ -1498,6 +2353,13 @@ class FillDrivenExecutionEngine:
                 source_fill_id=fill.source_fill_id,
                 now=datetime.now(timezone.utc),
             )
+            await self._record_source_fill_outcomes(
+                db,
+                fill,
+                order=None,
+                disposition=FILL_OUTCOME_MIN_NOTIONAL_EXEMPT,
+                reason="follower order is below the Hyperliquid minimum order value",
+            )
             await db.commit()
             return None
         if _should_fast_forward_below_min_active_increase(
@@ -1516,6 +2378,13 @@ class FillDrivenExecutionEngine:
                 copy_multiplier=leader.copy_multiplier,
                 source_fill_id=fill.source_fill_id,
                 now=datetime.now(timezone.utc),
+            )
+            await self._record_source_fill_outcomes(
+                db,
+                fill,
+                order=None,
+                disposition=FILL_OUTCOME_MIN_NOTIONAL_EXEMPT,
+                reason="follower order is below the Hyperliquid minimum order value",
             )
             await db.commit()
             return None
@@ -1545,6 +2414,7 @@ class FillDrivenExecutionEngine:
             source_type="AUTO_COPY",
             source_coin=fill.market.coin,
             execution_venue=ExecutionVenue.HYPERLIQUID.value,
+            venue_account=self.execution_scope,
             dex=fill.market.dex,
             canonical_coin=fill.market.canonical_coin,
             raw_coin_from_fill=fill.market.raw_coin,
@@ -1618,8 +2488,13 @@ class FillDrivenExecutionEngine:
                 "trading_enabled": self.settings.trading_enabled,
                 "hyperliquid_trading_enabled": self.settings.hyperliquid_trading_enabled,
                 "kill_switch_off": not kill_switch_active,
+                "kill_switch_check_deferred_to_serialized_submit_boundary": not reduce_only,
                 "leader_enabled": leader.enabled and leader.deleted_at is None,
-                "coin_allowed": is_coin_allowed(leader, fill.market.canonical_coin),
+                "coin_allowed": coin_allowed_for_fill,
+                "coin_allowed_by_config": coin_allowed_by_config,
+                "blocked_coin_existing_lifecycle_continuation": bool(
+                    not coin_allowed_by_config and coin_allowed_for_fill
+                ),
                 "price_fresh": order_price_fresh,
                 "price_cache_fresh": price_cache_fresh,
                 "price_cache_age_ms": price_cache_age_ms,
@@ -1632,17 +2507,20 @@ class FillDrivenExecutionEngine:
                 "live_leader_position_refresh": live_leader_position_refresh,
                 "stale_snapshot_cannot_override_fill": True,
                 "snapshot_conflict": snapshot_conflict,
-                "follower_account_state_fresh": None,
-                "follower_account_state_hot_path": False,
+                "follower_account_state_fresh": follower_position_state_fresh,
+                "follower_position_stream_trusted": follower_position_stream_trusted,
+                "follower_account_state_hot_path": True,
                 "effective_leverage": effective_leverage,
+                "effective_leverage_source": "CONFIRMED_MARKET_TARGET",
                 "market_max_leverage": leverage_plan.max_leverage,
                 "market_sz_decimals": leverage_plan.sz_decimals,
                 "market_asset_id_from_meta": leverage_plan.asset_id,
+                "market_only_isolated": market_only_isolated,
                 "effective_leverage_confirmed": leverage_plan.ok_for_open,
                 "leader_margin_mode_observed": leader_margin_mode_observed,
-                "follower_margin_mode_required": DESIRED_MARGIN_MODE,
+                "follower_margin_mode_required": required_margin_mode,
                 "follower_margin_mode_confirmed": False,
-                "follower_isolated_required": DESIRED_MARGIN_MODE == "ISOLATED",
+                "follower_isolated_required": required_margin_mode == FALLBACK_MARGIN_MODE,
                 "follower_isolated_confirmed": False,
                 "follower_leverage_confirmed": False,
                 "margin_sufficient": margin_ok,
@@ -1662,6 +2540,8 @@ class FillDrivenExecutionEngine:
                 ),
                 "allocation_mismatch": allocation_mismatch,
                 "allocation_mismatch_state_lag": allocation_mismatch_state_lag,
+                "allocation_mismatch_reduce_safe": allocation_mismatch_reduce_safe,
+                "follower_below_allocation": follower_below_allocation,
                 "aggregate_follower_qty": str(aggregate_follower_qty) if aggregate_follower_qty is not None else None,
                 "aggregate_follower_state_at": _iso_or_none(aggregate_follower_state_at),
                 "scope_aggregate_follower_qty": (
@@ -1678,6 +2558,8 @@ class FillDrivenExecutionEngine:
                 "manual_follower_position_guard": manual_follower_position_guard,
                 "manual_follower_position_guard_reason": manual_follower_position_guard_reason,
                 "manual_follower_position_guard_created_at": _iso_or_none(manual_follower_position_guard_created_at),
+                "follower_market_position_version": follower_market_position_version,
+                "follower_market_position_version_checked_at": decision_started_at.isoformat(),
                 "pending_open": pending_open,
                 "pending_open_reason": pending_open_reason,
                 "pending_open_activation_blocked": bool(pending_open_activation_reason),
@@ -1685,7 +2567,9 @@ class FillDrivenExecutionEngine:
                 "missed_reduce_catchup": missed_reduce_catchup,
                 "fill_direction_guard_reason": fill_direction_guard_reason,
                 "blocked_order_preserves_allocation_state": blocked_order_preserves_allocation,
+                "position_cap_rejected": position_cap_rejected,
                 "final_close_min_order_override": final_close_min_order_override,
+                "minimum_residual_early_close": minimum_residual_early_close,
                 "sizing_guard_error": sizing_guard_error,
                 "reduce_quantity_guard": {
                     "ok": not reduce_quantity_guard_blockers,
@@ -1714,11 +2598,37 @@ class FillDrivenExecutionEngine:
                     if market_owner_allocation is not None
                     else None,
                 },
+                "market_ownership_acquisition_required": bool(
+                    current_allocation is None
+                    and transition_plan is not None
+                    and transition_plan.action == AllocationTransitionAction.OPEN
+                ),
+                "market_ownership_new_open_from_flat": _fill_is_new_open_from_flat(
+                    fill_implied_position
+                ),
+                "market_ownership_checkpoint_flip_open": lifecycle_checkpoint_flip_open,
+                "market_ownership_economic_dust_reopen": lifecycle_economic_dust_reopen,
+                "economic_dust_reopen_mode": lifecycle_economic_dust_reopen_mode,
+                "economic_dust_reopen_follower_flat": economic_dust_reopen_follower_flat,
                 "error_code": _validator_error_code(validator_result),
                 "order_validator": validator_result.to_dict(),
                 "blockers": blockers,
             },
         )
+        for trace_key, trace_value in {
+            "aggregate_allocation_read_started_at": aggregate_allocation_read_started_at,
+            "aggregate_allocation_read_done_at": aggregate_allocation_read_done_at,
+            "follower_position_read_started_at": follower_position_read_started_at,
+            "follower_position_read_done_at": follower_position_read_done_at,
+            "opposite_allocation_guard_started_at": opposite_allocation_guard_started_at,
+            "opposite_allocation_guard_done_at": opposite_allocation_guard_done_at,
+            "market_leverage_plan_started_at": market_leverage_plan_started_at,
+            "market_leverage_plan_done_at": market_leverage_plan_done_at,
+            "sizing_guard_started_at": sizing_guard_started_at,
+            "sizing_guard_done_at": sizing_guard_done_at,
+        }.items():
+            if trace_value is not None:
+                _trace_set(order, trace_key, trace_value)
         if pending_submit_write_started_at is not None:
             _trace_set(order, "pending_submit_write_started_at", pending_submit_write_started_at)
         if asset_id_hydrate_started_at is not None:
@@ -1744,9 +2654,96 @@ class FillDrivenExecutionEngine:
                     }),
                 )
             )
+        if minimum_residual_early_close and transition_plan is not None:
+            db.add(
+                RiskEvent(
+                    severity="warning",
+                    event_type="MINIMUM_RESIDUAL_EARLY_CLOSE",
+                    symbol=fill.market.canonical_coin,
+                    leader_address=leader.leader_address,
+                    message=(
+                        "proportional follower remainder was below the venue minimum; "
+                        "the full allocation close was selected to prevent terminal dust"
+                    ),
+                    metadata_json=_json_safe({
+                        "source_fill_id": fill.source_fill_id,
+                        "dex": fill.market.dex,
+                        "canonical_coin": fill.market.canonical_coin,
+                        "allocation_id": current_allocation.id if current_allocation else None,
+                        "formula_target_notional_before_close": (
+                            transition_plan.formula_inputs or {}
+                        ).get("formula_target_notional_before_minimum_residual_close"),
+                        "minimum_tradeable_notional": (
+                            transition_plan.formula_inputs or {}
+                        ).get("minimum_tradeable_notional"),
+                        "close_qty_limit": str(transition_plan.close_qty_limit),
+                    }),
+                )
+            )
+        if lifecycle_economic_dust_reopen and transition_plan is not None:
+            db.add(
+                RiskEvent(
+                    severity="info",
+                    event_type="ECONOMIC_DUST_REOPEN",
+                    symbol=fill.market.canonical_coin,
+                    leader_address=leader.leader_address,
+                    message=(
+                        "leader increased a sub-minimum same-side remainder back "
+                        "into tradeable size; follower-flat state was treated as "
+                        "a new account-ratio lifecycle"
+                    ),
+                    metadata_json=_json_safe(
+                        {
+                            "source_fill_id": fill.source_fill_id,
+                            "dex": fill.market.dex,
+                            "canonical_coin": fill.market.canonical_coin,
+                            "start_position": str(
+                                fill_implied_position.start_position
+                            ),
+                            "post_position": str(
+                                fill_implied_position.signed_size_after
+                            ),
+                            "reference_price": str(fill.price),
+                            "start_notional": (
+                                transition_plan.formula_inputs or {}
+                            ).get("economic_dust_start_notional"),
+                            "post_notional": (
+                                transition_plan.formula_inputs or {}
+                            ).get("economic_dust_post_notional"),
+                            "minimum_tradeable_notional": str(
+                                minimum_tradeable_notional
+                            ),
+                            "reopen_mode": lifecycle_economic_dust_reopen_mode,
+                            "prior_allocation_id": (
+                                lifecycle_allocation.id
+                                if lifecycle_allocation is not None
+                                else None
+                            ),
+                            "transition_action": transition_plan.action.value,
+                            "order_status": status,
+                            "blockers": blockers,
+                        }
+                    ),
+                )
+            )
         _set_latency_fields(order)
         db.add(order)
         await db.flush()
+        await self._record_source_fill_outcomes(
+            db,
+            fill,
+            order=order,
+            disposition=(
+                FILL_OUTCOME_ORDER_PLANNED
+                if status == "PENDING_SUBMIT"
+                else FILL_OUTCOME_MIN_NOTIONAL_EXEMPT
+                if _validator_error_code(validator_result) == "BELOW_MIN_ORDER_VALUE"
+                else FILL_OUTCOME_NO_ACTION_REQUIRED
+                if status in {"NOOP", "IGNORED"} or _expected_no_action_block(order.error_message)
+                else FILL_OUTCOME_MANUAL_REVIEW
+            ),
+            reason=order.error_message,
+        )
         if pending_submit_write_started_at is not None:
             _trace_set(order, "pending_submit_write_done_at", datetime.now(timezone.utc))
             _set_latency_fields(order)
@@ -1777,6 +2774,7 @@ class FillDrivenExecutionEngine:
                 canonical_coin=fill.market.canonical_coin,
                 binance_symbol=None,
                 execution_venue=ExecutionVenue.HYPERLIQUID.value,
+                venue_account=self.execution_scope,
                 venue_symbol=fill.market.venue_symbol,
                 position_side=order_position_side.value,
                 target_notional=state_target_notional,
@@ -1816,10 +2814,21 @@ class FillDrivenExecutionEngine:
                     now=datetime.now(timezone.utc),
                 )
             elif blocked_order_preserves_allocation:
-                _preserve_allocation_state_after_blocked_order(
-                    current_allocation,
-                    now=datetime.now(timezone.utc),
-                )
+                if position_cap_rejected:
+                    _preserve_allocation_state_after_position_cap_rejection(
+                        current_allocation,
+                        leader_account_value=leader_account_value,
+                        leader_position_notional=leader_position_notional,
+                        leader_position_size=leader_position_size,
+                        copy_multiplier=leader.copy_multiplier,
+                        source_fill_id=fill.source_fill_id,
+                        now=datetime.now(timezone.utc),
+                    )
+                else:
+                    _preserve_allocation_state_after_blocked_order(
+                        current_allocation,
+                        now=datetime.now(timezone.utc),
+                    )
             else:
                 current_allocation.target_notional = state_target_notional
                 current_allocation.last_leader_account_value = leader_account_value
@@ -1874,6 +2883,18 @@ class FillDrivenExecutionEngine:
                     if not _apply_pending_reduce_offset_from_plan(current_allocation, transition_plan):
                         _clear_deferred_reduce(current_allocation)
 
+        if (
+            current_allocation is not None
+            and status == "PENDING_SUBMIT"
+            and minimum_residual_early_close
+        ):
+            _mark_minimum_residual_release_pending(
+                current_allocation,
+                order=order,
+                quantity=quantity,
+                now=datetime.now(timezone.utc),
+            )
+
         if current_allocation is not None and transition_plan is not None:
             _record_allocation_event(
                 db,
@@ -1881,6 +2902,8 @@ class FillDrivenExecutionEngine:
                 order=order,
                 action="DIRECTION_GUARD_BLOCKED"
                 if direction_guard_preserve_allocation
+                else "POSITION_CAP_REJECTED"
+                if position_cap_rejected
                 else "BLOCKED_PRESERVE"
                 if blocked_order_preserves_allocation
                 else "DEFERRED_REDUCE"
@@ -1922,50 +2945,575 @@ class FillDrivenExecutionEngine:
                     metadata_json={"source_fill_id": fill.source_fill_id, "dex": fill.market.dex},
                 )
             )
+        if status == "PENDING_SUBMIT":
+            _trace_set(order, "order_plan_commit_started_at", datetime.now(timezone.utc))
         await db.commit()
         if status == "PENDING_SUBMIT" and submit_order:
             self._release_pending_intent_if_resolved(order)
         return order
 
-    async def submit_planned_order(self, db: Any, order: ExecutionOrder, fill: FillEvent) -> None:
-        status = str(order.status or "").upper()
-        if status == "PENDING_SUBMIT":
-            claimed = await self._claim_order_for_submit(db, order)
-            if not claimed:
-                return
-        elif status == "SUBMITTING":
+    async def _follower_market_position_version_for_plan(
+        self,
+        db: Any,
+        market: MarketKey,
+    ) -> int:
+        memory_entry = (
+            self.manual_position_guard.active_entry(market)
+            if self.manual_position_guard is not None
+            else None
+        )
+        if memory_entry is not None:
+            raise RetryableFillProcessingError(memory_entry.blocker_message())
+        if not isinstance(db, AsyncSession):
+            return 0
+        row = await db.scalar(
+            _follower_market_guard_query(
+                market,
+                execution_scope=self.execution_scope,
+            ).with_for_update()
+        )
+        if row is None:
+            return 0
+        if bool(row.active):
+            if self.manual_position_guard is not None:
+                self.manual_position_guard.mark(
+                    market,
+                    reason=row.reason or "durable unmatched follower fill guard",
+                    observed_at=row.observed_at,
+                    position_version=int(row.position_version or 0),
+                    expected_position_side=row.expected_position_side,
+                    expected_position_qty=row.expected_position_qty,
+                    expected_position_relation=row.expected_position_relation,
+                    position_change_confirmed_at=row.position_change_confirmed_at,
+                )
+            raise RetryableFillProcessingError(
+                "DURABLE_FOLLOWER_MARKET_GUARD: an unmatched follower fill is being reconciled; "
+                "the source fill remains pending and will be replanned"
+            )
+        return int(row.position_version or 0)
+
+    async def _assert_follower_market_plan_current(
+        self,
+        db: Any,
+        order: ExecutionOrder,
+        fill: FillEvent,
+    ) -> None:
+        if not isinstance(db, AsyncSession):
             return
-        else:
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(:market_key)"),
+            {"market_key": _market_transaction_key(fill.market, self.execution_scope)},
+        )
+        guard = await db.scalar(
+            _follower_market_guard_query(
+                fill.market,
+                execution_scope=self.execution_scope,
+            ).with_for_update()
+        )
+        current_version = int(guard.position_version or 0) if guard is not None else 0
+        checklist = order.pre_trade_checklist or {}
+        planned_version = _int_or_none(checklist.get("follower_market_position_version"))
+        guard_active = bool(guard is not None and guard.active)
+        memory_guard_active = bool(
+            self.manual_position_guard is not None
+            and self.manual_position_guard.active_entry(fill.market) is not None
+        )
+        if planned_version == current_version and not guard_active and not memory_guard_active:
+            order.pre_trade_checklist = _json_safe({
+                **checklist,
+                "follower_market_position_cas": {
+                    "ok": True,
+                    "planned_version": planned_version,
+                    "current_version": current_version,
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                },
+            })
+            return
+
+        reason = (
+            "unmatched follower fill changed the market position after order planning"
+            if planned_version != current_version
+            else "follower market guard became active after order planning"
+        )
+        invalidated = await self._invalidate_unsubmitted_market_plans_for_replay(
+            db,
+            market=fill.market,
+            current_version=current_version,
+            invalidate_current_version=guard_active or memory_guard_active,
+            reason=reason,
+        )
+        if invalidated:
+            raise StaleFollowerMarketPlanInvalidated(reason)
+        raise RetryablePreExchangeSubmitError(
+            "follower market position changed before exchange submit; waiting for durable reconciliation"
+        )
+
+    async def _invalidate_unsubmitted_market_plans_for_replay(
+        self,
+        db: AsyncSession,
+        *,
+        market: MarketKey,
+        current_version: int,
+        invalidate_current_version: bool,
+        reason: str,
+    ) -> int:
+        rows = (
+            await db.execute(
+                select(ExecutionOrder)
+                .where(ExecutionOrder.source_type == "AUTO_COPY")
+                .where(ExecutionOrder.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                .where(ExecutionOrder.venue_account == self.execution_scope)
+                .where(ExecutionOrder.dex == market.dex)
+                .where(func.upper(ExecutionOrder.canonical_coin) == market.canonical_coin.upper())
+                .where(ExecutionOrder.status.in_(["PENDING_SUBMIT", "SUBMITTING"]))
+                .where(ExecutionOrder.order_submit_started_at.is_(None))
+                .with_for_update()
+            )
+        ).scalars().all()
+        stale_rows = [
+            row
+            for row in rows
+            if _planned_follower_market_position_version(row) != current_version
+            or invalidate_current_version
+        ]
+        if not stale_rows:
+            return 0
+
+        stale_order_ids = [int(row.id) for row in stale_rows if row.id is not None]
+        outcome_source_fill_ids = (
+            await db.execute(
+                select(SourceFillOutcome.source_fill_id).where(
+                    SourceFillOutcome.execution_order_id.in_(stale_order_ids)
+                )
+            )
+        ).scalars().all()
+        source_fill_ids = {
+            str(source_fill_id)
+            for source_fill_id in outcome_source_fill_ids
+            if source_fill_id
+        }
+        source_fill_ids.update(
+            str(row.source_fill_id) for row in stale_rows if row.source_fill_id
+        )
+        allocation_ids = {
+            int(row.allocation_id) for row in stale_rows if row.allocation_id is not None
+        }
+        now = datetime.now(timezone.utc)
+        if stale_order_ids:
+            await db.execute(
+                delete(SourceFillOutcome).where(
+                    SourceFillOutcome.execution_order_id.in_(stale_order_ids)
+                )
+            )
+        if source_fill_ids:
+            await db.execute(
+                update(SourceFill)
+                .where(SourceFill.source_fill_id.in_(source_fill_ids))
+                .values(
+                    processed_at=None,
+                    next_retry_at=now,
+                    last_processing_error=(
+                        "stale unsubmitted order plan invalidated after follower market position change"
+                    ),
+                    updated_at=now,
+                )
+            )
+        for row in stale_rows:
+            original_source_fill_id = row.source_fill_id
+            original_cloid = row.cloid
+            row.pre_trade_checklist = _json_safe({
+                **(row.pre_trade_checklist or {}),
+                "follower_market_position_cas": {
+                    "ok": False,
+                    "planned_version": _planned_follower_market_position_version(row),
+                    "current_version": current_version,
+                    "invalidated_at": now.isoformat(),
+                    "reason": reason,
+                    "source_fill_id": original_source_fill_id,
+                    "cloid": original_cloid,
+                },
+            })
+            row.status = "STALE_PLAN"
+            row.dry_run = True
+            row.error_message = (
+                "STALE_FOLLOWER_MARKET_PLAN: no exchange request was sent; "
+                "the source fill was returned to the durable inbox for replanning"
+            )
+            row.order_finalized_at = now
+            # Release both uniqueness keys only because the exchange submit-start
+            # marker proves this logical plan was never sent.
+            row.source_fill_id = None
+            row.cloid = None
+            self.pending_intents.release(row)
+
+        if allocation_ids:
+            allocations = (
+                await db.execute(
+                    select(LeaderPositionAllocationRecord)
+                    .where(LeaderPositionAllocationRecord.id.in_(allocation_ids))
+                    .with_for_update()
+                )
+            ).scalars().all()
+            for allocation in allocations:
+                allocated_qty = abs(Decimal(allocation.allocated_qty or 0))
+                allocated_notional = abs(Decimal(allocation.allocated_notional or 0))
+                if allocated_qty <= ALLOCATION_TRANSITION_TOLERANCE:
+                    _close_zero_allocation_lifecycle(
+                        allocation,
+                        reason="stale unsubmitted market plan invalidated before exchange submit",
+                        now=now,
+                    )
+                else:
+                    allocation.target_notional = allocated_notional
+                    allocation.status = "OPEN"
+                    if allocation.last_source_fill_id in source_fill_ids:
+                        allocation.last_source_fill_id = None
+                    if allocation.pending_reduce_source_fill_id in source_fill_ids:
+                        _clear_deferred_reduce(allocation)
+
+        db.add(
+            RiskEvent(
+                severity="warning",
+                event_type="STALE_FOLLOWER_MARKET_PLANS_REQUEUED",
+                symbol=market.canonical_coin,
+                leader_address=None,
+                message=(
+                    "unsubmitted plans were invalidated after a follower position version change; "
+                    "source fills returned to durable replay"
+                ),
+                metadata_json={
+                    "execution_venue": ExecutionVenue.HYPERLIQUID.value,
+                    "dex": market.dex,
+                    "canonical_coin": market.canonical_coin,
+                    "current_version": current_version,
+                    "invalidated_order_ids": stale_order_ids,
+                    "source_fill_count": len(source_fill_ids),
+                    "reason": reason,
+                },
+            )
+        )
+        await db.flush()
+        return len(stale_rows)
+
+    async def submit_planned_order(self, db: Any, order: ExecutionOrder, fill: FillEvent) -> None:
+        try:
+            status = str(order.status or "").upper()
+            if status == "PENDING_SUBMIT":
+                # Acquire market serialization before the order-row claim so
+                # every transaction keeps the global market -> row lock order.
+                # Holding it through the submit-marker commit lets the later
+                # submit function reuse this single CAS instead of reacquiring
+                # and rereading the same follower-market guard.
+                _trace_set(order, "submit_plan_guard_started_at", datetime.now(timezone.utc))
+                await self._assert_follower_market_plan_current(db, order, fill)
+                _trace_set(order, "submit_plan_guard_done_at", datetime.now(timezone.utc))
+                _trace_set(order, "submit_claim_started_at", datetime.now(timezone.utc))
+                claimed = await self._claim_order_for_submit(db, order)
+                _trace_set(order, "submit_claim_done_at", datetime.now(timezone.utc))
+                if not claimed:
+                    return
+            elif status == "SUBMITTING":
+                return
+            else:
+                self.pending_intents.release(order)
+                return
+            await self._submit_hyperliquid_order(
+                db,
+                order,
+                fill,
+                reduce_only=bool(order.reduce_only),
+                market_plan_guard_held=True,
+                durable_claim_pending=isinstance(db, AsyncSession),
+            )
+        except OrderSubmitClaimLost:
+            # The signed submit marker is the single durable PENDING->SUBMITTING
+            # CAS. A competing worker/recovery path already changed this order,
+            # so this transaction must discard every pre-send mutation and must
+            # never call the exchange.
+            if hasattr(db, "rollback"):
+                await db.rollback()
+            return
+        except StaleFollowerMarketPlanInvalidated:
+            await db.commit()
             self.pending_intents.release(order)
             return
-        await self._submit_hyperliquid_order(db, order, fill, reduce_only=bool(order.reduce_only))
+        await self._prefer_concurrently_recovered_fill(db, order)
         await self._apply_allocation_fill(db, order)
+        await self._update_order_source_fill_outcomes(db, order)
         await db.commit()
         self._release_pending_intent_if_resolved(order)
+
+    async def _block_order_for_active_kill_switch(
+        self,
+        db: Any,
+        order: ExecutionOrder,
+        fill: FillEvent,
+        *,
+        reduce_only: bool,
+        serialize_with_control: bool = False,
+    ) -> bool:
+        # Unit-level fake sessions do not represent a live runtime switch. Tests
+        # that exercise this gate opt in explicitly.
+        enforce_runtime_switch = isinstance(db, AsyncSession) or bool(
+            getattr(db, "enforce_runtime_kill_switch", False)
+        )
+        if reduce_only or not enforce_runtime_switch:
+            return False
+        if serialize_with_control:
+            await acquire_copy_trading_control_lock(db)
+        kill_switch_active = await self._kill_switch_active(db)
+        checked_at = datetime.now(timezone.utc)
+        order.pre_trade_checklist = _json_safe({
+            **(order.pre_trade_checklist or {}),
+            "runtime_kill_switch_guard": {
+                "ok": not kill_switch_active,
+                "checked_at": checked_at.isoformat(),
+                "serialized_with_control": serialize_with_control,
+                "reduce_close_allowed": True,
+            },
+            "kill_switch_off": not kill_switch_active,
+        })
+        if not kill_switch_active:
+            return False
+
+        order.status = "BLOCKED"
+        order.dry_run = True
+        order.error_message = EMERGENCY_KILL_SWITCH_ERROR
+        order.order_finalized_at = checked_at
+        allocation = None
+        if order.allocation_id is not None:
+            allocation = await self._load_allocation_for_update(db, order.allocation_id)
+        if _allocation_active(allocation):
+            _preserve_allocation_state_after_blocked_order(allocation, now=checked_at)
+        else:
+            await self._close_zero_allocation_after_unsubmitted_open(
+                db,
+                order,
+                fill,
+                reason=order.error_message,
+            )
+        db.add(
+            RiskEvent(
+                severity="warning",
+                event_type="EMERGENCY_KILL_SWITCH_BLOCKED_QUEUED_ORDER",
+                symbol=fill.market.canonical_coin,
+                leader_address=order.leader_address,
+                message=order.error_message,
+                metadata_json={
+                    "order_id": order.id,
+                    "source_fill_id": order.source_fill_id,
+                    "allocation_id": order.allocation_id,
+                    "cloid": order.cloid,
+                    "order_action": order.order_action,
+                    "serialized_with_control": serialize_with_control,
+                },
+            )
+        )
+        _set_latency_fields(order)
+        return True
+
+    async def _block_open_increase_above_latest_position_cap(
+        self,
+        db: Any,
+        order: ExecutionOrder,
+        fill: FillEvent,
+        *,
+        reduce_only: bool,
+    ) -> bool:
+        """Recheck the latest leader cap at the final reversible boundary.
+
+        Planning rejects the whole logical fill instead of clipping it. This
+        second check serializes with frontend config updates and protects a
+        queued plan from a lower cap, allocation reconciliation, rounded size,
+        or a fresher market price observed after planning. Reduce/close orders
+        bypass the guard unconditionally.
+        """
+
+        action = str(order.order_action or "").upper()
+        if reduce_only or action not in {
+            AllocationTransitionAction.OPEN.value,
+            AllocationTransitionAction.INCREASE.value,
+            AllocationTransitionAction.FLIP_OPEN_SECOND.value,
+        }:
+            return False
+        enforce = isinstance(db, AsyncSession) or bool(
+            getattr(db, "enforce_runtime_position_cap", False)
+        )
+        if not enforce:
+            return False
+
+        if isinstance(db, AsyncSession):
+            cap = await db.scalar(
+                select(LeaderConfig.max_notional_per_trade)
+                .where(LeaderConfig.id == order.leader_id)
+                # Serialize the final decision with PATCH /leaders/{id}. If the
+                # save commits first we see the new cap; otherwise that save
+                # takes effect immediately after this already-authorized send.
+                .with_for_update(read=True, of=LeaderConfig)
+                .limit(1)
+            )
+        else:
+            cap = getattr(db, "runtime_position_cap", None)
+        cap_value = _decimal_from_value(cap)
+        checked_at = datetime.now(timezone.utc)
+        if cap_value is None or cap_value <= 0:
+            order.pre_trade_checklist = _json_safe({
+                **(order.pre_trade_checklist or {}),
+                "final_position_cap_guard": {
+                    "ok": True,
+                    "cap": None,
+                    "checked_at": checked_at.isoformat(),
+                    "reduce_close_exempt": True,
+                },
+            })
+            return False
+
+        allocation = None
+        if order.allocation_id is not None:
+            allocation = await self._load_allocation_for_update(db, order.allocation_id)
+        current_qty = abs(Decimal(getattr(allocation, "allocated_qty", 0) or 0))
+        current_notional = abs(Decimal(getattr(allocation, "allocated_notional", 0) or 0))
+        order_qty = abs(Decimal(order.quantity or 0))
+        order_notional = abs(Decimal(order.notional or order.delta_notional or 0))
+        planned_target = abs(Decimal(order.target_notional or 0))
+        price_candidates = [
+            Decimal(order.estimated_price or 0),
+            Decimal(order.price or 0),
+        ]
+        final_limit_price = _decimal_from_value(
+            (order.request_payload_masked or {}).get("limit_px")
+        )
+        if final_limit_price is not None and final_limit_price > 0:
+            price_candidates.append(final_limit_price)
+        live_price_entry = self.price_cache.get(fill.market.canonical_coin)
+        if live_price_entry is not None:
+            price_candidates.append(Decimal(live_price_entry.price or 0))
+        live_price = max(price_candidates)
+        projected_qty_notional = (
+            _q((current_qty + order_qty) * live_price)
+            if live_price > 0
+            else Decimal("0")
+        )
+        projected_ledger_notional = _q(current_notional + order_notional)
+        projected_notional = max(
+            _q(planned_target),
+            projected_ledger_notional,
+            projected_qty_notional,
+        )
+        cap_value = _q(cap_value)
+        blocked = projected_notional > cap_value + ALLOCATION_TRANSITION_TOLERANCE
+        guard_payload = {
+            "ok": not blocked,
+            "cap": str(cap_value),
+            "planned_target_notional": str(_q(planned_target)),
+            "current_allocation_notional": str(_q(current_notional)),
+            "order_notional": str(_q(order_notional)),
+            "projected_ledger_notional": str(projected_ledger_notional),
+            "current_allocation_qty": str(_q(current_qty)),
+            "order_qty": str(_q(order_qty)),
+            "final_limit_price": str(_q(final_limit_price))
+            if final_limit_price is not None
+            else None,
+            "live_price": str(_q(live_price)),
+            "projected_qty_notional": str(projected_qty_notional),
+            "projected_notional": str(projected_notional),
+            "policy": "REJECT_WHOLE_OPEN_OR_INCREASE",
+            "checked_at": checked_at.isoformat(),
+            "reduce_close_exempt": True,
+        }
+        order.pre_trade_checklist = _json_safe({
+            **(order.pre_trade_checklist or {}),
+            "final_position_cap_guard": guard_payload,
+        })
+        if not blocked:
+            return False
+
+        order.status = "BLOCKED"
+        order.dry_run = True
+        order.error_message = (
+            f"{MAX_POSITION_NOTIONAL_CAP_EXCEEDED}: final projected position "
+            f"{projected_notional} exceeds latest configured cap {cap_value}; "
+            "whole open/increase rejected before exchange submit"
+        )
+        order.order_finalized_at = checked_at
+        if _allocation_active(allocation):
+            _preserve_allocation_state_after_blocked_order(allocation, now=checked_at)
+        else:
+            await self._close_zero_allocation_after_unsubmitted_open(
+                db,
+                order,
+                fill,
+                reason=order.error_message,
+            )
+        db.add(
+            RiskEvent(
+                severity="warning",
+                event_type="MAX_POSITION_NOTIONAL_CAP_BLOCKED_ORDER",
+                symbol=fill.market.canonical_coin,
+                leader_address=order.leader_address,
+                message=order.error_message,
+                metadata_json={
+                    "order_id": order.id,
+                    "source_fill_id": order.source_fill_id,
+                    "allocation_id": order.allocation_id,
+                    "order_action": order.order_action,
+                    **guard_payload,
+                },
+            )
+        )
+        _set_latency_fields(order)
+        return True
+
+    async def _prefer_concurrently_recovered_fill(self, db: Any, order: ExecutionOrder) -> None:
+        """Do not let a late submit response overwrite a recovery-confirmed fill."""
+        if not isinstance(db, AsyncSession) or order.id is None:
+            return
+        with db.no_autoflush:
+            row = (
+                await db.execute(
+                    select(
+                        ExecutionOrder.status,
+                        ExecutionOrder.executed_qty,
+                        ExecutionOrder.avg_fill_price,
+                        ExecutionOrder.cum_quote,
+                        ExecutionOrder.order_id,
+                        ExecutionOrder.venue_order_id,
+                        ExecutionOrder.raw_response,
+                        ExecutionOrder.response_payload_masked,
+                        ExecutionOrder.error_message,
+                        ExecutionOrder.order_finalized_at,
+                    ).where(ExecutionOrder.id == order.id)
+                )
+            ).one_or_none()
+        if row is None or Decimal(row.executed_qty or 0) <= Decimal(order.executed_qty or 0):
+            return
+        order.status = row.status
+        order.executed_qty = row.executed_qty
+        order.avg_fill_price = row.avg_fill_price
+        order.cum_quote = row.cum_quote
+        order.order_id = row.order_id
+        order.venue_order_id = row.venue_order_id
+        order.raw_response = row.raw_response
+        order.response_payload_masked = row.response_payload_masked
+        order.error_message = row.error_message
+        order.order_finalized_at = row.order_finalized_at
 
     async def _claim_order_for_submit(self, db: Any, order: ExecutionOrder) -> bool:
         if str(order.status or "").upper() != "PENDING_SUBMIT":
             return False
-        claim_time = datetime.now(timezone.utc)
         if order.id is None or not isinstance(db, AsyncSession):
+            claim_time = datetime.now(timezone.utc)
             order.status = "SUBMITTING"
             order.updated_at = claim_time
             if hasattr(db, "commit"):
                 await db.commit()
             return True
-        result = await db.execute(
-            update(ExecutionOrder)
-            .where(ExecutionOrder.id == order.id)
-            .where(ExecutionOrder.status == "PENDING_SUBMIT")
-            .values(status="SUBMITTING", updated_at=claim_time)
-            .returning(ExecutionOrder.id)
-        )
-        claimed_id = result.scalar_one_or_none()
-        if claimed_id is None:
-            return False
-        order.status = "SUBMITTING"
-        order.updated_at = claim_time
-        await db.commit()
+        # Do not issue a redundant UPDATE here.  The signed submit marker below
+        # performs the only durable PENDING_SUBMIT -> SUBMITTING compare-and-set
+        # and commits the cloid/signer/nonce/envelope atomically before transport.
+        # Until that CAS succeeds, a failure is provably pre-exchange and leaves
+        # the durable order replayable. Duplicate workers can prepare in parallel,
+        # but only the marker winner is allowed to send.
         return True
 
     def _release_pending_intent_if_resolved(self, order: ExecutionOrder) -> None:
@@ -2004,6 +3552,7 @@ class FillDrivenExecutionEngine:
                         leader_address=leader_address,
                         dex=market.dex,
                         canonical_coin=market.canonical_coin,
+                        execution_scope=self.execution_scope,
                     )
                 )
             ).scalars().all()
@@ -2068,6 +3617,7 @@ class FillDrivenExecutionEngine:
             source_type="AUTO_COPY",
             source_coin=fill.market.coin,
             execution_venue=ExecutionVenue.HYPERLIQUID.value,
+            venue_account=self.execution_scope,
             dex=fill.market.dex,
             canonical_coin=fill.market.canonical_coin,
             raw_coin_from_fill=fill.market.raw_coin,
@@ -2142,6 +3692,13 @@ class FillDrivenExecutionEngine:
         _set_latency_fields(order)
         db.add(order)
         await db.flush()
+        await self._record_source_fill_outcomes(
+            db,
+            fill,
+            order=order,
+            disposition=FILL_OUTCOME_NO_ACTION_REQUIRED,
+            reason=reason,
+        )
         await db.commit()
         return order
 
@@ -2154,20 +3711,35 @@ class FillDrivenExecutionEngine:
         reduce_only: bool,
     ) -> tuple[RiskSettingResult, str]:
         checklist = order.pre_trade_checklist or {}
-        desired_leverage = await self._market_default_leverage(db, fill.market)
-        market_max_leverage = _int_or_none(checklist.get("market_max_leverage"))
-        effective_leverage = (
-            _int_or_none(checklist.get("effective_leverage"))
-            or (min(desired_leverage, market_max_leverage) if market_max_leverage is not None else None)
-            or desired_leverage
+        validator_checklist = (
+            checklist.get("order_validator")
+            if isinstance(checklist.get("order_validator"), dict)
+            else {}
         )
-        account_address = self.settings.hyperliquid_follower_account_address() or ""
+        market_max_leverage = _int_or_none(
+            checklist.get("market_max_leverage")
+            or validator_checklist.get("market_max_leverage")
+            or validator_checklist.get("max_leverage")
+        )
+        # Leverage/margin settings do not affect a reduce-only action. Reuse the
+        # leverage that was already validated while planning instead of issuing
+        # another database query on every reduction.
         if reduce_only:
+            desired_leverage = (
+                _int_or_none(checklist.get("effective_leverage"))
+                or _int_or_none(checklist.get("follower_effective_leverage"))
+                or int(self.settings.hyperliquid_default_leverage or 10)
+            )
+            effective_leverage = min(
+                value
+                for value in (desired_leverage, market_max_leverage)
+                if value is not None and value > 0
+            )
             return (
                 RiskSettingResult(
                     is_ok=True,
                     status="SKIPPED_REDUCE_ONLY_FAST_PATH",
-                    account_address=account_address,
+                    account_address=self.settings.hyperliquid_follower_account_address() or "",
                     dex=fill.market.dex,
                     canonical_coin=fill.market.canonical_coin,
                     desired_margin_mode=DESIRED_MARGIN_MODE,
@@ -2182,18 +3754,66 @@ class FillDrivenExecutionEngine:
                 "reduce_only_skip",
             )
 
+        checklist_effective = _int_or_none(checklist.get("effective_leverage"))
+        # Planning already resolved and validated the market's effective
+        # leverage. If that exact market/leverage/margin tuple is confirmed in
+        # the process cache, avoid querying MarketRiskSetting again on every
+        # burst fill. A cache miss still follows the authoritative DB/exchange
+        # path below, so newly seen markets and changed leverage remain safe.
+        planned_margin_mode = str(
+            checklist.get("follower_margin_mode_required")
+            or validator_checklist.get("follower_margin_mode_required")
+            or (
+                FALLBACK_MARGIN_MODE
+                if (
+                    checklist.get("market_only_isolated")
+                    or validator_checklist.get("market_only_isolated")
+                )
+                else DESIRED_MARGIN_MODE
+            )
+        ).upper()
+        market_only_isolated_explicit = (
+            "market_only_isolated" in checklist
+            or "market_only_isolated" in validator_checklist
+        )
+        if checklist_effective is not None and checklist_effective > 0:
+            planned_cache_keys = [
+                (
+                    str(fill.market.dex or "").lower(),
+                    str(fill.market.canonical_coin or "").upper(),
+                    checklist_effective,
+                    planned_margin_mode,
+                )
+            ]
+            for cache_key in planned_cache_keys:
+                cached = self._risk_settings_ok_cache.get(cache_key)
+                if cached is not None:
+                    return cached, "process_cache_planned_leverage"
+
+        # Planning resolves the policy from the already-prewarmed authoritative
+        # market metadata: cross-capable=max leverage, isolated-only=1x.  Reuse
+        # that exact value here instead of querying a stale per-market DB target
+        # or taking the minimum with it.
+        if planned_margin_mode == FALLBACK_MARGIN_MODE:
+            effective_leverage = 1
+        else:
+            effective_leverage = (
+                checklist_effective
+                or _int_or_none(checklist.get("follower_effective_leverage"))
+                or market_max_leverage
+                or int(self.settings.hyperliquid_default_leverage or 10)
+            )
+            if market_max_leverage is not None and market_max_leverage > 0:
+                effective_leverage = min(effective_leverage, market_max_leverage)
+        desired_leverage = effective_leverage
+        account_address = self.settings.hyperliquid_follower_account_address() or ""
+
         cache_keys = [
             (
                 str(fill.market.dex or "").lower(),
                 str(fill.market.canonical_coin or "").upper(),
                 effective_leverage,
-                DESIRED_MARGIN_MODE,
-            ),
-            (
-                str(fill.market.dex or "").lower(),
-                str(fill.market.canonical_coin or "").upper(),
-                effective_leverage,
-                FALLBACK_MARGIN_MODE,
+                planned_margin_mode,
             ),
         ]
         for cache_key in cache_keys:
@@ -2220,7 +3840,12 @@ class FillDrivenExecutionEngine:
                 dex=fill.market.dex,
                 canonical_coin_value=fill.market.canonical_coin,
                 asset_id=fill.market.asset_id,
-                market_max_leverage=checklist.get("market_max_leverage"),
+                market_max_leverage=market_max_leverage,
+                market_only_isolated=(
+                    planned_margin_mode == FALLBACK_MARGIN_MODE
+                    if market_only_isolated_explicit
+                    else None
+                ),
                 desired_default_leverage=desired_leverage,
                 action_type=order.order_action or "OPEN",
                 reduce_only=False,
@@ -2297,6 +3922,8 @@ class FillDrivenExecutionEngine:
         fill: FillEvent,
         *,
         reduce_only: bool,
+        market_plan_guard_held: bool = False,
+        durable_claim_pending: bool = False,
     ) -> None:
         already_submitted = (
             order.order_submit_started_at is not None
@@ -2306,7 +3933,15 @@ class FillDrivenExecutionEngine:
             or bool(order.venue_order_id)
             or bool(order.raw_response)
         )
-        if already_submitted or (isinstance(db, AsyncSession) and str(order.status or "").upper() != "SUBMITTING"):
+        allowed_submit_statuses = (
+            {"PENDING_SUBMIT", "SUBMITTING"}
+            if durable_claim_pending
+            else {"SUBMITTING"}
+        )
+        if already_submitted or (
+            isinstance(db, AsyncSession)
+            and str(order.status or "").upper() not in allowed_submit_statuses
+        ):
             order.status = "BLOCKED"
             order.dry_run = True
             order.error_message = (
@@ -2331,6 +3966,12 @@ class FillDrivenExecutionEngine:
                 )
             )
             await self._close_zero_allocation_after_unsubmitted_open(db, order, fill, reason=order.error_message)
+            if not already_submitted:
+                await self._restore_unfilled_minimum_residual_release(
+                    db,
+                    order,
+                    fill,
+                )
             _set_latency_fields(order)
             return
         if not order.cloid or not order.estimated_price or order.quantity <= 0:
@@ -2338,6 +3979,11 @@ class FillDrivenExecutionEngine:
             order.dry_run = True
             order.error_message = "invalid order payload"
             await self._close_zero_allocation_after_unsubmitted_open(db, order, fill, reason=order.error_message)
+            await self._restore_unfilled_minimum_residual_release(
+                db,
+                order,
+                fill,
+            )
             return
         internal_blockers = self._pre_submit_internal_blockers(
             order=order,
@@ -2374,8 +4020,32 @@ class FillDrivenExecutionEngine:
             )
             _set_latency_fields(order)
             await self._close_zero_allocation_after_unsubmitted_open(db, order, fill, reason=order.error_message)
+            await self._restore_unfilled_minimum_residual_release(
+                db,
+                order,
+                fill,
+            )
             return
+        if await self._signer_has_ambiguous_submitted_order(db, order):
+            raise RetryablePreExchangeSubmitError(
+                "SIGNER_SUBMISSION_UNKNOWN_BARRIER: an earlier signed action is still ambiguous; "
+                "this order remains durable until recovery resolves it"
+            )
+        # Every transaction that can touch both the market serialization lock
+        # and an allocation row must acquire them in that order.  Fill planning
+        # already uses market -> allocation.  Taking the market lock before the
+        # live-allocation submit guard prevents a parallel fill planner and
+        # submit worker from forming the inverse allocation -> market deadlock.
+        # The submit-start commit releases this lock before the exchange call,
+        # so exchange round-trip latency is not serialized.
+        if not market_plan_guard_held:
+            await self._assert_follower_market_plan_current(db, order, fill)
         if await self._guard_reduce_submit_against_live_allocation(db, order, fill):
+            await self._restore_unfilled_minimum_residual_release(
+                db,
+                order,
+                fill,
+            )
             return
         submit_trace: dict[str, Any] = {}
         _trace_set(order, "submit_flow_started_at", datetime.now(timezone.utc))
@@ -2387,6 +4057,11 @@ class FillDrivenExecutionEngine:
                 order.error_message = _validator_payload_message(validator_payload) or "Hyperliquid order validator blocked order"
                 _set_latency_fields(order)
                 await self._close_zero_allocation_after_unsubmitted_open(db, order, fill, reason=order.error_message)
+                await self._restore_unfilled_minimum_residual_release(
+                    db,
+                    order,
+                    fill,
+                )
                 return
 
             _trace_set(order, "risk_setting_started_at", datetime.now(timezone.utc))
@@ -2401,6 +4076,12 @@ class FillDrivenExecutionEngine:
                 _trace_set(order, "risk_setting_done_at", datetime.now(timezone.utc))
             _trace_set_detail(order, "risk_setting_source", risk_setting_source)
             if not risk_settings.is_ok:
+                if str(risk_settings.reason_code or "").upper() != "CROSS_MARGIN_NOT_SUPPORTED":
+                    raise RetryablePreExchangeSubmitError(
+                        risk_settings.reason_code
+                        or risk_settings.reason
+                        or "Hyperliquid margin settings are temporarily unconfirmed"
+                    )
                 order.status = "BLOCKED"
                 order.dry_run = True
                 order.error_message = risk_settings.reason_code or risk_settings.reason or "could not confirm Hyperliquid margin settings"
@@ -2478,9 +4159,62 @@ class FillDrivenExecutionEngine:
                 "quantity": payload["sz"],
                 "limit_px": payload["limit_px"],
             })
+            if await self._block_open_increase_above_latest_position_cap(
+                db,
+                order,
+                fill,
+                reduce_only=reduce_only,
+            ):
+                return
+            # This is the final reversible boundary. The shared advisory lock
+            # orders this check against Telegram/frontend /off updates; the
+            # submit-start marker commit below releases it immediately before
+            # the exchange transport call.
+            if await self._block_order_for_active_kill_switch(
+                db,
+                order,
+                fill,
+                reduce_only=reduce_only,
+                serialize_with_control=True,
+            ):
+                return
+            durable_signed_submit = (
+                isinstance(db, AsyncSession)
+                and callable(getattr(self.execution_client, "prepare_market_order_envelope", None))
+                and callable(getattr(self.execution_client, "submit_market_order_envelope", None))
+                and bool(getattr(self.execution_client, "signer_scope", None))
+            )
+            if durable_signed_submit:
+                try:
+                    submit_nonce = await self._allocate_submit_nonce(db)
+                    signed_envelope = self.execution_client.prepare_market_order_envelope(
+                        nonce=submit_nonce,
+                        latency_trace=submit_trace,
+                        **payload,
+                    )
+                    signed_hash = _signed_envelope_hash(signed_envelope)
+                except Exception as exc:
+                    raise RetryablePreExchangeSubmitError(
+                        f"could not durably prepare signed exchange action: {redact_text(exc)}"
+                    ) from exc
+                order.submit_signer_scope = self.execution_client.signer_scope
+                order.submit_nonce = submit_nonce
+                order.signed_action_envelope = _json_safe(signed_envelope)
+                order.signed_action_hash = signed_hash
             exchange_submit_started_at = datetime.now(timezone.utc)
-            await self._persist_submit_started_marker(db, order, exchange_submit_started_at)
-            response = await self.execution_client.place_market_order(**payload, _latency_trace=submit_trace)
+            await self._persist_submit_started_marker(
+                db,
+                order,
+                exchange_submit_started_at,
+                claim_pending=durable_claim_pending,
+            )
+            if durable_signed_submit:
+                response = await self.execution_client.submit_market_order_envelope(
+                    signed_envelope,
+                    latency_trace=submit_trace,
+                )
+            else:
+                response = await self.execution_client.place_market_order(**payload, _latency_trace=submit_trace)
             exchange_submit_done_at = datetime.now(timezone.utc)
             _trace_merge_submit_trace(order, submit_trace)
             order.order_submit_done_at = exchange_submit_done_at
@@ -2509,6 +4243,33 @@ class FillDrivenExecutionEngine:
             if oid:
                 order.order_id = oid
                 order.venue_order_id = oid
+            if (
+                hyperliquid_error
+                and fill_qty is None
+                and is_hyperliquid_network_upgrade_post_only_error(hyperliquid_error)
+            ):
+                db.add(
+                    RiskEvent(
+                        severity="critical",
+                        event_type=HYPERLIQUID_NETWORK_UPGRADE_POST_ONLY_REJECTION,
+                        symbol=str(fill.market.canonical_coin)[:32],
+                        leader_address=order.leader_address,
+                        message=(
+                            "Hyperliquid explicitly rejected the order during the "
+                            "network-upgrade post-only period; manual action required"
+                        ),
+                        metadata_json={
+                            "order_id": order.id,
+                            "source_fill_id": order.source_fill_id,
+                            "canonical_coin": fill.market.canonical_coin,
+                            "order_action": order.order_action,
+                            "position_side": order.position_side,
+                            "quantity": str(order.quantity),
+                            "reduce_only": bool(order.reduce_only),
+                            "exchange_error": redact_text(hyperliquid_error),
+                        },
+                    )
+                )
             response_parsed_at = datetime.now(timezone.utc)
             _trace_set(order, "exchange_response_parsed_at", response_parsed_at)
             if status in {"OPEN", "RESTING", "SUBMITTED"}:
@@ -2531,7 +4292,7 @@ class FillDrivenExecutionEngine:
                             event_type="IOC_CANCEL_FAILED",
                             symbol=fill.market.canonical_coin,
                             leader_address=order.leader_address,
-                            message=f"IOC resting/open cancel failed: {exc}",
+                            message=f"IOC resting/open cancel failed: {redact_text(exc)}",
                             metadata_json={"cloid": order.cloid},
                         )
                     )
@@ -2547,7 +4308,20 @@ class FillDrivenExecutionEngine:
             order.dry_run = True
             order.error_message = str(exc)
             await self._close_zero_allocation_after_unsubmitted_open(db, order, fill, reason=order.error_message)
+        except RetryablePreExchangeSubmitError:
+            raise
+        except OrderSubmitClaimLost:
+            raise
+        except StaleFollowerMarketPlanInvalidated:
+            raise
         except Exception as exc:
+            # A database deadlock/serialization/connection failure before the
+            # durable submit-start marker is provably pre-exchange.  Let the
+            # queue worker roll the failed transaction back and retry the same
+            # durable order; querying from this aborted transaction would only
+            # mask the root error with InFailedSQLTransaction and delay replay.
+            if order.order_submit_started_at is None and _is_transient_submit_exception(exc):
+                raise
             _trace_merge_submit_trace(order, submit_trace)
             now = datetime.now(timezone.utc)
             if order.order_submit_started_at is not None:
@@ -2561,45 +4335,181 @@ class FillDrivenExecutionEngine:
                 order.status = "FAILED"
                 order.order_finalized_at = now
                 _trace_set(order, "order_finalized_at", now)
-                order.error_message = f"Hyperliquid order not submitted: {exc}"
+                order.error_message = f"Hyperliquid order not submitted: {redact_text(exc)}"
                 await self._close_zero_allocation_after_unsubmitted_open(db, order, fill, reason=order.error_message)
             else:
                 order.status = "UNKNOWN"
-                order.error_message = f"Hyperliquid order status unknown: {exc}"
+                order.error_message = f"Hyperliquid order status unknown: {redact_text(exc)}"
             order.dry_run = False
         if order.status in {"REJECTED", "CANCELED", "EXPIRED"} and not order.executed_qty:
             await self._close_allocation_after_absent_reduce_rejection(db, order, fill)
             await self._close_zero_allocation_after_unsubmitted_open(db, order, fill, reason=order.error_message or order.status)
+        if (
+            str(order.status or "").upper()
+            in {"FAILED", "REJECTED", "CANCELED", "EXPIRED", "BLOCKED"}
+            and not order.executed_qty
+        ):
+            await self._restore_unfilled_minimum_residual_release(
+                db,
+                order,
+                fill,
+            )
         _set_latency_fields(order)
+        actual_send_ms = ((order.latency_trace or {}).get("metrics") or {}).get(
+            "ws_to_actual_send_ms"
+        )
+        if actual_send_ms is not None and actual_send_ms > PER_FILL_INTERNAL_LATENCY_WARN_MS:
+            metrics = (order.latency_trace or {}).get("metrics") or {}
+            log.warning(
+                "per_fill_actual_send_latency_slo_missed",
+                order_id=order.id,
+                source_fill_id=order.source_fill_id,
+                dex=order.dex,
+                canonical_coin=order.canonical_coin,
+                order_action=order.order_action,
+                ws_to_actual_send_ms=actual_send_ms,
+                ws_to_submit_ms=order.ws_to_submit_ms,
+                parse_to_dedupe_ms=metrics.get("parse_to_dedupe_ms"),
+                dedupe_ms=metrics.get("dedupe_ms"),
+                decision_ms=metrics.get("decision_ms"),
+                order_plan_commit_ms=metrics.get("order_plan_commit_ms"),
+                submit_scheduler_lag_ms=metrics.get("submit_scheduler_lag_ms"),
+                submit_order_load_ms=metrics.get("submit_order_load_ms"),
+                submit_plan_guard_ms=metrics.get("submit_plan_guard_ms"),
+                submit_claim_ms=metrics.get("submit_claim_ms"),
+                risk_setting_ms=metrics.get("risk_setting_ms"),
+                sdk_prepare_sign_ms=metrics.get("sdk_prepare_sign_ms"),
+                submit_marker_to_actual_send_ms=metrics.get(
+                    "submit_marker_to_actual_send_ms"
+                ),
+            )
+
+    async def _signer_has_ambiguous_submitted_order(
+        self,
+        db: Any,
+        order: ExecutionOrder,
+    ) -> bool:
+        if not isinstance(db, AsyncSession) or order.id is None:
+            return False
+        signer_scope = str(getattr(self.execution_client, "signer_scope", "") or "")
+        if not signer_scope:
+            return False
+        return bool(
+            await db.scalar(
+                _ambiguous_signer_order_query(
+                    signer_scope=signer_scope,
+                    current_order_id=int(order.id),
+                )
+            )
+        )
+
+    async def _allocate_submit_nonce(self, db: AsyncSession) -> int:
+        signer_scope = str(getattr(self.execution_client, "signer_scope", "") or "")
+        if not signer_scope:
+            raise RuntimeError("execution signer scope is unavailable")
+        now = datetime.now(timezone.utc)
+        nonce_floor = int(now.timestamp() * 1000)
+        nonce_insert = insert(SignerNonceState).values(
+            signer_scope=signer_scope,
+            last_nonce=nonce_floor,
+            updated_at=now,
+        )
+        allocated = await db.scalar(
+            nonce_insert.on_conflict_do_update(
+                index_elements=[SignerNonceState.signer_scope],
+                set_={
+                    "last_nonce": func.greatest(
+                        SignerNonceState.last_nonce + 1,
+                        nonce_floor,
+                    ),
+                    "updated_at": now,
+                },
+            ).returning(SignerNonceState.last_nonce)
+        )
+        if allocated is None:
+            raise RuntimeError("database did not allocate an exchange nonce")
+        allocated_nonce = int(allocated)
+        reserve_in_process = getattr(
+            self.execution_client,
+            "reserve_action_nonce_at_least",
+            None,
+        )
+        if callable(reserve_in_process):
+            allocated_nonce = int(reserve_in_process(allocated_nonce))
+            await db.execute(
+                update(SignerNonceState)
+                .where(SignerNonceState.signer_scope == signer_scope)
+                .values(
+                    last_nonce=func.greatest(
+                        SignerNonceState.last_nonce,
+                        allocated_nonce,
+                    ),
+                    updated_at=now,
+                )
+            )
+        return allocated_nonce
 
     async def _persist_submit_started_marker(
         self,
         db: Any,
         order: ExecutionOrder,
         started_at: datetime,
+        *,
+        claim_pending: bool = False,
     ) -> None:
         if isinstance(db, AsyncSession) and order.id is not None:
+            expected_status = "PENDING_SUBMIT" if claim_pending else "SUBMITTING"
+            _trace_set(order, "submit_marker_write_started_at", datetime.now(timezone.utc))
             result = await db.execute(
                 update(ExecutionOrder)
                 .where(ExecutionOrder.id == order.id)
-                .where(ExecutionOrder.status == "SUBMITTING")
+                .where(ExecutionOrder.venue_account == self.execution_scope)
+                .where(ExecutionOrder.status == expected_status)
                 .where(ExecutionOrder.order_submit_started_at.is_(None))
                 .values(
+                    status="SUBMITTING",
                     order_submit_started_at=started_at,
                     binance_order_submit_at=started_at,
                     request_payload_masked=order.request_payload_masked,
+                    signed_action_envelope=order.signed_action_envelope,
+                    signed_action_hash=order.signed_action_hash,
+                    submit_signer_scope=order.submit_signer_scope,
+                    submit_nonce=order.submit_nonce,
                     pre_trade_checklist=order.pre_trade_checklist,
                     updated_at=started_at,
                 )
                 .returning(ExecutionOrder.id)
             )
             if result.scalar_one_or_none() is None:
-                raise AutoCopyOrderPolicyError("INTERNAL_SUBMIT_GUARD: submit-start marker was not claimable")
+                raise OrderSubmitClaimLost(
+                    "durable submit-start marker CAS was already claimed"
+                )
+            _trace_set(order, "submit_marker_cas_done_at", datetime.now(timezone.utc))
             await db.commit()
+            _trace_set(order, "submit_marker_commit_done_at", datetime.now(timezone.utc))
+        order.status = "SUBMITTING"
         order.order_submit_started_at = started_at
         order.binance_order_submit_at = started_at
         _trace_set(order, "order_submit_started_at", started_at)
         _trace_set(order, "exchange_submit_call_started_at", started_at)
+        _set_latency_fields(order)
+        if (
+            order.ws_to_submit_ms is not None
+            and order.ws_to_submit_ms > PER_FILL_INTERNAL_LATENCY_WARN_MS
+        ):
+            metrics = (order.latency_trace or {}).get("metrics") or {}
+            log.warning(
+                "per_fill_internal_latency_slo_missed",
+                order_id=order.id,
+                source_fill_id=order.source_fill_id,
+                dex=order.dex,
+                canonical_coin=order.canonical_coin,
+                order_action=order.order_action,
+                ws_to_submit_ms=order.ws_to_submit_ms,
+                dedupe_ms=metrics.get("dedupe_ms"),
+                decision_ms=metrics.get("decision_ms"),
+                pending_submit_db_write_ms=metrics.get("pending_submit_db_write_ms"),
+            )
 
     async def _guard_reduce_submit_against_live_allocation(
         self,
@@ -2830,7 +4740,13 @@ class FillDrivenExecutionEngine:
         allocation.pending_reduce_qty = None
         allocation.pending_reduce_notional = None
         allocation.pending_reduce_reason = (
-            "reduce-only order rejected because follower position was already absent"
+            MINIMUM_RESIDUAL_ECONOMIC_FLAT_REASON
+            if bool(
+                (order.pre_trade_checklist or {}).get(
+                    "minimum_residual_early_close"
+                )
+            )
+            else "reduce-only order rejected because follower position was already absent"
         )
         allocation.pending_reduce_since = None
         allocation.pending_reduce_source_fill_id = None
@@ -2881,6 +4797,94 @@ class FillDrivenExecutionEngine:
             )
         )
 
+    async def _restore_unfilled_minimum_residual_release(
+        self,
+        db: Any,
+        order: ExecutionOrder,
+        fill: FillEvent,
+    ) -> None:
+        """Cancel a provisional release when no follower close was executed."""
+        if (
+            order.allocation_id is None
+            or not bool(
+                (order.pre_trade_checklist or {}).get(
+                    "minimum_residual_early_close"
+                )
+            )
+        ):
+            return
+        allocation = await self._load_allocation_for_update(
+            db,
+            order.allocation_id,
+        )
+        if (
+            allocation is None
+            or str(allocation.status or "").upper() == "CLOSED"
+            or str(allocation.pending_reduce_reason or "")
+            != MINIMUM_RESIDUAL_ECONOMIC_FLAT_PENDING_REASON
+        ):
+            return
+        before_target = Decimal(allocation.target_notional or 0)
+        now = datetime.now(timezone.utc)
+        allocation.target_notional = Decimal(
+            allocation.allocated_notional or 0
+        )
+        allocation.status = (
+            "OPEN" if _allocation_active(allocation) else "CLOSED"
+        )
+        _clear_deferred_reduce(allocation)
+        allocation.last_reconcile_at = now
+        db.add(
+            AllocationEvent(
+                allocation_id=allocation.id,
+                execution_order_id=order.id,
+                leader_id=allocation.leader_id,
+                leader_address=allocation.leader_address,
+                source_fill_id=order.source_fill_id,
+                execution_venue=allocation.execution_venue,
+                dex=allocation.dex,
+                canonical_coin=allocation.canonical_coin,
+                position_side=allocation.position_side,
+                action="MINIMUM_RESIDUAL_RELEASE_RESTORED",
+                before_notional=before_target,
+                after_notional=Decimal(
+                    allocation.allocated_notional or 0
+                ),
+                before_qty=Decimal(allocation.allocated_qty or 0),
+                after_qty=Decimal(allocation.allocated_qty or 0),
+                metadata_json=_json_safe(
+                    {
+                        "order_id": order.id,
+                        "order_status": order.status,
+                        "error_message": order.error_message,
+                    }
+                ),
+            )
+        )
+        db.add(
+            RiskEvent(
+                severity="warning",
+                event_type="MINIMUM_RESIDUAL_RELEASE_RESTORED",
+                symbol=fill.market.canonical_coin,
+                leader_address=order.leader_address,
+                message=(
+                    "minimum-residual close reached a terminal state without "
+                    "execution; follower allocation remains owner and the "
+                    "provisional market release was canceled"
+                ),
+                metadata_json=_json_safe(
+                    {
+                        "allocation_id": allocation.id,
+                        "order_id": order.id,
+                        "source_fill_id": order.source_fill_id,
+                        "order_status": order.status,
+                        "dex": fill.market.dex,
+                        "canonical_coin": fill.market.canonical_coin,
+                    }
+                ),
+            )
+        )
+
     def _pre_submit_internal_blockers(
         self,
         *,
@@ -2904,9 +4908,16 @@ class FillDrivenExecutionEngine:
             not manual_guard_blocked
             and self.manual_position_guard is not None
             and self.manual_position_guard.active_entry(fill.market) is not None
-            and not _order_market_owner_guard_allows_manual_guard(order)
         ):
             blockers.append("INTERNAL_SUBMIT_GUARD: manual follower position guard active")
+        if (
+            checklist.get("market_ownership_economic_dust_reopen")
+            and checklist.get("economic_dust_reopen_follower_flat") is not True
+        ):
+            blockers.append(
+                "INTERNAL_SUBMIT_GUARD: economic dust reopen requires "
+                "confirmed follower-flat planning state"
+            )
         if action in {
             AllocationTransitionAction.REDUCE.value,
             AllocationTransitionAction.CLOSE.value,
@@ -2916,11 +4927,16 @@ class FillDrivenExecutionEngine:
                 blockers.append("INTERNAL_SUBMIT_GUARD: reduce/close requires allocation_id")
             if not checklist.get("allocation_scope_guard"):
                 blockers.append("INTERNAL_SUBMIT_GUARD: reduce/close missing allocation scope guard")
-            if checklist.get("allocation_mismatch") and not checklist.get("allocation_mismatch_state_lag"):
+            if (
+                checklist.get("allocation_mismatch")
+                and not checklist.get("allocation_mismatch_state_lag")
+                and not checklist.get("allocation_mismatch_reduce_safe")
+            ):
                 blockers.append("INTERNAL_SUBMIT_GUARD: allocation mismatch present")
             if (
                 checklist.get("unmanaged_follower_position")
                 and not checklist.get("unmanaged_follower_position_state_lag")
+                and not checklist.get("unmanaged_follower_position_reduce_safe")
             ):
                 blockers.append("INTERNAL_SUBMIT_GUARD: unmanaged follower position present")
         elif action in {
@@ -2930,7 +4946,10 @@ class FillDrivenExecutionEngine:
         }:
             if order.allocation_id is None:
                 blockers.append("INTERNAL_SUBMIT_GUARD: open/increase requires allocation_id")
-            if checklist.get("allocation_mismatch"):
+            if (
+                checklist.get("allocation_mismatch")
+                and not checklist.get("allocation_mismatch_state_lag")
+            ):
                 blockers.append("INTERNAL_SUBMIT_GUARD: allocation mismatch present")
             if checklist.get("unmanaged_follower_position") and not checklist.get("unmanaged_follower_position_state_lag"):
                 blockers.append("INTERNAL_SUBMIT_GUARD: unmanaged follower position present")
@@ -2959,6 +4978,21 @@ class FillDrivenExecutionEngine:
         )
         if result is None:
             return
+        minimum_residual_economic_flat_intent = bool(
+            (order.pre_trade_checklist or {}).get(
+                "minimum_residual_early_close"
+            )
+        )
+        if minimum_residual_economic_flat_intent:
+            # This closed allocation is the durable causal boundary that lets a
+            # later same-side leader increase be treated as a new follower
+            # lifecycle.  Preserve it after any executed close quantity so an
+            # eventual follower-flat reconciliation also retains the boundary.
+            # The helper additionally requires status=CLOSED and the exact
+            # startPosition checkpoint, so a partial fill cannot reopen early.
+            allocation.pending_reduce_reason = (
+                MINIMUM_RESIDUAL_ECONOMIC_FLAT_REASON
+            )
         allocation_update_done_at = result.applied_at
         await self._promote_baseline_for_active_allocation(
             db,
@@ -2977,7 +5011,16 @@ class FillDrivenExecutionEngine:
             after_notional=result.after_notional,
             before_qty=result.before_qty,
             after_qty=result.after_qty,
-            metadata={"order_action": order.order_action},
+            metadata={
+                "order_action": order.order_action,
+                "minimum_residual_economic_flat_intent": (
+                    minimum_residual_economic_flat_intent
+                ),
+                "minimum_residual_economic_flat_closed": bool(
+                    minimum_residual_economic_flat_intent
+                    and str(allocation.status or "").upper() == "CLOSED"
+                ),
+            },
         )
         _set_latency_fields(order)
 
@@ -3087,90 +5130,493 @@ class FillDrivenExecutionEngine:
         return "recover snapshot fill after active allocation checkpoint"
 
     async def _record_source_fill(self, db: Any, fill: FillEvent, *, processed: bool) -> bool:
-        stmt = (
-            insert(SourceFill)
-            .values(
-                source_fill_id=fill.source_fill_id,
-                leader_address=fill.leader_address,
-                coin=fill.market.coin,
-                dex=fill.market.dex,
-                canonical_coin=fill.market.canonical_coin,
-                raw_coin=fill.market.raw_coin,
-                asset_id=fill.market.asset_id,
-                side=fill.side,
-                price=fill.price,
-                size=fill.size,
-                source_time_ms=fill.time_ms,
-                ws_received_at=fill.ws_received_at,
-                raw_fill=fill.raw,
-                is_snapshot=fill.is_snapshot,
-                processed_at=datetime.now(timezone.utc) if processed else None,
-            )
-            .on_conflict_do_nothing(index_elements=[SourceFill.source_fill_id])
-            .returning(SourceFill.id)
+        attempt_at = datetime.now(timezone.utc) if processed else None
+        insert_stmt = insert(SourceFill).values(
+            source_fill_id=fill.source_fill_id,
+            execution_account=self.execution_scope,
+            leader_address=fill.leader_address,
+            coin=fill.market.coin,
+            dex=fill.market.dex,
+            canonical_coin=fill.market.canonical_coin,
+            raw_coin=fill.market.raw_coin,
+            asset_id=fill.market.asset_id,
+            side=fill.side,
+            price=fill.price,
+            size=fill.size,
+            source_time_ms=fill.time_ms,
+            ws_received_at=fill.ws_received_at,
+            raw_fill=fill.raw,
+            is_snapshot=fill.is_snapshot,
+            processed_at=attempt_at,
+            last_attempt_at=attempt_at,
+            next_retry_at=None,
+            last_processing_error=None,
         )
+        if processed:
+            # The durable inbox normally inserted this fill already with
+            # processed_at=NULL. Claim it atomically in one round trip. The
+            # WHERE clause is the exactly-once guard: an already-processed fill
+            # returns no row and therefore cannot be submitted again. Keep the
+            # original inbox payload immutable: a coalesced planning event may
+            # represent several raw fills and must never overwrite one of them.
+            stmt = insert_stmt.on_conflict_do_update(
+                index_elements=[SourceFill.source_fill_id],
+                set_={
+                    "processed_at": attempt_at,
+                    "last_attempt_at": attempt_at,
+                    "next_retry_at": None,
+                    "updated_at": attempt_at,
+                },
+                where=(
+                    SourceFill.processed_at.is_(None)
+                    & (SourceFill.execution_account == self.execution_scope)
+                ),
+            ).returning(SourceFill.id)
+        else:
+            stmt = insert_stmt.on_conflict_do_nothing(
+                index_elements=[SourceFill.source_fill_id]
+            ).returning(SourceFill.id)
         result = await db.execute(stmt)
-        inserted_id = result.scalar_one_or_none()
-        if inserted_id is not None:
-            await db.flush()
-            return True
-        if not processed:
-            await db.flush()
-            return False
-        now = datetime.now(timezone.utc)
-        promote_stmt = (
-            update(SourceFill)
-            .where(SourceFill.source_fill_id == fill.source_fill_id)
-            .where(SourceFill.processed_at.is_(None))
-            .values(
-                leader_address=fill.leader_address,
-                coin=fill.market.coin,
-                dex=fill.market.dex,
-                canonical_coin=fill.market.canonical_coin,
-                raw_coin=fill.market.raw_coin,
-                asset_id=fill.market.asset_id,
-                side=fill.side,
-                price=fill.price,
-                size=fill.size,
-                source_time_ms=fill.time_ms,
-                ws_received_at=fill.ws_received_at,
-                raw_fill=fill.raw,
-                is_snapshot=fill.is_snapshot,
-                processed_at=now,
-                updated_at=now,
-            )
-            .returning(SourceFill.id)
-        )
-        result = await db.execute(promote_stmt)
         await db.flush()
         return result.scalar_one_or_none() is not None
 
-    async def warm_market_meta_cache(self, dexes: list[str] | tuple[str, ...] | set[str]) -> None:
-        results = await asyncio.gather(
-            *(self._get_market_meta(dex) for dex in dexes),
-            return_exceptions=True,
+    async def _claim_source_fill_group(self, db: Any, fill: FillEvent) -> bool:
+        if isinstance(db, AsyncSession):
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(:market_key)"),
+                {"market_key": _market_transaction_key(fill.market, self.execution_scope)},
+            )
+        claimed = await self._record_source_fill(db, fill, processed=True)
+        if not claimed:
+            return False
+        source_fill_ids = _coalesced_source_fill_ids(fill)
+        if len(source_fill_ids) <= 1 or not isinstance(db, AsyncSession):
+            await self._mark_coalesced_source_fills_processed(db, fill)
+            return True
+        rows = (
+            await db.execute(
+                select(SourceFill.source_fill_id, SourceFill.processed_at)
+                .where(SourceFill.execution_account == self.execution_scope)
+                .where(SourceFill.source_fill_id.in_(source_fill_ids))
+                .with_for_update()
+            )
+        ).all()
+        if len(rows) != len(source_fill_ids):
+            raise RetryableFillProcessingError(
+                "coalesced fill group is incomplete in the durable inbox"
+            )
+        representative_id = fill.source_fill_id
+        already_processed_members = [
+            source_fill_id
+            for source_fill_id, processed_at in rows
+            if source_fill_id != representative_id and processed_at is not None
+        ]
+        if already_processed_members:
+            raise RuntimeError(
+                "coalesced fill group overlaps a previously processed source fill"
+            )
+        await self._mark_coalesced_source_fills_processed(db, fill)
+        return True
+
+    async def _assert_market_fill_fifo(self, db: Any, fill: FillEvent) -> None:
+        """Prevent retry timing from changing first-arrival ownership order.
+
+        ``source_fills.id`` is allocated when the websocket fill is durably
+        inserted, so it is the restart-safe arrival sequence.  A later fill may
+        not pass an earlier unprocessed fill for the same follower market even
+        if exponential retry timing or per-leader websocket scheduling differs.
+        The market advisory transaction lock acquired by ``_claim_source_fill_group``
+        serializes this check with every competing planner.
+        """
+        if not isinstance(db, AsyncSession):
+            return
+        current_id_query = (
+            select(SourceFill.id)
+            .where(SourceFill.execution_account == self.execution_scope)
+            .where(SourceFill.source_fill_id == fill.source_fill_id)
+            .limit(1)
+            .scalar_subquery()
         )
-        for result in results:
-            if isinstance(result, Exception):
-                log.warning("market_meta_warmup_failed", error=str(result)[:160])
+        earlier_id_query = (
+            select(SourceFill.id)
+            .where(SourceFill.execution_account == self.execution_scope)
+            .where(SourceFill.id < current_id_query)
+            .where(SourceFill.is_snapshot.is_(False))
+            .where(SourceFill.processed_at.is_(None))
+            .where(SourceFill.dex == str(fill.market.dex or "").lower())
+            .where(func.upper(SourceFill.canonical_coin) == fill.market.canonical_coin.upper())
+            .order_by(SourceFill.id.asc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        current_id, earlier_id = (
+            await db.execute(
+                select(
+                    current_id_query.label("current_id"),
+                    earlier_id_query.label("earlier_id"),
+                )
+            )
+        ).one()
+        if current_id is None:
+            raise RetryableFillProcessingError(
+                "durable source fill row is missing during market FIFO claim"
+            )
+        if earlier_id is not None:
+            raise MarketFillFifoWait(
+                "MARKET_FILL_FIFO_WAIT: an earlier durable fill for this market "
+                "must finish before this fill can compete for ownership"
+            )
+
+    async def _mark_coalesced_source_fills_processed(self, db: Any, fill: FillEvent) -> None:
+        source_fill_ids = _coalesced_source_fill_ids(fill)
+        if len(source_fill_ids) <= 1:
+            return
+        now = datetime.now(timezone.utc)
+        await db.execute(
+            update(SourceFill)
+            .where(SourceFill.execution_account == self.execution_scope)
+            .where(SourceFill.source_fill_id.in_(source_fill_ids))
+            .where(SourceFill.processed_at.is_(None))
+            .values(
+                processed_at=now,
+                last_attempt_at=now,
+                next_retry_at=None,
+                last_processing_error=None,
+                updated_at=now,
+            )
+        )
+        await db.flush()
+
+    async def _record_source_fill_outcomes(
+        self,
+        db: Any,
+        fill: FillEvent,
+        *,
+        order: ExecutionOrder | None,
+        disposition: str,
+        reason: str | None,
+    ) -> None:
+        source_fill_ids = _coalesced_source_fill_ids(fill)
+        if not source_fill_ids or not hasattr(db, "execute"):
+            return
+        values = [
+            {
+                "source_fill_id": source_fill_id,
+                "execution_order_id": order.id if order is not None else None,
+                "disposition": disposition,
+                "reason": redact_text(reason)[:2000] if reason else None,
+            }
+            for source_fill_id in source_fill_ids
+        ]
+        result = await db.execute(
+            insert(SourceFillOutcome)
+            .values(values)
+            .on_conflict_do_nothing(index_elements=[SourceFillOutcome.source_fill_id])
+            .returning(SourceFillOutcome.source_fill_id)
+        )
+        inserted = set(result.scalars().all())
+        if len(inserted) == len(source_fill_ids):
+            await db.flush()
+            return
+        existing = (
+            await db.execute(
+                select(SourceFillOutcome).where(
+                    SourceFillOutcome.source_fill_id.in_(source_fill_ids)
+                )
+            )
+        ).scalars().all()
+        expected_order_id = order.id if order is not None else None
+        for outcome in existing:
+            if outcome.execution_order_id != expected_order_id:
+                raise RuntimeError(
+                    "source fill outcome is already linked to a different logical order"
+                )
+        await db.flush()
+
+    async def _update_order_source_fill_outcomes(self, db: Any, order: ExecutionOrder) -> None:
+        if order.id is None:
+            return
+        status = str(order.status or "").upper()
+        if status == "FILLED" and Decimal(order.executed_qty or 0) > 0:
+            disposition = FILL_OUTCOME_EXECUTED
+        elif status in RECOVERY_ORDER_STATUSES or status in {"OPEN", "RESTING", "SUBMITTED"}:
+            disposition = FILL_OUTCOME_SUBMISSION_UNKNOWN
+        elif status in {"NOOP", "IGNORED"}:
+            disposition = FILL_OUTCOME_NO_ACTION_REQUIRED
+        elif status == "BLOCKED" and str(order.error_message or "").startswith("EMERGENCY_KILL_SWITCH:"):
+            disposition = FILL_OUTCOME_NO_ACTION_REQUIRED
+        elif status == "BLOCKED" and _expected_no_action_block(order.error_message):
+            disposition = FILL_OUTCOME_NO_ACTION_REQUIRED
+        else:
+            disposition = FILL_OUTCOME_MANUAL_REVIEW
+        await db.execute(
+            update(SourceFillOutcome)
+            .where(SourceFillOutcome.execution_order_id == order.id)
+            .values(
+                disposition=disposition,
+                reason=redact_text(order.error_message)[:2000] if order.error_message else None,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+
+    async def warm_market_meta_cache(self, dexes: list[str] | tuple[str, ...] | set[str]) -> None:
+        # Market capabilities are exchange-global, not account-specific. Use a
+        # PostgreSQL-backed snapshot so the main and sub-account workers copy
+        # the same data into their own in-process hot caches instead of each
+        # pulling meta/perpDexs independently. Startup only; no fill waits on
+        # this shared database cache in the normal path.
+        for dex in dexes:
+            try:
+                meta, refreshed_at, asset_offset = await self._load_shared_market_meta(dex)
+                self._install_market_meta(
+                    dex,
+                    meta,
+                    refreshed_at=refreshed_at,
+                    asset_offset=asset_offset,
+                )
+            except Exception as exc:
+                log.warning(
+                    "shared_market_meta_warmup_failed",
+                    dex=str(dex or ""),
+                    error=redact_text(exc)[:160],
+                )
+                try:
+                    await self._get_market_meta(dex)
+                except Exception as fallback_exc:
+                    log.warning(
+                        "market_meta_warmup_failed",
+                        dex=str(dex or ""),
+                        error=redact_text(fallback_exc)[:160],
+                    )
+
+    async def load_shared_perp_dex_directory(self) -> dict[str, int]:
+        """Load one exchange-global DEX/asset-offset directory for all workers.
+
+        The main/default worker owns periodic refreshes.  An explicit
+        sub-account worker always reuses a valid snapshot, so adding another
+        execution account does not duplicate Hyperliquid metadata traffic.
+        This method is startup-only and is never awaited by a live fill.
+        """
+
+        network = str(self.settings.hyperliquid_execution_network or "mainnet").lower()
+        setting_key = _shared_perp_dex_directory_setting_key(network=network)
+        lock_key = f"{SHARED_PERP_DEX_DIRECTORY_LOCK_PREFIX}:{network}"
+        ttl_seconds = max(
+            int(getattr(self.settings, "hyperliquid_risk_settings_ttl_seconds", 300) or 300),
+            30,
+        )
+        now = datetime.now(timezone.utc)
+        async with self._shared_db_session_factory() as db:
+            if isinstance(db, AsyncSession):
+                await db.execute(text("SET LOCAL synchronous_commit = OFF"))
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                {"lock_key": lock_key},
+            )
+            row = await db.get(AppSetting, setting_key)
+            payload = dict(row.value) if row is not None and isinstance(row.value, dict) else None
+            parsed = _parse_shared_perp_dex_directory_payload(
+                payload,
+                expected_network=network,
+            )
+            explicit_route = bool(self.settings.low_latency_uses_explicit_leader_route())
+            if parsed is not None:
+                cached_offsets, cached_at = parsed
+                if explicit_route or cached_at >= now - timedelta(seconds=ttl_seconds):
+                    self._market_asset_offsets.update(cached_offsets)
+                    self._perp_dex_directory_refreshed_at = cached_at
+                    await db.commit()
+                    return dict(cached_offsets)
+
+            raw_directory = await self.info_client.post_info({"type": "perpDexs"})
+            offsets = _perp_dex_asset_offsets_from_payload(raw_directory)
+            if not offsets or "" not in offsets:
+                raise RuntimeError("invalid Hyperliquid perp DEX directory")
+            refreshed_at = datetime.now(timezone.utc)
+            value = {
+                "version": SHARED_PERP_DEX_DIRECTORY_CACHE_VERSION,
+                "network": network,
+                "refreshed_at": refreshed_at.isoformat(),
+                "asset_offsets": offsets,
+            }
+            await db.execute(
+                insert(AppSetting)
+                .values(key=setting_key, value=value, updated_at=refreshed_at)
+                .on_conflict_do_update(
+                    index_elements=[AppSetting.key],
+                    set_={"value": value, "updated_at": refreshed_at},
+                )
+            )
+            await db.commit()
+        self._market_asset_offsets.update(offsets)
+        self._perp_dex_directory_refreshed_at = refreshed_at
+        return dict(offsets)
+
+    async def _load_shared_market_meta(
+        self,
+        dex: str,
+    ) -> tuple[dict[str, Any], datetime, int]:
+        dex_key = str(dex or "").lower()
+        setting_key = _shared_market_meta_setting_key(
+            network=self.settings.hyperliquid_execution_network,
+            dex=dex_key,
+        )
+        lock_key = (
+            f"{SHARED_MARKET_META_LOCK_PREFIX}:"
+            f"{self.settings.hyperliquid_execution_network.lower()}:{dex_key or 'default'}"
+        )
+        ttl_seconds = max(
+            int(getattr(self.settings, "hyperliquid_risk_settings_ttl_seconds", 300) or 300),
+            30,
+        )
+        now = datetime.now(timezone.utc)
+        async with self._shared_db_session_factory() as db:
+            if isinstance(db, AsyncSession):
+                await db.execute(text("SET LOCAL synchronous_commit = OFF"))
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                {"lock_key": lock_key},
+            )
+            row = await db.get(AppSetting, setting_key)
+            payload = dict(row.value) if row is not None and isinstance(row.value, dict) else None
+            parsed = _parse_shared_market_meta_payload(payload, expected_dex=dex_key)
+            explicit_route = bool(self.settings.low_latency_uses_explicit_leader_route())
+            if parsed is not None:
+                cached_meta, cached_at, cached_offset = parsed
+                # The default/main worker is the designated refresher. The
+                # explicit sub-account worker always reuses an existing valid
+                # snapshot; a genuinely new market still follows the existing
+                # miss refresh path.
+                if explicit_route or cached_at >= now - timedelta(seconds=ttl_seconds):
+                    await db.commit()
+                    return cached_meta, cached_at, cached_offset
+
+            try:
+                meta = await self.info_client.meta(dex_key)
+            except TypeError:
+                meta = await self.info_client.meta()
+            meta = dict(meta or {})
+            if not isinstance(meta.get("universe"), list):
+                raise RuntimeError(f"invalid Hyperliquid market metadata for {dex_key or 'default'}")
+            cached_offset = parsed[2] if parsed is not None else None
+            asset_offset = (
+                cached_offset
+                if cached_offset is not None
+                else await self._fetch_perp_dex_asset_offset(dex_key)
+            )
+            refreshed_at = datetime.now(timezone.utc)
+            value = {
+                "version": SHARED_MARKET_META_CACHE_VERSION,
+                "network": self.settings.hyperliquid_execution_network.lower(),
+                "dex": dex_key,
+                "asset_offset": asset_offset,
+                "refreshed_at": refreshed_at.isoformat(),
+                "meta": meta,
+            }
+            stmt = (
+                insert(AppSetting)
+                .values(key=setting_key, value=value, updated_at=refreshed_at)
+                .on_conflict_do_update(
+                    index_elements=[AppSetting.key],
+                    set_={"value": value, "updated_at": refreshed_at},
+                )
+            )
+            await db.execute(stmt)
+            await db.commit()
+            return meta, refreshed_at, asset_offset
+
+    async def _fetch_perp_dex_asset_offset(self, dex: str) -> int:
+        dex_key = str(dex or "").lower()
+        if not dex_key:
+            return 0
+        cached_offset = self._market_asset_offsets.get(dex_key)
+        if cached_offset is not None:
+            return int(cached_offset)
+        payload = await self.info_client.post_info({"type": "perpDexs"})
+        offsets = _perp_dex_asset_offsets_from_payload(payload)
+        self._market_asset_offsets.update(offsets)
+        if dex_key in offsets:
+            return int(offsets[dex_key])
+        raise RuntimeError(f"Hyperliquid perp dex offset unavailable for {dex_key}")
+
+    def _install_market_meta(
+        self,
+        dex: str,
+        meta: dict[str, Any],
+        *,
+        refreshed_at: datetime,
+        asset_offset: int,
+    ) -> None:
+        dex_key = str(dex or "").lower()
+        self._market_meta_cache[dex_key] = (refreshed_at, dict(meta))
+        self._market_asset_offsets[dex_key] = int(asset_offset)
+        self._prime_market_plan_cache_from_meta(dex_key, meta)
+        prime_sdk_meta = getattr(self.execution_client, "prime_sdk_market_metadata", None)
+        if callable(prime_sdk_meta):
+            prime_sdk_meta(
+                dex=dex_key,
+                meta=meta,
+                asset_offset=asset_offset,
+            )
 
     async def _get_market_meta(self, dex: str, *, force_refresh: bool = False) -> dict[str, Any]:
         dex_key = str(dex or "").lower()
         now = datetime.now(timezone.utc)
         ttl_seconds = max(int(getattr(self.settings, "hyperliquid_risk_settings_ttl_seconds", 300) or 300), 30)
         cached = self._market_meta_cache.get(dex_key)
+        observed_cached_at = cached[0] if cached is not None else None
         if cached is not None and not force_refresh:
             cached_at, meta = cached
             if cached_at >= now - timedelta(seconds=ttl_seconds):
                 return meta
-        try:
-            meta = await self.info_client.meta(dex_key)
-        except TypeError:
-            meta = await self.info_client.meta()
-        meta = dict(meta or {})
-        self._market_meta_cache[dex_key] = (now, meta)
-        self._prime_market_plan_cache_from_meta(dex_key, meta)
-        return meta
+        refresh_lock = self._market_meta_refresh_locks.setdefault(dex_key, asyncio.Lock())
+        async with refresh_lock:
+            now = datetime.now(timezone.utc)
+            cached = self._market_meta_cache.get(dex_key)
+            if force_refresh:
+                if cached is not None and (
+                    observed_cached_at is None or cached[0] > observed_cached_at
+                ):
+                    return cached[1]
+                cooldown_seconds = max(
+                    0.0,
+                    float(
+                        getattr(
+                            self.settings,
+                            "market_meta_miss_refresh_cooldown_seconds",
+                            0.25,
+                        )
+                        or 0
+                    ),
+                )
+                last_force_refresh_at = self._market_meta_force_refresh_at.get(dex_key)
+                if (
+                    cached is not None
+                    and last_force_refresh_at is not None
+                    and last_force_refresh_at >= now - timedelta(seconds=cooldown_seconds)
+                ):
+                    return cached[1]
+            elif cached is not None and cached[0] >= now - timedelta(seconds=ttl_seconds):
+                return cached[1]
+            try:
+                meta = await self.info_client.meta(dex_key)
+            except TypeError:
+                meta = await self.info_client.meta()
+            meta = dict(meta or {})
+            refreshed_at = datetime.now(timezone.utc)
+            asset_offset = self._market_asset_offsets.get(dex_key)
+            prime_sdk_meta = getattr(self.execution_client, "prime_sdk_market_metadata", None)
+            if asset_offset is None and callable(prime_sdk_meta):
+                asset_offset = await self._fetch_perp_dex_asset_offset(dex_key)
+            self._install_market_meta(
+                dex_key,
+                meta,
+                refreshed_at=refreshed_at,
+                asset_offset=asset_offset or 0,
+            )
+            if force_refresh:
+                self._market_meta_force_refresh_at[dex_key] = refreshed_at
+            return meta
 
     def _prime_market_plan_cache_from_meta(self, dex: str, meta: dict[str, Any]) -> None:
         for index, item in enumerate(meta.get("universe", []) or []):
@@ -3180,8 +5626,13 @@ class FillDrivenExecutionEngine:
             if not parsed.coin:
                 continue
             market_meta = {**item, "asset_id": index, "index": index}
+            policy_leverage = _market_policy_effective_leverage(
+                market_meta,
+                canonical_coin_value=parsed.canonical_coin,
+                configured_default_leverage=self.settings.hyperliquid_default_leverage,
+            )
             plan = build_hyperliquid_leverage_plan(
-                default_leverage=self.settings.hyperliquid_default_leverage,
+                default_leverage=policy_leverage,
                 coin_max_leverage=item.get("maxLeverage"),
                 sz_decimals=item.get("szDecimals"),
                 asset_id=index,
@@ -3196,11 +5647,86 @@ class FillDrivenExecutionEngine:
         try:
             meta = await self._get_market_meta(fill.market.dex)
             asset_id = resolve_asset_id_from_meta(meta, coin=fill.market.coin, dex=fill.market.dex)
+            if asset_id is None:
+                meta = await self._get_market_meta(fill.market.dex, force_refresh=True)
+                asset_id = resolve_asset_id_from_meta(meta, coin=fill.market.coin, dex=fill.market.dex)
         except Exception:
             asset_id = None
         if asset_id is not None:
             self._asset_id_cache[(str(fill.market.dex or "").lower(), str(fill.market.canonical_coin or "").upper())] = asset_id
         return self._fill_with_asset_id(fill, asset_id)
+
+    async def _ensure_market_execution_metadata(self, market: MarketKey) -> dict[str, Any]:
+        cache_key = (str(market.dex or "").lower(), str(market.canonical_coin or "").upper())
+        cached_plan = self.market_leverage_plan_cache.get(cache_key)
+        cached_market_meta = getattr(cached_plan, "market_meta", None) if cached_plan is not None else None
+        retry_reason = self._market_metadata_retry_reason(market, cached_market_meta)
+        if retry_reason is None:
+            return dict(cached_market_meta)
+
+        meta = await self._get_market_meta(market.dex)
+        market_meta = self._market_meta_item(meta, market)
+        retry_reason = self._market_metadata_retry_reason(market, market_meta)
+        if retry_reason is not None:
+            meta = await self._get_market_meta(market.dex, force_refresh=True)
+            market_meta = self._market_meta_item(meta, market)
+            retry_reason = self._market_metadata_retry_reason(market, market_meta)
+        if retry_reason is not None:
+            raise RetryableFillProcessingError(retry_reason)
+
+        asset_id = int(market_meta["asset_id"])
+        self._asset_id_cache[cache_key] = asset_id
+        policy_leverage = _market_policy_effective_leverage(
+            market_meta,
+            canonical_coin_value=market.canonical_coin,
+            configured_default_leverage=self.settings.hyperliquid_default_leverage,
+        )
+        plan = build_hyperliquid_leverage_plan(
+            default_leverage=policy_leverage,
+            coin_max_leverage=market_meta.get("maxLeverage"),
+            sz_decimals=market_meta.get("szDecimals"),
+            asset_id=asset_id,
+            market_meta=market_meta,
+        )
+        self.market_leverage_plan_cache[cache_key] = plan
+        return market_meta
+
+    @staticmethod
+    def _market_meta_item(meta: dict[str, Any], market: MarketKey) -> dict[str, Any] | None:
+        target = parse_coin(market.canonical_coin, default_dex=market.dex)
+        for index, item in enumerate(meta.get("universe", []) or []):
+            if not isinstance(item, dict):
+                continue
+            parsed = parse_coin(str(item.get("name", "")), default_dex=market.dex)
+            if parsed.canonical_coin == target.canonical_coin:
+                return {**item, "asset_id": index, "index": index}
+        return None
+
+    @staticmethod
+    def _market_metadata_retry_reason(
+        market: MarketKey,
+        market_meta: dict[str, Any] | None,
+    ) -> str | None:
+        if not market_meta:
+            return f"market metadata unavailable for {market.canonical_coin}"
+        meta_asset_id = _int_or_none(
+            _first_present(
+                market_meta.get("asset_id"),
+                market_meta.get("assetId"),
+                market_meta.get("index"),
+            )
+        )
+        if market.asset_id is None or meta_asset_id is None:
+            return f"market asset id unavailable for {market.canonical_coin}"
+        if int(market.asset_id) != meta_asset_id:
+            return f"market asset id mismatch for {market.canonical_coin}"
+        sz_decimals = _int_or_none(market_meta.get("szDecimals"))
+        if sz_decimals is None or sz_decimals < 0:
+            return f"market size precision unavailable for {market.canonical_coin}"
+        max_leverage = _int_or_none(market_meta.get("maxLeverage"))
+        if max_leverage is None or max_leverage <= 0:
+            return f"market max leverage unavailable for {market.canonical_coin}"
+        return None
 
     async def _load_cached_asset_id(self, db: Any, market: MarketKey) -> int | None:
         cache_key = (str(market.dex or "").lower(), str(market.canonical_coin or "").upper())
@@ -3233,20 +5759,7 @@ class FillDrivenExecutionEngine:
             asset_id=asset_id,
             venue_symbol=fill.market.venue_symbol,
         )
-        return FillEvent(
-            source_fill_id=fill.source_fill_id,
-            leader_address=fill.leader_address,
-            market=market,
-            side=fill.side,
-            price=fill.price,
-            size=fill.size,
-            time_ms=fill.time_ms,
-            raw=fill.raw,
-            is_snapshot=fill.is_snapshot,
-            ws_received_at=fill.ws_received_at,
-            parse_started_at=fill.parse_started_at,
-            parse_done_at=fill.parse_done_at,
-        )
+        return replace(fill, market=market)
 
     async def _load_live_leader_position_snapshot(
         self,
@@ -3263,7 +5776,7 @@ class FillDrivenExecutionEngine:
                 leader_address=mask_address(leader.leader_address),
                 dex=market.dex,
                 canonical_coin=market.canonical_coin,
-                error=str(exc)[:160],
+                error=redact_text(exc)[:160],
             )
             return False, None, str(exc)[:500]
 
@@ -3356,76 +5869,53 @@ class FillDrivenExecutionEngine:
         db: Any,
         market: MarketKey,
         leader_position: LatestAccountPosition | None,
+        *,
+        reduce_only: bool = False,
     ) -> Any:
-        raw = getattr(leader_position, "raw_payload_masked", None) or {}
-        raw_max = raw.get("maxLeverage") if isinstance(raw, dict) else None
-        raw_sz_decimals = raw.get("szDecimals") if isinstance(raw, dict) else None
         cache_key = (str(market.dex or "").lower(), str(market.canonical_coin or "").upper())
-        default_leverage = await self._market_default_leverage(db, market)
         cached = self.market_leverage_plan_cache.get(cache_key)
+        # A reduce-only order needs the cached asset/size precision but cannot
+        # increase margin exposure. Avoid reloading per-market leverage for the
+        # dominant reduction path; missing metadata still falls through to the
+        # authoritative loader below.
+        if (
+            reduce_only
+            and cached is not None
+            and cached.max_leverage is not None
+            and cached.sz_decimals is not None
+        ):
+            return cached
         if (
             cached is not None
             and cached.max_leverage is not None
             and cached.sz_decimals is not None
-            and cached.effective_leverage == min(default_leverage, cached.max_leverage)
+            and cached.effective_leverage
+            == _market_policy_effective_leverage(
+                cached.market_meta,
+                canonical_coin_value=market.canonical_coin,
+                configured_default_leverage=self.settings.hyperliquid_default_leverage,
+            )
         ):
             return cached
-        plan = build_hyperliquid_leverage_plan(
-            default_leverage=default_leverage,
-            coin_max_leverage=raw_max,
-            sz_decimals=raw_sz_decimals,
-            asset_id=market.asset_id,
-            market_meta={**raw, "asset_id": market.asset_id, "index": market.asset_id}
-            if raw_sz_decimals is not None and market.asset_id is not None
-            else None,
+        # Risk-increasing orders require current capability metadata. The full
+        # universe is prewarmed at startup, so this is an in-memory hit in the
+        # normal path; only a genuinely new/unseen market performs the existing
+        # metadata refresh.
+        market_meta = await self._ensure_market_execution_metadata(market)
+        policy_leverage = _market_policy_effective_leverage(
+            market_meta,
+            canonical_coin_value=market.canonical_coin,
+            configured_default_leverage=self.settings.hyperliquid_default_leverage,
         )
-        if plan.max_leverage is not None and plan.sz_decimals is not None:
-            self.market_leverage_plan_cache[cache_key] = plan
-            return plan
-        try:
-            meta = await self._get_market_meta(market.dex)
-        except Exception:
-            return plan
-        target = parse_coin(market.canonical_coin, default_dex=market.dex)
-        for index, item in enumerate(meta.get("universe", []) or []):
-            parsed = parse_coin(str(item.get("name", "")), default_dex=market.dex)
-            if parsed.canonical_coin == target.canonical_coin:
-                market_meta = {**item, "asset_id": index, "index": index}
-                meta_plan = build_hyperliquid_leverage_plan(
-                    default_leverage=default_leverage,
-                    coin_max_leverage=item.get("maxLeverage"),
-                    sz_decimals=item.get("szDecimals"),
-                    asset_id=index,
-                    market_meta=market_meta,
-                )
-                self.market_leverage_plan_cache[cache_key] = meta_plan
-                return meta_plan
-        if plan.max_leverage is not None:
-            self.market_leverage_plan_cache[cache_key] = plan
-        return plan
-
-    async def _market_default_leverage(self, db: Any, market: MarketKey) -> int:
-        configured_default = int(self.settings.hyperliquid_default_leverage or 10)
-        account = self.settings.hyperliquid_follower_account_address()
-        if not account:
-            return configured_default
-        row = await db.scalar(
-            select(MarketRiskSetting)
-            .where(MarketRiskSetting.execution_venue == ExecutionVenue.HYPERLIQUID.value)
-            .where(MarketRiskSetting.account_address == account.lower())
-            .where(MarketRiskSetting.dex == str(market.dex or "").lower())
-            .where(func.upper(MarketRiskSetting.canonical_coin) == str(market.canonical_coin or "").upper())
-            .where(MarketRiskSetting.status == STATUS_CONFIRMED)
-            .order_by(MarketRiskSetting.last_confirmed_at.desc().nulls_last(), MarketRiskSetting.updated_at.desc())
-            .limit(1)
+        meta_plan = build_hyperliquid_leverage_plan(
+            default_leverage=policy_leverage,
+            coin_max_leverage=market_meta.get("maxLeverage"),
+            sz_decimals=market_meta.get("szDecimals"),
+            asset_id=market_meta.get("asset_id"),
+            market_meta=market_meta,
         )
-        if row is None:
-            return configured_default
-        for value in (row.effective_leverage, row.actual_leverage, row.desired_leverage):
-            parsed = _int_or_none(value)
-            if parsed is not None and parsed > 0:
-                return parsed
-        return configured_default
+        self.market_leverage_plan_cache[cache_key] = meta_plan
+        return meta_plan
 
     def _schedule_state_refresh_if_stale(self) -> None:
         if self._state_refresh_task is not None and not self._state_refresh_task.done():
@@ -3454,33 +5944,90 @@ class FillDrivenExecutionEngine:
                 role=role,
                 address=address,
                 dex=extra_dex,
-                error=str(exc)[:160],
+                error=redact_text(exc)[:160],
             )
 
     async def _refresh_account_abstraction(self, db: Any, role: str, address: str, *, extra_dex: str | None = None) -> None:
-        dexes = [dex.dex_name for dex in HyperliquidDexRegistry(self.settings).enabled_dexes()]
-        normalized_extra = str(extra_dex or "").lower()
-        if normalized_extra not in dexes:
-            dexes.append(normalized_extra)
-        snapshot = await AccountAbstractionService(self.info_client, self.settings).fetch_snapshot(
-            role=role,
-            address=address,
-            dexes=dexes,
+        refresh_key = (str(role or "").upper(), str(address or "").lower())
+        refresh_lock = self._account_abstraction_refresh_locks.setdefault(
+            refresh_key,
+            asyncio.Lock(),
         )
-        resolved_by_dex = {
-            dex: resolve_account_value_for_sizing(snapshot, dex, self.settings)
-            for dex in dexes
-        }
-        payload = await save_account_abstraction_state(
-            db,
-            snapshot=snapshot,
-            resolved_by_dex=resolved_by_dex,
-        )
-        self._cache_account_abstraction_payload(snapshot.role, snapshot.address, payload)
-
-    def _account_abstraction_cache_ttl(self) -> timedelta:
-        seconds = max(1, min(int(getattr(self.settings, "account_state_stale_seconds", 10) or 10), 5))
-        return timedelta(seconds=seconds)
+        async with refresh_lock:
+            dexes = [dex.dex_name for dex in HyperliquidDexRegistry(self.settings).enabled_dexes()]
+            normalized_extra = str(extra_dex or "").lower()
+            if normalized_extra not in dexes:
+                dexes.append(normalized_extra)
+            cached_entry = self._account_abstraction_cache.get(
+                account_abstraction_setting_key(role, address)
+            )
+            cached_payload = cached_entry[1] if cached_entry is not None else {}
+            cached_mode = str(
+                cached_payload.get("account_abstraction_mode")
+                or cached_payload.get("mode")
+                or ""
+            ).upper()
+            confirmed_unified = bool(
+                cached_mode == MODE_UNIFIED
+                and (
+                    cached_payload.get("user_abstraction_available")
+                    or cached_payload.get("userAbstractionAvailable")
+                )
+            )
+            now = datetime.now(timezone.utc)
+            last_full_refresh = self._account_abstraction_full_refresh_at.get(refresh_key)
+            full_refresh_interval = max(
+                30.0,
+                float(
+                    getattr(self.settings, "account_value_full_refresh_seconds", 300.0)
+                    or 300.0
+                ),
+            )
+            use_confirmed_unified_fast = bool(
+                confirmed_unified
+                and last_full_refresh is not None
+                and last_full_refresh >= now - timedelta(seconds=full_refresh_interval)
+            )
+            snapshot = await AccountAbstractionService(
+                self.account_info_client,
+                self.settings,
+            ).fetch_snapshot(
+                role=role,
+                address=address,
+                dexes=dexes,
+                confirmed_unified_fast=use_confirmed_unified_fast,
+            )
+            resolved_by_dex = {
+                dex: resolve_account_value_for_sizing(snapshot, dex, self.settings)
+                for dex in dexes
+            }
+            cached_usable = _account_abstraction_payload_has_usable_value(
+                cached_payload,
+                dexes=dexes,
+            )
+            refreshed_usable = any(
+                result.account_value is not None
+                and result.account_value > 0
+                and not result.blockers
+                for result in resolved_by_dex.values()
+            )
+            if snapshot.error_message and cached_usable and not refreshed_usable:
+                # A transient info/API failure must never replace a usable
+                # sizing value with an unavailable one. Keep the last known
+                # good snapshot; the independent background loop will retry.
+                raise RuntimeError(
+                    "account value refresh returned no usable value; preserving last known good snapshot"
+                )
+            payload = await save_account_abstraction_state(
+                db,
+                snapshot=snapshot,
+                resolved_by_dex=resolved_by_dex,
+            )
+            if not use_confirmed_unified_fast:
+                self._account_abstraction_full_refresh_at[refresh_key] = datetime.now(timezone.utc)
+            # One dictionary assignment atomically replaces the prior snapshot
+            # for every fill coroutine running on this event loop.
+            self._cache_account_abstraction_payload(snapshot.role, snapshot.address, payload)
 
     def _cache_account_abstraction_payload(
         self,
@@ -3505,10 +6052,10 @@ class FillDrivenExecutionEngine:
         cached = self._account_abstraction_cache.get(key)
         if cached is None:
             return None
-        cached_at, payload = cached
-        current = now or datetime.now(timezone.utc)
-        if cached_at < current - self._account_abstraction_cache_ttl():
-            return None
+        _, payload = cached
+        # The fill path always keeps the last known good snapshot in memory.
+        # Freshness is maintained by the independent poller, not by expiring
+        # this entry and forcing a database/REST read on an arriving fill.
         return dict(payload)
 
     async def _resolved_account_values(
@@ -3560,8 +6107,8 @@ class FillDrivenExecutionEngine:
             if payload is None:
                 self._schedule_state_refresh_if_stale()
                 return None
-            value = resolved_value_payload(payload, dex)
-            if value is None:
+            value = _resolved_account_value_payload(payload, dex)
+            if _account_value_payload_needs_refresh(value):
                 self._schedule_state_refresh_if_stale()
                 self._schedule_account_abstraction_refresh(role=role, address=address, dex=dex)
             return value
@@ -3580,11 +6127,10 @@ class FillDrivenExecutionEngine:
         if payload is None:
             self._schedule_state_refresh_if_stale()
             return None
-        result = resolved_value_payload(payload, dex)
-        if result is None:
+        result = _resolved_account_value_payload(payload, dex)
+        if _account_value_payload_needs_refresh(result):
             self._schedule_state_refresh_if_stale()
             self._schedule_account_abstraction_refresh(role=role, address=address, dex=dex)
-            return None
         return result
 
     async def _load_allocation(
@@ -3598,6 +6144,7 @@ class FillDrivenExecutionEngine:
             select(LeaderPositionAllocationRecord)
             .where(LeaderPositionAllocationRecord.leader_address == leader.leader_address.lower())
             .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+            .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
             .where(LeaderPositionAllocationRecord.dex == market.dex)
             .where(func.upper(LeaderPositionAllocationRecord.canonical_coin) == str(market.canonical_coin).upper())
             .where(LeaderPositionAllocationRecord.status != "CLOSED")
@@ -3621,6 +6168,7 @@ class FillDrivenExecutionEngine:
                 select(LeaderPositionAllocationRecord)
                 .join(LeaderConfig, LeaderConfig.id == LeaderPositionAllocationRecord.leader_id)
                 .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
                 .where(LeaderPositionAllocationRecord.dex == market.dex)
                 .where(func.upper(LeaderPositionAllocationRecord.canonical_coin) == str(market.canonical_coin).upper())
                 .where(LeaderPositionAllocationRecord.status != "CLOSED")
@@ -3634,7 +6182,99 @@ class FillDrivenExecutionEngine:
         for allocation in rows:
             if _allocation_market_owner_active(allocation, self.pending_intents):
                 return allocation
+            if await self._allocation_has_durable_unresolved_order(db, allocation):
+                # In-memory pending intents are intentionally only an acceleration
+                # layer.  After a restart, the durable outbox remains authoritative:
+                # a zero-fill OPEN allocation with an UNKNOWN/SUBMITTING order still
+                # owns the market until recovery proves whether it filled.
+                return allocation
         return None
+
+    async def _peek_allocation_for_lifecycle_gate(
+        self,
+        db: Any,
+        leader: LeaderConfig,
+        market: MarketKey,
+    ) -> LeaderPositionAllocationRecord | None:
+        """Read lifecycle presence without holding an allocation row lock.
+
+        The market transaction lock already serializes competing planners.  This
+        lightweight read exists only to discard old non-owner lifecycle fills
+        before hot-path dependencies; the authoritative allocation is still
+        loaded with ``FOR UPDATE`` later for every actionable fill.
+        """
+        return await db.scalar(
+            select(LeaderPositionAllocationRecord)
+            .where(LeaderPositionAllocationRecord.leader_address == leader.leader_address.lower())
+            .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+            .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
+            .where(LeaderPositionAllocationRecord.dex == market.dex)
+            .where(
+                func.upper(LeaderPositionAllocationRecord.canonical_coin)
+                == str(market.canonical_coin).upper()
+            )
+            .order_by(
+                case((LeaderPositionAllocationRecord.status != "CLOSED", 0), else_=1),
+                LeaderPositionAllocationRecord.updated_at.desc(),
+                LeaderPositionAllocationRecord.id.desc(),
+            )
+            .execution_options(populate_existing=True)
+            .limit(1)
+        )
+
+    async def _allocation_has_durable_unresolved_order(
+        self,
+        db: Any,
+        allocation: LeaderPositionAllocationRecord | None,
+    ) -> bool:
+        allocation_id = _int_or_none(getattr(allocation, "id", None))
+        if allocation_id is None:
+            return False
+        if self.pending_intents.has_pending_allocation(allocation):
+            return True
+        return bool(
+            await db.scalar(
+                select(ExecutionOrder.id)
+                .where(ExecutionOrder.source_type == "AUTO_COPY")
+                .where(ExecutionOrder.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                .where(ExecutionOrder.venue_account == self.execution_scope)
+                .where(ExecutionOrder.allocation_id == allocation_id)
+                .where(ExecutionOrder.status.in_(RECOVERY_ORDER_STATUSES))
+                .limit(1)
+            )
+        )
+
+    async def _market_owner_handoff_pending(
+        self,
+        db: Any,
+        owner_allocation: LeaderPositionAllocationRecord | None,
+    ) -> bool:
+        if owner_allocation is None:
+            return False
+        # A leader-flat close intent is a release in progress.  The next leader
+        # must wait for the follower close confirmation, not be permanently
+        # recorded as BLOCKED and not submit concurrently with that close.
+        if _allocation_has_flat_leader_close_intent(owner_allocation):
+            return True
+        if (
+            str(
+                getattr(owner_allocation, "pending_reduce_reason", "") or ""
+            )
+            == MINIMUM_RESIDUAL_ECONOMIC_FLAT_PENDING_REASON
+        ):
+            # The leader intentionally remains non-flat at dust size, but the
+            # follower close is a full lifecycle release. Keep the next
+            # leader's fill durable until that close reaches a terminal state.
+            return await self._allocation_has_durable_unresolved_order(
+                db,
+                owner_allocation,
+            )
+        # Initial ownership is also provisional while its first exchange action
+        # is unresolved.  Waiting here prevents a restart from letting another
+        # leader open the same market before UNKNOWN recovery completes.
+        if not _allocation_active(owner_allocation):
+            return await self._allocation_has_durable_unresolved_order(db, owner_allocation)
+        return False
 
     async def _allocation_sum_qty(self, db: Any, market: MarketKey, side: PositionSide) -> Decimal:
         qty, _latest_reconcile_at = await self._allocation_sum_qty_with_latest_reconcile(db, market, side)
@@ -3652,6 +6292,7 @@ class FillDrivenExecutionEngine:
                 select(LeaderPositionAllocationRecord)
                 .join(LeaderConfig, LeaderConfig.id == LeaderPositionAllocationRecord.leader_id)
                 .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
                 .where(LeaderPositionAllocationRecord.dex == market.dex)
                 .where(func.upper(LeaderPositionAllocationRecord.canonical_coin) == str(market.canonical_coin).upper())
                 .where(LeaderPositionAllocationRecord.position_side == side.value)
@@ -3684,6 +6325,7 @@ class FillDrivenExecutionEngine:
                 select(LeaderPositionAllocationRecord)
                 .join(LeaderConfig, LeaderConfig.id == LeaderPositionAllocationRecord.leader_id)
                 .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
                 .where(LeaderPositionAllocationRecord.dex == market.dex)
                 .where(func.upper(LeaderPositionAllocationRecord.canonical_coin) == str(market.canonical_coin).upper())
                 .where(
@@ -3754,6 +6396,43 @@ class FillDrivenExecutionEngine:
         follower = self.settings.hyperliquid_follower_account_address()
         if not follower:
             return _empty_position_side_qtys(), None
+        if isinstance(db, AsyncSession):
+            # Load the state timestamp and both possible position sides in one
+            # round trip.  Keeping the outer join is important: a genuinely
+            # flat market still needs the fresh account-state timestamp.
+            state_id = (
+                select(LatestAccountState.id)
+                .where(LatestAccountState.role == FOLLOWER)
+                .where(LatestAccountState.address == follower.lower())
+                .where(LatestAccountState.dex == market.dex)
+                .order_by(
+                    LatestAccountState.last_update_at.desc().nulls_last(),
+                    LatestAccountState.id.desc(),
+                )
+                .limit(1)
+                .scalar_subquery()
+            )
+            rows = (
+                await db.execute(
+                    select(LatestAccountState, LatestAccountPosition)
+                    .outerjoin(
+                        LatestAccountPosition,
+                        (LatestAccountPosition.account_state_id == LatestAccountState.id)
+                        & (
+                            func.upper(LatestAccountPosition.canonical_coin)
+                            == str(market.canonical_coin).upper()
+                        )
+                        & (LatestAccountPosition.side.in_(["LONG", "SHORT"]))
+                        & (LatestAccountPosition.active.is_(True)),
+                    )
+                    .where(LatestAccountState.id == state_id)
+                )
+            ).all()
+            if not rows:
+                return _empty_position_side_qtys(), None
+            state = rows[0][0]
+            positions = [position for _state, position in rows if position is not None]
+            return self._position_qtys_and_latest_state_at(state, positions)
         state = await db.scalar(
             select(LatestAccountState)
             .where(LatestAccountState.role == FOLLOWER)
@@ -3772,6 +6451,13 @@ class FillDrivenExecutionEngine:
                 .where(LatestAccountPosition.active.is_(True))
             )
         ).scalars().all()
+        return self._position_qtys_and_latest_state_at(state, positions)
+
+    @staticmethod
+    def _position_qtys_and_latest_state_at(
+        state: LatestAccountState,
+        positions: list[LatestAccountPosition],
+    ) -> tuple[dict[PositionSide, Decimal], datetime | None]:
         positions_by_side: dict[PositionSide, list[LatestAccountPosition]] = {
             PositionSide.LONG: [],
             PositionSide.SHORT: [],
@@ -3806,6 +6492,7 @@ class FillDrivenExecutionEngine:
             select(LeaderPositionAllocationRecord)
             .join(LeaderConfig, LeaderConfig.id == LeaderPositionAllocationRecord.leader_id)
             .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+            .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
             .where(LeaderPositionAllocationRecord.dex == market.dex)
             .where(func.upper(LeaderPositionAllocationRecord.canonical_coin) == str(market.canonical_coin).upper())
             .where(LeaderPositionAllocationRecord.position_side == opposite.value)
@@ -3820,7 +6507,15 @@ class FillDrivenExecutionEngine:
         return row is not None
 
     async def _kill_switch_active(self, db: Any) -> bool:
-        row = await db.get(AppSetting, "risk")
+        if isinstance(db, AsyncSession):
+            row = await db.scalar(
+                select(AppSetting)
+                .where(AppSetting.key == "risk")
+                .execution_options(populate_existing=True)
+                .limit(1)
+            )
+        else:
+            row = await db.get(AppSetting, "risk")
         if row is None:
             return True
         return bool((row.value or {}).get("kill_switch", True))
@@ -3838,16 +6533,28 @@ class LowLatencyRuntimeState:
     poll_fallback_leaders: set[str] = field(default_factory=set)
     subscribed_leaders_by_dex: dict[str, int] = field(default_factory=dict)
     last_event_time_by_dex: dict[str, str | None] = field(default_factory=dict)
+    active_allocation_dexes: set[str] = field(default_factory=set)
     follower_order_updates_subscribed: bool = False
     follower_user_events_subscribed: bool = False
     follower_user_fills_subscribed: bool = False
     follower_clearinghouse_subscribed: bool = False
+    follower_all_dexs_clearinghouse_subscribed: bool = False
     leader_user_fills_subscribed_count: int = 0
     last_ws_event_at: datetime | None = None
     last_allocation_sync_at: datetime | None = None
     allocation_sync_count: int = 0
     allocation_sync_skipped_count: int = 0
     allocation_sync_last_error: str | None = None
+    account_value_refresh_count: int = 0
+    account_value_last_refresh_at: datetime | None = None
+    account_value_last_refresh_duration_ms: int | None = None
+    account_value_refresh_last_error: str | None = None
+    event_loop_lag_ms: int = 0
+    max_event_loop_lag_ms: int = 0
+    durable_replay_scan_count: int = 0
+    durable_order_resume_scan_count: int = 0
+    durable_replay_idle_wait_count: int = 0
+    background_cycles_deferred_for_hot_path: int = 0
     reconnect_count: int = 0
     last_error: str | None = None
 
@@ -3858,50 +6565,119 @@ class HyperliquidLowLatencyWatcher:
         *,
         settings: Settings,
         info_client: HyperliquidInfoClient,
+        account_info_client: HyperliquidInfoClient | None = None,
         execution_client: HyperliquidExecutionClient,
         db_session_factory: Any,
+        submit_db_session_factory: Any | None = None,
         price_cache: LowLatencyPriceCache | None = None,
     ) -> None:
         self.settings = settings
+        execution_scope = getattr(settings, "low_latency_execution_scope", None)
+        self.execution_scope = (
+            str(execution_scope() or "").lower()
+            if callable(execution_scope)
+            else ""
+        )
         self.info_client = info_client
+        self.account_info_client = account_info_client or info_client
         self.execution_client = execution_client
         self.db_session_factory = db_session_factory
+        self.submit_db_session_factory = submit_db_session_factory or db_session_factory
+        self._submit_database_pool_isolated = submit_db_session_factory is not None
         self.price_cache = price_cache or LowLatencyPriceCache(stale_ms=settings.price_cache_stale_ms)
         self.manual_position_guard = FollowerManualPositionGuard()
+        self.state = LowLatencyRuntimeState()
+        self._follower_position_stream_observed_at: dict[str, datetime] = {}
         self.engine = FillDrivenExecutionEngine(
             settings=settings,
             info_client=info_client,
+            account_info_client=self.account_info_client,
             execution_client=execution_client,
             price_cache=self.price_cache,
             manual_position_guard=self.manual_position_guard,
+            follower_position_stream_trusted=self._follower_position_stream_is_trusted,
+            shared_db_session_factory=db_session_factory,
         )
-        self.state = LowLatencyRuntimeState()
         self._stopped = asyncio.Event()
         self._leader_lock = asyncio.Lock()
         self._subscribed: set[str] = set()
         self._leader_fill_subscription_event = asyncio.Event()
+        self._account_abstraction_refresh_event = asyncio.Event()
         self._leader_fill_backfill_start_ms: int | None = None
+        self._leader_fill_backfill_lock = asyncio.Lock()
         self._leader_fill_startup_backfill_done = False
+        self._leader_snapshot_backfilled_through_ms: dict[str, int] = {}
+        self._fill_ingress_guard = asyncio.Lock()
+        self._fill_ingress_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._fill_queue_guard = asyncio.Lock()
-        self._fill_queues: dict[tuple[str, str, str], asyncio.Queue[tuple[FillEvent, LeaderConfig]]] = {}
+        self._fill_queues: dict[
+            tuple[str, str, str],
+            asyncio.Queue[tuple[FillEvent, LeaderConfig, bool]],
+        ] = {}
         self._fill_workers: dict[tuple[str, str, str], asyncio.Task] = {}
+        self._queued_source_fill_ids: set[str] = set()
         self._submit_queue_guard = asyncio.Lock()
         self._submit_queues: dict[str, asyncio.Queue[tuple[int, FillEvent]]] = {}
         self._submit_workers: dict[str, asyncio.Task] = {}
+        self._queued_submit_order_ids: set[int] = set()
+        # A freshly committed plan is already the authoritative payload the
+        # submit worker needs. Hand the detached ORM object across in memory so
+        # the normal live path does not re-read a ~7KB order row before its
+        # final durable CAS. Recovery/retry paths intentionally fall back to an
+        # authoritative database load when only a durable order id is available.
+        self._committed_submit_orders: dict[int, ExecutionOrder] = {}
+        self._submit_plan_committed_at: dict[int, datetime] = {}
         self._submit_retry_counts: dict[int, int] = {}
+        self._submit_retry_not_before: dict[int, float] = {}
+        self._recent_submit_latency_samples: list[dict[str, Any]] = []
+        self._durable_replay_wakeup = asyncio.Event()
+        self._durable_replay_wakeup_handle: asyncio.TimerHandle | None = None
+        self._durable_replay_wakeup_at: float | None = None
         self._suppressed_source_fill_guard = asyncio.Lock()
-        self._suppressed_source_fill_ids: dict[str, datetime] = {}
+        self._suppressed_source_fill_ids: OrderedDict[str, datetime] = OrderedDict()
+        self._recently_completed_source_fill_ids: OrderedDict[str, datetime] = OrderedDict()
         self._background_tasks: set[asyncio.Task] = set()
         self._follower_state_refresh_pending_dexes: set[str] = set()
-        self._follower_state_refresh_task: asyncio.Task | None = None
+        self._follower_state_refresh_reasons: dict[str, str] = {}
+        self._follower_state_refresh_tasks: dict[str, asyncio.Task] = {}
+        self._follower_rest_refresh_failures: dict[str, int] = {}
+        self._follower_rest_refresh_next_at: dict[str, float] = {}
+        self._liveness_stuck_signature: str | None = None
+        self._writer_lease_connection: Any | None = None
+        self._writer_lease_key = _writer_lease_key(
+            self.settings.hyperliquid_follower_account_address() or "default"
+        )
 
     async def stop(self) -> None:
         self._stopped.set()
 
     async def run(self) -> None:
+        while not self._stopped.is_set() and not await self._acquire_writer_lease():
+            await self._store_standby_status()
+            try:
+                await asyncio.wait_for(self._stopped.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+        if self._stopped.is_set():
+            return
+        await self._enable_discovered_perp_dexes()
         await self._store_starting_status()
         await self.refresh_leaders()
+        # A persisted last-known-good value is sufficient to start ingestion.
+        # Do not hold websocket subscription/backfill behind a balance REST
+        # request merely because that value is old. If no valid value has ever
+        # been captured, one blocking refresh is unavoidable because the
+        # configured sizing formula cannot otherwise be evaluated.
+        cached_account_value_ready = await self._load_follower_account_abstraction_cache()
+        if cached_account_value_ready:
+            self._account_abstraction_refresh_event.set()
+        else:
+            await self._refresh_follower_account_abstraction_once()
+            self._account_abstraction_refresh_event.clear()
+        await self._restore_persistent_manual_position_guards()
         await self._refresh_active_follower_positions_once(reason="STARTUP_ACTIVE_REFRESH")
+        await self._replay_unprocessed_fills_once()
+        await self._resume_unstarted_orders_once()
         self._schedule_background_task(self._warm_latency_caches())
         tasks = [
             asyncio.create_task(self._leader_fill_ws_loop()),
@@ -3909,7 +6685,12 @@ class HyperliquidLowLatencyWatcher:
             asyncio.create_task(self._leader_refresh_loop()),
             asyncio.create_task(self._price_poll_loop()),
             asyncio.create_task(self._active_follower_position_refresh_loop()),
+            asyncio.create_task(self._account_abstraction_refresh_loop()),
             asyncio.create_task(self._allocation_sync_loop()),
+            asyncio.create_task(self._durable_replay_loop()),
+            asyncio.create_task(self._leader_fill_backfill_retry_loop()),
+            asyncio.create_task(self._writer_lease_watch_loop()),
+            asyncio.create_task(self._event_loop_lag_watch_loop()),
             asyncio.create_task(self._status_loop()),
         ]
         try:
@@ -3921,39 +6702,300 @@ class HyperliquidLowLatencyWatcher:
             await self._cancel_background_tasks()
             await self._cancel_fill_workers()
             await self._cancel_submit_workers()
+            await self._release_writer_lease()
+
+    async def _enable_discovered_perp_dexes(self) -> list[str]:
+        configured = self.settings.enabled_hyperliquid_dex_list()
+        if not bool(
+            getattr(self.settings, "enable_all_hyperliquid_perp_dexes", True)
+        ):
+            return configured
+        try:
+            offsets = await asyncio.wait_for(
+                self.engine.load_shared_perp_dex_directory(),
+                timeout=max(
+                    0.25,
+                    float(
+                        getattr(
+                            self.settings,
+                            "hyperliquid_perp_dex_discovery_timeout_seconds",
+                            3.0,
+                        )
+                        or 3.0
+                    ),
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The checked-in/current environment list remains a safe startup
+            # fallback.  Discovery is an availability enhancement and must not
+            # prevent websocket ingestion or durable replay after an API outage.
+            log.warning(
+                "hyperliquid_perp_dex_directory_discovery_failed",
+                error=redact_text(exc)[:200],
+                configured_dexes=configured,
+            )
+            return configured
+        enabled = list(configured)
+        for dex in offsets:
+            normalized = str(dex or "").lower()
+            if normalized not in enabled:
+                enabled.append(normalized)
+        self.settings.enabled_hyperliquid_dexes = ",".join(enabled)
+        log.info(
+            "hyperliquid_all_perp_dexes_enabled",
+            dexes=enabled,
+            directory_refreshed_at=(
+                self.engine._perp_dex_directory_refreshed_at.isoformat()
+                if self.engine._perp_dex_directory_refreshed_at is not None
+                else None
+            ),
+        )
+        return enabled
+
+    async def _acquire_writer_lease(self) -> bool:
+        if self._writer_lease_connection is not None:
+            return True
+        bind = getattr(self.db_session_factory, "kw", {}).get("bind")
+        if bind is None:
+            return True
+        connection = await bind.connect()
+        try:
+            acquired = bool(
+                await connection.scalar(
+                    text("SELECT pg_try_advisory_lock(:lease_key)"),
+                    {"lease_key": self._writer_lease_key},
+                )
+            )
+            await connection.commit()
+        except Exception:
+            await connection.close()
+            raise
+        if not acquired:
+            await connection.close()
+            return False
+        self._writer_lease_connection = connection
+        return True
+
+    async def _release_writer_lease(self) -> None:
+        connection = self._writer_lease_connection
+        self._writer_lease_connection = None
+        if connection is None:
+            return
+        try:
+            await connection.execute(
+                text("SELECT pg_advisory_unlock(:lease_key)"),
+                {"lease_key": self._writer_lease_key},
+            )
+            await connection.commit()
+        finally:
+            await connection.close()
+
+    async def _writer_lease_watch_loop(self) -> None:
+        while not self._stopped.is_set():
+            connection = self._writer_lease_connection
+            if connection is None:
+                self.state.last_error = "writer lease lost"
+                self._stopped.set()
+                return
+            try:
+                await connection.scalar(text("SELECT 1"))
+                await connection.commit()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.state.last_error = f"writer lease lost: {redact_text(exc)[:160]}"
+                self._stopped.set()
+                return
+            try:
+                await asyncio.wait_for(self._stopped.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _event_loop_lag_watch_loop(self) -> None:
+        interval = 0.05
+        loop = asyncio.get_running_loop()
+        expected = loop.time() + interval
+        last_warning_at = 0.0
+        while not self._stopped.is_set():
+            await asyncio.sleep(interval)
+            observed = loop.time()
+            lag_ms = max(0, int((observed - expected) * 1000))
+            self.state.event_loop_lag_ms = lag_ms
+            self.state.max_event_loop_lag_ms = max(self.state.max_event_loop_lag_ms, lag_ms)
+            if lag_ms >= 100 and observed - last_warning_at >= 1.0:
+                last_warning_at = observed
+                log.warning(
+                    "low_latency_event_loop_lag",
+                    lag_ms=lag_ms,
+                    fill_queue_count=len(self._queued_source_fill_ids),
+                    submit_queue_count=len(self._queued_submit_order_ids),
+                )
+            expected = observed + interval
 
     async def _warm_latency_caches(self) -> None:
         dexes = [dex.dex_name for dex in HyperliquidDexRegistry(self.settings).enabled_dexes()]
+        await self.engine.warm_market_meta_cache(dexes)
         try:
-            warmed = self.execution_client.warm_exchanges(dexes)
+            # SDK object construction performs CPU-heavy wallet/mapping setup.
+            # Metadata is already in memory, so move this one-time work off the
+            # event loop and keep websocket ingestion responsive.
+            warmed = await asyncio.to_thread(
+                self.execution_client.warm_exchanges,
+                dexes,
+            )
             if warmed:
                 log.info("hyperliquid_exchange_cache_warmed", dexes=warmed)
         except Exception as exc:
-            self.state.last_error = f"exchange warmup: {str(exc)[:160]}"
-        await self.engine.warm_market_meta_cache(dexes)
+            self.state.last_error = f"exchange warmup: {redact_text(exc)[:160]}"
+        warm_transport = getattr(self.execution_client, "warm_order_transport", None)
+        if callable(warm_transport):
+            try:
+                if await warm_transport(""):
+                    log.info("hyperliquid_order_transport_warmed")
+            except Exception as exc:
+                # This is an optional latency optimization. A failed read-only
+                # warmup must never affect durable order processing.
+                log.warning(
+                    "hyperliquid_order_transport_warmup_failed",
+                    error=redact_text(exc)[:200],
+                )
         try:
             async with self.db_session_factory() as db:
-                warmed_accounts = await self.engine.warm_account_abstraction_cache(
-                    db,
-                    leader_addresses=list(self.state.active_leaders),
-                )
                 warmed_risk = await self.engine.warm_risk_settings_cache(db)
                 await db.commit()
-            if warmed_accounts:
-                log.info("hyperliquid_account_abstraction_cache_warmed", accounts=warmed_accounts)
             if warmed_risk:
                 log.info("hyperliquid_risk_settings_cache_warmed", markets=warmed_risk)
         except Exception as exc:
-            self.state.last_error = f"latency cache warmup: {str(exc)[:160]}"
+            self.state.last_error = f"latency cache warmup: {redact_text(exc)[:160]}"
+        try:
+            confirmed, failed = await self._reconcile_one_x_market_risk_settings()
+            if confirmed or failed:
+                log.info(
+                    "hyperliquid_one_x_risk_settings_reconciled",
+                    confirmed=confirmed,
+                    failed=failed,
+                )
+        except Exception as exc:
+            self.state.last_error = f"1x risk reconciliation: {redact_text(exc)[:160]}"
+            log.warning(
+                "hyperliquid_one_x_risk_settings_reconcile_failed",
+                error=redact_text(exc)[:200],
+            )
+
+    async def _reconcile_one_x_market_risk_settings(self) -> tuple[int, int]:
+        account = self.settings.hyperliquid_follower_account_address()
+        if not account:
+            return 0, 0
+        async with self.db_session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(MarketRiskSetting)
+                    .where(MarketRiskSetting.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                    .where(MarketRiskSetting.account_address == account.lower())
+                    .order_by(MarketRiskSetting.dex, MarketRiskSetting.canonical_coin)
+                )
+            ).scalars().all()
+            active_position_scopes = {
+                (str(dex or "").lower(), str(canonical or coin or "").upper())
+                for dex, canonical, coin in (
+                    await db.execute(
+                        select(
+                            LatestAccountPosition.dex,
+                            LatestAccountPosition.canonical_coin,
+                            LatestAccountPosition.coin,
+                        )
+                        .where(LatestAccountPosition.role == FOLLOWER)
+                        .where(LatestAccountPosition.address == account.lower())
+                        .where(LatestAccountPosition.active.is_(True))
+                    )
+                ).all()
+            }
+        targets = [
+            (
+                str(row.dex or "").lower(),
+                str(row.canonical_coin or ""),
+                row.asset_id,
+                row.market_max_leverage,
+            )
+            for row in rows
+            if one_x_leverage_required(
+                margin_mode=row.actual_margin_mode or row.desired_margin_mode,
+                canonical_coin_value=row.canonical_coin,
+            )
+            and any(
+                _int_or_none(value) != 1
+                for value in (row.desired_leverage, row.effective_leverage, row.actual_leverage)
+            )
+        ]
+        targets.sort(
+            key=lambda item: (
+                (item[0], item[1].upper()) not in active_position_scopes,
+                item[0],
+                item[1].upper(),
+            )
+        )
+        confirmed = 0
+        failed = 0
+        for dex, canonical, asset_id, market_max_leverage in targets:
+            cache_scope = (dex, canonical.upper())
+            lock_key = (*cache_scope, 1)
+            risk_lock = self.engine._risk_settings_locks.setdefault(lock_key, asyncio.Lock())
+            async with risk_lock:
+                async with self.db_session_factory() as db:
+                    result = await ensure_hyperliquid_market_risk_settings(
+                        db=db,
+                        client=self.execution_client,
+                        settings=self.settings,
+                        account_address=account,
+                        dex=dex,
+                        canonical_coin_value=canonical,
+                        asset_id=asset_id,
+                        market_max_leverage=market_max_leverage,
+                        desired_default_leverage=1,
+                        action_type="PREPARE_OPEN",
+                        force_refresh=True,
+                    )
+                    await db.commit()
+            for cache_key in list(self.engine._risk_settings_ok_cache):
+                if cache_key[:2] == cache_scope:
+                    self.engine._risk_settings_ok_cache.pop(cache_key, None)
+            if not result.is_ok or result.effective_leverage != 1 or result.actual_leverage != 1:
+                failed += 1
+                log.warning(
+                    "hyperliquid_one_x_market_reconcile_failed",
+                    dex=dex,
+                    canonical_coin=canonical,
+                    reason=redact_text(result.reason_code or result.reason or result.status)[:160],
+                )
+                continue
+            self.engine._risk_settings_ok_cache[
+                (dex, canonical.upper(), 1, result.desired_margin_mode)
+            ] = result
+            if result.actual_margin_mode:
+                self.engine._risk_settings_ok_cache[
+                    (dex, canonical.upper(), 1, result.actual_margin_mode)
+                ] = result
+            confirmed += 1
+        return confirmed, failed
 
     async def refresh_leaders(self) -> None:
         async with self.db_session_factory() as db:
-            leaders = (await db.execute(active_leaders_statement())).scalars().all()
+            leaders = (
+                await db.execute(
+                    active_leaders_statement(
+                        execution_scope=self.execution_scope,
+                        explicit_route=self.settings.low_latency_uses_explicit_leader_route(),
+                    )
+                )
+            ).scalars().all()
         active = {
             normalize_leader_address(leader.leader_address): leader for leader in leaders
         }
         ws_leaders, poll_fallback = self._partition_ws_leaders(list(active))
         async with self._leader_lock:
+            previous_active_leaders = set(self.state.active_leaders)
             previous_ws_leaders = set(self.state.ws_leaders)
             self.state.active_leaders = active
             self.state.ws_leaders = set(ws_leaders)
@@ -3964,9 +7006,15 @@ class HyperliquidLowLatencyWatcher:
                 for dex in HyperliquidDexRegistry(self.settings).enabled_dexes()
             }
             changed = previous_ws_leaders != self.state.ws_leaders
+            active_changed = previous_active_leaders != set(active)
             self._update_websocket_connected_state()
         if changed:
             self._leader_fill_subscription_event.set()
+        if active_changed:
+            # Enabling a leader often follows a collateral transfer. Wake the
+            # out-of-band balance poller immediately instead of waiting for its
+            # normal interval.
+            self._account_abstraction_refresh_event.set()
 
     def _partition_ws_leaders(self, leaders: list[str]) -> tuple[list[str], list[str]]:
         limit = int(getattr(self.settings, "hyperliquid_ws_leader_subscription_limit", 0) or 0)
@@ -3980,15 +7028,99 @@ class HyperliquidLowLatencyWatcher:
             try:
                 await self.refresh_leaders()
             except Exception as exc:
-                self.state.last_error = str(exc)[:200]
+                self.state.last_error = redact_text(exc)[:200]
             await asyncio.sleep(float(self.settings.low_latency_leader_refresh_seconds))
+
+    async def _refresh_follower_account_abstraction_once(self) -> bool:
+        follower = self.settings.hyperliquid_follower_account_address()
+        if not follower:
+            self.state.account_value_refresh_last_error = "follower account address unavailable"
+            return False
+        started_at = datetime.now(timezone.utc)
+        try:
+            async with self.db_session_factory() as db:
+                if isinstance(db, AsyncSession):
+                    # This snapshot is reconstructable. It must not force a
+                    # WAL fsync ahead of a fill plan or an order submit marker.
+                    await db.execute(text("SET LOCAL synchronous_commit = OFF"))
+                await self.engine._refresh_account_abstraction(db, FOLLOWER, follower)
+                await db.commit()
+            finished_at = datetime.now(timezone.utc)
+            self.state.account_value_refresh_count += 1
+            self.state.account_value_last_refresh_at = finished_at
+            self.state.account_value_last_refresh_duration_ms = _delta_ms(started_at, finished_at)
+            self.state.account_value_refresh_last_error = None
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            finished_at = datetime.now(timezone.utc)
+            self.state.account_value_last_refresh_duration_ms = _delta_ms(started_at, finished_at)
+            self.state.account_value_refresh_last_error = redact_text(exc)[:200]
+            log.warning(
+                "follower_account_value_background_refresh_failed",
+                execution_account=mask_address(follower),
+                error=self.state.account_value_refresh_last_error,
+            )
+            return False
+
+    async def _load_follower_account_abstraction_cache(self) -> bool:
+        follower = self.settings.hyperliquid_follower_account_address()
+        if not follower:
+            return False
+        async with self.db_session_factory() as db:
+            payload = await load_account_abstraction_state(
+                db,
+                role=FOLLOWER,
+                address=follower,
+            )
+        if not payload:
+            return False
+        self.engine._cache_account_abstraction_payload(FOLLOWER, follower, payload)
+        dexes = [
+            dex.dex_name
+            for dex in HyperliquidDexRegistry(self.settings).enabled_dexes()
+        ]
+        return _account_abstraction_payload_has_usable_value(
+            payload,
+            dexes=dexes,
+        )
+
+    async def _account_abstraction_refresh_loop(self) -> None:
+        interval = max(
+            1.0,
+            float(getattr(self.settings, "account_value_refresh_seconds", 5.0) or 5.0),
+        )
+        while not self._stopped.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._account_abstraction_refresh_event.wait(),
+                    timeout=interval,
+                )
+            except asyncio.TimeoutError:
+                pass
+            self._account_abstraction_refresh_event.clear()
+            while self._hot_path_busy() and not self._stopped.is_set():
+                self.state.background_cycles_deferred_for_hot_path += 1
+                await asyncio.sleep(0.05)
+            if self._stopped.is_set():
+                return
+            await self._refresh_follower_account_abstraction_once()
 
     async def _price_poll_loop(self) -> None:
         while not self._stopped.is_set():
             dexes = HyperliquidDexRegistry(self.settings).enabled_dexes()
             price_status = self.price_cache.status_by_dex([dex.dex_name for dex in dexes])
+            fallback_dexes = _price_fallback_dexes(
+                enabled_dexes=[dex.dex_name for dex in dexes],
+                active_allocation_dexes=self.state.active_allocation_dexes,
+                last_event_time_by_dex=self.state.last_event_time_by_dex,
+                now=datetime.now(timezone.utc),
+            )
             had_error = False
             for dex in dexes:
+                if str(dex.dex_name or "").lower() not in fallback_dexes:
+                    continue
                 status = price_status.get(str(dex.dex_name or "").lower()) or {}
                 if self.state.websocket_connected and status.get("fresh"):
                     continue
@@ -3997,13 +7129,17 @@ class HyperliquidLowLatencyWatcher:
                     self.price_cache.update_mids(dex=dex.dex_name, mids=mids, source="REST_POLL_FALLBACK", replace=True)
                 except Exception as exc:
                     had_error = True
-                    self.state.last_error = f"price cache {dex.dex_name or 'default'}: {str(exc)[:160]}"
+                    self.state.last_error = f"price cache {dex.dex_name or 'default'}: {redact_text(exc)[:160]}"
             if not had_error and str(self.state.last_error or "").startswith("price cache "):
                 self.state.last_error = None
             await asyncio.sleep(float(self.settings.price_cache_poll_seconds))
 
     async def _allocation_sync_loop(self) -> None:
         while not self._stopped.is_set():
+            if self._hot_path_busy():
+                self.state.background_cycles_deferred_for_hot_path += 1
+                await asyncio.sleep(0.05)
+                continue
             try:
                 async with self.db_session_factory() as db:
                     synced, skipped = await self._sync_allocations_to_actual_follower_positions(db)
@@ -4016,9 +7152,9 @@ class HyperliquidLowLatencyWatcher:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.state.allocation_sync_last_error = str(exc)[:200]
-                self.state.last_error = f"allocation sync: {str(exc)[:160]}"
-                log.warning("allocation_sync_failed", error=str(exc))
+                self.state.allocation_sync_last_error = redact_text(exc)[:200]
+                self.state.last_error = f"allocation sync: {redact_text(exc)[:160]}"
+                log.warning("allocation_sync_failed", error=redact_text(exc))
             await asyncio.sleep(float(self.settings.allocation_sync_poll_seconds))
 
     async def _active_follower_position_refresh_loop(self) -> None:
@@ -4027,15 +7163,23 @@ class HyperliquidLowLatencyWatcher:
             return
         while not self._stopped.is_set():
             started = asyncio.get_running_loop().time()
+            if self._hot_path_busy():
+                self.state.background_cycles_deferred_for_hot_path += 1
+                await asyncio.sleep(min(0.05, max(0.01, interval)))
+                continue
             try:
-                dexes = await self._active_allocation_dexes()
+                dexes = [
+                    dex
+                    for dex in await self._active_allocation_dexes()
+                    if not self._follower_position_stream_is_trusted(dex)
+                ]
                 if dexes:
                     self._schedule_follower_state_refresh(dexes, reason="ACTIVE_ALLOCATION_REFRESH")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.state.last_error = f"active follower position refresh: {str(exc)[:160]}"
-                log.warning("active_follower_position_refresh_failed", error=str(exc))
+                self.state.last_error = f"active follower position refresh: {redact_text(exc)[:160]}"
+                log.warning("active_follower_position_refresh_failed", error=redact_text(exc))
             elapsed = asyncio.get_running_loop().time() - started
             await asyncio.sleep(max(0.05, interval - elapsed))
 
@@ -4046,20 +7190,37 @@ class HyperliquidLowLatencyWatcher:
         return await self._refresh_follower_positions_for_dexes(dexes, source=reason)
 
     async def _active_allocation_dexes(self) -> list[str]:
+        follower = self.settings.hyperliquid_follower_account_address()
+        allocation_dexes = (
+            select(LeaderPositionAllocationRecord.dex)
+            .join(LeaderConfig, LeaderConfig.id == LeaderPositionAllocationRecord.leader_id)
+            .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+            .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
+            .where(LeaderPositionAllocationRecord.status != "CLOSED")
+            .where(LeaderConfig.enabled.is_(True))
+            .where(LeaderConfig.deleted_at.is_(None))
+        )
+        dex_query = allocation_dexes
+        if follower:
+            # Keep refreshing a DEX while a follower position is still OPEN or
+            # awaiting its second missing-position confirmation.  Otherwise the
+            # last allocation can close after the first flat snapshot and leave
+            # a stale MISSING position behind forever, causing the next genuine
+            # open to be mistaken for an unmanaged/manual position.
+            follower_position_dexes = (
+                select(LatestAccountPosition.dex)
+                .where(LatestAccountPosition.role == FOLLOWER)
+                .where(LatestAccountPosition.address == follower.lower())
+                .where(LatestAccountPosition.active.is_(True))
+            )
+            dex_query = allocation_dexes.union(follower_position_dexes)
         async with self.db_session_factory() as db:
             rows = (
-                await db.execute(
-                    select(LeaderPositionAllocationRecord.dex)
-                    .join(LeaderConfig, LeaderConfig.id == LeaderPositionAllocationRecord.leader_id)
-                    .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
-                    .where(LeaderPositionAllocationRecord.status != "CLOSED")
-                    .where(LeaderPositionAllocationRecord.allocated_qty > Decimal("0"))
-                    .where(LeaderConfig.enabled.is_(True))
-                    .where(LeaderConfig.deleted_at.is_(None))
-                    .distinct()
-                )
+                await db.execute(dex_query)
             ).scalars().all()
-        return sorted({str(row or "").lower() for row in rows})
+        active_dexes = {str(row or "").lower() for row in rows}
+        self.state.active_allocation_dexes = active_dexes
+        return sorted(active_dexes)
 
     async def _refresh_follower_positions_for_dexes(self, dexes: list[str], *, source: str) -> int:
         follower = self.settings.hyperliquid_follower_account_address()
@@ -4070,6 +7231,9 @@ class HyperliquidLowLatencyWatcher:
         async with self.db_session_factory() as db:
             for dex in dexes:
                 dex_name = str(dex or "").lower()
+                loop_time = asyncio.get_running_loop().time()
+                if loop_time < self._follower_rest_refresh_next_at.get(dex_name, 0.0):
+                    continue
                 try:
                     state = await service.fetch_state(
                         role=FOLLOWER,
@@ -4081,13 +7245,36 @@ class HyperliquidLowLatencyWatcher:
                     )
                     await save_account_state(db, state)
                     refreshed += 1
+                    self._follower_rest_refresh_failures.pop(dex_name, None)
+                    refresh_error_prefix = (
+                        f"follower position refresh {dex_name or 'default'}:"
+                    )
+                    if str(self.state.last_error or "").startswith(refresh_error_prefix):
+                        self.state.last_error = None
+                    self._follower_rest_refresh_next_at[dex_name] = loop_time + max(
+                        0.5,
+                        float(
+                            getattr(
+                                self.settings,
+                                "follower_active_position_refresh_seconds",
+                                0.5,
+                            )
+                            or 0.5
+                        ),
+                    )
                 except Exception as exc:
-                    self.state.last_error = f"follower position refresh {dex_name or 'default'}: {str(exc)[:160]}"
+                    failures = self._follower_rest_refresh_failures.get(dex_name, 0) + 1
+                    self._follower_rest_refresh_failures[dex_name] = failures
+                    self._follower_rest_refresh_next_at[dex_name] = loop_time + min(
+                        30.0,
+                        0.5 * (2 ** min(failures, 6)),
+                    )
+                    self.state.last_error = f"follower position refresh {dex_name or 'default'}: {redact_text(exc)[:160]}"
                     log.warning(
                         "follower_position_refresh_failed",
                         dex=dex_name,
                         reason=source,
-                        error=str(exc),
+                        error=redact_text(exc),
                     )
             await db.commit()
         return refreshed
@@ -4102,6 +7289,7 @@ class HyperliquidLowLatencyWatcher:
                 select(LeaderPositionAllocationRecord)
                 .join(LeaderConfig, LeaderConfig.id == LeaderPositionAllocationRecord.leader_id)
                 .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
                 .where(LeaderPositionAllocationRecord.status != "CLOSED")
                 .where(LeaderConfig.enabled.is_(True))
                 .where(LeaderConfig.deleted_at.is_(None))
@@ -4162,6 +7350,23 @@ class HyperliquidLowLatencyWatcher:
             if side is None:
                 skipped += len(rows)
                 continue
+            parsed_coin = parse_coin(canonical_coin, default_dex=dex)
+            market = MarketKey(
+                dex=dex,
+                coin=parsed_coin.coin,
+                canonical_coin=canonical_coin,
+                raw_coin=canonical_coin,
+                asset_id=None,
+                venue_symbol=canonical_coin,
+            )
+            # Order recovery can finalize an UNKNOWN/SUBMITTING order in the
+            # backend process after the watcher has already returned from the
+            # submit attempt.  Reconcile the watcher-only overlay from the
+            # durable order state before it is allowed to suppress allocation
+            # sync.  Otherwise a recovered order can leave an immortal pending
+            # intent which prevents a later manual fill from being absorbed and
+            # keeps the durable follower-market guard active indefinitely.
+            await self.engine._release_resolved_pending_intents_for_market(db, market)
             state = state_by_dex.get(dex)
             state_at = _state_updated_at(state)
             if state_at is None:
@@ -4191,7 +7396,11 @@ class HyperliquidLowLatencyWatcher:
                             ),
                             state_at=state_at,
                         )
-                        if _allocation_leader_snapshot_nonflat(allocation):
+                        if (
+                            _allocation_leader_snapshot_nonflat(allocation)
+                            and str(allocation.pending_reduce_reason or "")
+                            != MINIMUM_RESIDUAL_ECONOMIC_FLAT_REASON
+                        ):
                             await self._mark_allocation_wait_until_flat_after_follower_flat(
                                 db,
                                 allocation=allocation,
@@ -4205,11 +7414,68 @@ class HyperliquidLowLatencyWatcher:
                 skipped += len(rows)
                 continue
             allocation = rows[0]
+            manual_guard_entry = self.manual_position_guard.active_entry(market)
+            manual_guard_active = manual_guard_entry is not None
             if self.engine.pending_intents.has_pending_allocation(allocation):
                 skipped += 1
                 continue
             allocation_reconcile_at = _datetime_or_none(getattr(allocation, "last_reconcile_at", None))
-            if allocation_reconcile_at is not None and state_at < allocation_reconcile_at:
+            actual_scope_qty_by_side = {
+                PositionSide.LONG: _actual_scope_qty(
+                    actual_positions_by_scope, dex, canonical_coin, PositionSide.LONG
+                ),
+                PositionSide.SHORT: _actual_scope_qty(
+                    actual_positions_by_scope, dex, canonical_coin, PositionSide.SHORT
+                ),
+            }
+            allocation_scope_qty_by_side = {
+                PositionSide.LONG: (
+                    abs(Decimal(allocation.allocated_qty or 0))
+                    if side == PositionSide.LONG
+                    else Decimal("0")
+                ),
+                PositionSide.SHORT: (
+                    abs(Decimal(allocation.allocated_qty or 0))
+                    if side == PositionSide.SHORT
+                    else Decimal("0")
+                ),
+            }
+            confirmation_before = (
+                manual_guard_entry.position_change_confirmed_at
+                if manual_guard_entry is not None
+                else None
+            )
+            manual_guard_confirmation_at = self.manual_position_guard.confirm_if_observed(
+                market,
+                follower_qty_by_side=actual_scope_qty_by_side,
+                allocation_qty_by_side=allocation_scope_qty_by_side,
+                follower_state_at=state_at,
+            )
+            manual_guard_confirms_state = manual_guard_confirmation_at is not None
+            if (
+                isinstance(db, AsyncSession)
+                and manual_guard_entry is not None
+                and confirmation_before is None
+                and manual_guard_confirmation_at is not None
+            ):
+                await db.execute(
+                    update(FollowerMarketGuard)
+                    .where(FollowerMarketGuard.execution_account == self.execution_scope)
+                    .where(FollowerMarketGuard.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                    .where(FollowerMarketGuard.dex == market.dex)
+                    .where(func.upper(FollowerMarketGuard.canonical_coin) == market.canonical_coin.upper())
+                    .where(FollowerMarketGuard.active.is_(True))
+                    .where(FollowerMarketGuard.position_version == manual_guard_entry.position_version)
+                    .values(
+                        position_change_confirmed_at=manual_guard_confirmation_at,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+            if (
+                allocation_reconcile_at is not None
+                and state_at < allocation_reconcile_at
+                and not manual_guard_confirms_state
+            ):
                 skipped += 1
                 continue
             current_allocation_qty = abs(Decimal(allocation.allocated_qty or 0))
@@ -4218,6 +7484,7 @@ class HyperliquidLowLatencyWatcher:
                 latest_fill_event = await self._latest_allocation_fill_applied_event(db, allocation)
                 if (
                     actual_qty < current_allocation_qty - ALLOCATION_TRANSITION_TOLERANCE
+                    and not manual_guard_active
                     and _allocation_sync_in_post_fill_snapshot_lag_guard(
                         allocation_reconcile_at=allocation_reconcile_at,
                         latest_fill_event_at=_datetime_or_none(getattr(latest_fill_event, "created_at", None)),
@@ -4226,6 +7493,12 @@ class HyperliquidLowLatencyWatcher:
                 ):
                     skipped += 1
                     continue
+            if manual_guard_active and not manual_guard_confirms_state:
+                # Never mutate the allocation from a merely time-new snapshot.
+                # It must either cross the fill-implied position checkpoint or
+                # show the expected directional delta versus the allocation.
+                skipped += 1
+                continue
             if _allocation_has_flat_leader_close_intent(allocation):
                 applied = await self._sync_flat_leader_close_intent_allocation(
                     db,
@@ -4240,47 +7513,54 @@ class HyperliquidLowLatencyWatcher:
                 else:
                     skipped += 1
                 continue
-            parsed_coin = parse_coin(canonical_coin, default_dex=dex)
-            market = MarketKey(
-                dex=dex,
-                coin=parsed_coin.coin,
-                canonical_coin=canonical_coin,
-                raw_coin=canonical_coin,
-                asset_id=None,
-                venue_symbol=canonical_coin,
-            )
             sync = _manual_same_side_position_sync(
                 allocation=allocation,
                 planning_allocation=allocation,
                 transition_plan=SimpleNamespace(action=AllocationTransitionAction.INCREASE),
                 aggregate_side=side,
-                follower_qty_by_side={
-                    PositionSide.LONG: _actual_scope_qty(actual_positions_by_scope, dex, canonical_coin, PositionSide.LONG),
-                    PositionSide.SHORT: _actual_scope_qty(actual_positions_by_scope, dex, canonical_coin, PositionSide.SHORT),
-                },
-                allocation_qty_by_side={side: abs(Decimal(allocation.allocated_qty or 0))},
+                follower_qty_by_side=actual_scope_qty_by_side,
+                allocation_qty_by_side=allocation_scope_qty_by_side,
                 follower_state_at=state_at,
                 allocation_latest_reconcile_at=allocation_reconcile_at,
                 has_pending_allocation=False,
                 mark_price=mark_price,
-                allow_actual_qty_increase=self.manual_position_guard.active_entry(market) is None,
-                trusted_actual_qty_ceiling=_decimal_from_value(getattr(latest_fill_event, "after_qty", None)),
+                # An unmatched/no-cloid same-side follower add is an explicit
+                # manual position change.  Once a post-fill account snapshot is
+                # old enough to be trustworthy, absorb the actual quantity into
+                # the sole active allocation just as we already do for manual
+                # reductions.  Otherwise the manual guard would forbid the
+                # upward sync while also requiring that sync before it can
+                # clear, permanently blocking every later leader fill.
+                allow_actual_qty_increase=(
+                    not manual_guard_active or manual_guard_confirms_state
+                ),
+                trusted_actual_qty_ceiling=(
+                    actual_qty
+                    if manual_guard_confirms_state
+                    else _decimal_from_value(getattr(latest_fill_event, "after_qty", None))
+                ),
             )
             if not sync.get("applied"):
                 if abs(actual_qty - current_allocation_qty) <= ALLOCATION_TRANSITION_TOLERANCE:
                     allocation.last_reconcile_at = state_at
-                    if hasattr(allocation, "updated_at"):
-                        allocation.updated_at = datetime.now(timezone.utc)
+                    allocation.updated_at = datetime.now(timezone.utc)
                     synced += 1
                 continue
             before_qty = Decimal(allocation.allocated_qty or 0)
             before_notional = Decimal(allocation.allocated_notional or 0)
             if sync.get("closed"):
+                minimum_residual_release_pending = (
+                    str(allocation.pending_reduce_reason or "")
+                    == MINIMUM_RESIDUAL_ECONOMIC_FLAT_PENDING_REASON
+                )
                 allocation.allocated_qty = Decimal("0")
                 allocation.allocated_notional = Decimal("0")
                 allocation.target_notional = Decimal("0")
                 allocation.status = "CLOSED"
-                if _allocation_leader_snapshot_nonflat(allocation):
+                if (
+                    _allocation_leader_snapshot_nonflat(allocation)
+                    and not minimum_residual_release_pending
+                ):
                     await self._mark_allocation_wait_until_flat_after_follower_flat(
                         db,
                         allocation=allocation,
@@ -4293,9 +7573,15 @@ class HyperliquidLowLatencyWatcher:
                 allocation.avg_entry_price = _position_entry_price(position) or mark_price or allocation.avg_entry_price
                 allocation.status = "OPEN"
             allocation.last_reconcile_at = datetime.now(timezone.utc)
-            if hasattr(allocation, "updated_at"):
-                allocation.updated_at = allocation.last_reconcile_at
-            _clear_deferred_reduce(allocation)
+            # Do not probe this server-onupdate ORM attribute with hasattr after
+            # an autoflush. SQLAlchemy may have expired it, and probing performs
+            # forbidden implicit async IO (MissingGreenlet), rolling back the
+            # whole allocation-sync transaction.
+            allocation.updated_at = allocation.last_reconcile_at
+            if sync.get("closed"):
+                _clear_deferred_reduce_after_follower_flat(allocation)
+            else:
+                _clear_deferred_reduce(allocation)
             db.add(
                 RiskEvent(
                     severity="info",
@@ -4330,6 +7616,7 @@ class HyperliquidLowLatencyWatcher:
                 )
                 .join(LeaderConfig, LeaderConfig.id == LeaderPositionAllocationRecord.leader_id)
                 .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
                 .where(LeaderPositionAllocationRecord.status != "CLOSED")
                 .where(or_(LeaderConfig.enabled.is_(False), LeaderConfig.deleted_at.is_not(None)))
                 .with_for_update(of=LeaderPositionAllocationRecord)
@@ -4360,8 +7647,7 @@ class HyperliquidLowLatencyWatcher:
             allocation.last_leader_position_size = Decimal("0")
             allocation.last_leader_position_notional = Decimal("0")
             allocation.last_reconcile_at = now
-            if hasattr(allocation, "updated_at"):
-                allocation.updated_at = now
+            allocation.updated_at = now
             _clear_deferred_reduce(allocation)
             db.add(
                 AllocationEvent(
@@ -4442,9 +7728,8 @@ class HyperliquidLowLatencyWatcher:
         allocation.target_notional = Decimal("0")
         allocation.status = "CLOSED"
         allocation.last_reconcile_at = now
-        if hasattr(allocation, "updated_at"):
-            allocation.updated_at = now
-        _clear_deferred_reduce(allocation)
+        allocation.updated_at = now
+        _clear_deferred_reduce_after_follower_flat(allocation)
         db.add(
             AllocationEvent(
                 allocation_id=allocation.id,
@@ -4506,7 +7791,7 @@ class HyperliquidLowLatencyWatcher:
             allocation.allocated_notional = Decimal("0")
             allocation.target_notional = Decimal("0")
             allocation.status = "CLOSED"
-            _clear_deferred_reduce(allocation)
+            _clear_deferred_reduce_after_follower_flat(allocation)
             event_type = "AUTO_CLOSE_LEADER_FOLLOWER_FLAT"
             message = "flat leader close-intent allocation auto-closed after follower actual position became flat"
         elif abs(actual_qty - before_qty) > ALLOCATION_TRANSITION_TOLERANCE:
@@ -4524,8 +7809,7 @@ class HyperliquidLowLatencyWatcher:
         else:
             return False
         allocation.last_reconcile_at = now
-        if hasattr(allocation, "updated_at"):
-            allocation.updated_at = now
+        allocation.updated_at = now
         db.add(
             AllocationEvent(
                 allocation_id=allocation.id,
@@ -4638,9 +7922,18 @@ class HyperliquidLowLatencyWatcher:
     async def _ws_loop(self) -> None:
         while not self._stopped.is_set():
             try:
-                async with websockets.connect(self.settings.hyperliquid_ws_url, ping_interval=20) as ws:
+                async with websockets.connect(
+                    self.settings.hyperliquid_ws_url,
+                    ping_interval=20,
+                    compression=None,
+                    max_queue=HYPERLIQUID_WS_MAX_QUEUE,
+                    max_size=HYPERLIQUID_WS_MAX_MESSAGE_BYTES,
+                ) as ws:
                     self.state.market_ws_connected = True
                     self.state.low_latency_primary = True
+                    self.state.follower_clearinghouse_subscribed = False
+                    self.state.follower_all_dexs_clearinghouse_subscribed = False
+                    self._follower_position_stream_observed_at.clear()
                     self._update_websocket_connected_state()
                     self.state.last_error = None
                     await self._subscribe_follower(ws)
@@ -4656,7 +7949,11 @@ class HyperliquidLowLatencyWatcher:
                             continue
                         ws_received_at = datetime.now(timezone.utc)
                         self.state.last_ws_event_at = ws_received_at
-                        await self._handle_ws_message(raw, ws_received_at=ws_received_at)
+                        await self._handle_ws_message(
+                            raw,
+                            ws_received_at=ws_received_at,
+                            defer_leader_fill_persist=True,
+                        )
             except Exception as exc:
                 self.state.market_ws_connected = False
                 self._update_websocket_connected_state()
@@ -4665,27 +7962,36 @@ class HyperliquidLowLatencyWatcher:
                 self.state.follower_user_events_subscribed = False
                 self.state.follower_user_fills_subscribed = False
                 self.state.follower_clearinghouse_subscribed = False
+                self.state.follower_all_dexs_clearinghouse_subscribed = False
+                self._follower_position_stream_observed_at.clear()
                 self.state.reconnect_count += 1
-                self.state.last_error = str(exc)[:200]
-                log.warning("low_latency_ws_reconnect", error=str(exc))
+                self.state.last_error = redact_text(exc)[:200]
+                log.warning("low_latency_ws_reconnect", error=redact_text(exc))
                 await asyncio.sleep(3)
 
     async def _leader_fill_ws_loop(self) -> None:
         while not self._stopped.is_set():
             try:
-                async with websockets.connect(self.settings.hyperliquid_ws_url, ping_interval=20) as ws:
+                async with websockets.connect(
+                    self.settings.hyperliquid_ws_url,
+                    ping_interval=20,
+                    compression=None,
+                    max_queue=HYPERLIQUID_WS_MAX_QUEUE,
+                    max_size=HYPERLIQUID_WS_MAX_MESSAGE_BYTES,
+                ) as ws:
                     self.state.leader_fills_ws_connected = True
                     self._update_websocket_connected_state()
                     self.state.last_error = None
                     self._subscribed.clear()
                     self._leader_fill_subscription_event.clear()
                     await self._subscribe_active_leaders(ws)
-                    self._schedule_startup_leader_fill_backfill()
                     next_app_ping_at = asyncio.get_running_loop().time() + HYPERLIQUID_WS_APP_PING_SECONDS
+                    start_time_ms = await self._durable_leader_fill_backfill_start_ms()
                     if self._leader_fill_backfill_start_ms is not None:
-                        start_time_ms = self._leader_fill_backfill_start_ms
-                        self._leader_fill_backfill_start_ms = None
-                        self._schedule_background_task(self._backfill_leader_fills_since(start_time_ms))
+                        start_time_ms = min(start_time_ms, self._leader_fill_backfill_start_ms)
+                    self._leader_fill_backfill_start_ms = None
+                    async with self._leader_fill_backfill_lock:
+                        await self._backfill_leader_fills_since(start_time_ms)
                     while not self._stopped.is_set():
                         if asyncio.get_running_loop().time() >= next_app_ping_at:
                             await self._send_ws_ping(ws)
@@ -4699,7 +8005,12 @@ class HyperliquidLowLatencyWatcher:
                             continue
                         ws_received_at = datetime.now(timezone.utc)
                         self.state.last_ws_event_at = ws_received_at
-                        await self._handle_ws_message(raw, ws_received_at=ws_received_at)
+                        await self._handle_ws_message(
+                            raw,
+                            ws_received_at=ws_received_at,
+                            defer_leader_fill_persist=True,
+                            leader_ingress_source="primary_userFills",
+                        )
             except Exception as exc:
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                 backfill_start_ms = max(now_ms - 5_000, 0)
@@ -4713,9 +8024,39 @@ class HyperliquidLowLatencyWatcher:
                 self.state.leader_fills_ws_connected = False
                 self._update_websocket_connected_state()
                 self.state.reconnect_count += 1
-                self.state.last_error = str(exc)[:200]
-                log.warning("low_latency_leader_fill_ws_reconnect", error=str(exc))
+                self.state.last_error = redact_text(exc)[:200]
+                log.warning("low_latency_leader_fill_ws_reconnect", error=redact_text(exc))
                 await asyncio.sleep(3)
+
+    async def _durable_leader_fill_backfill_start_ms(self) -> int:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        fallback = self._startup_leader_fill_backfill_start_ms(now_ms)
+        fallback = fallback if fallback is not None else max(now_ms - 60_000, 0)
+        async with self._leader_lock:
+            leaders = sorted(self.state.ws_leaders)
+        if not leaders:
+            return fallback
+        async with self.db_session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(LeaderFillCursor.leader_address, LeaderFillCursor.backfilled_through_ms)
+                    .where(LeaderFillCursor.leader_address.in_(leaders))
+                )
+            ).all()
+        by_address = {
+            normalize_leader_address(address): (
+                int(backfilled_through_ms)
+                if int(backfilled_through_ms or 0) > 0
+                else fallback
+            )
+            for address, backfilled_through_ms in rows
+        }
+        starts = [
+            max(by_address.get(address, fallback) - LEADER_FILL_BACKFILL_OVERLAP_MS, 0)
+            for address in leaders
+        ]
+        self._leader_fill_startup_backfill_done = True
+        return min(starts or [fallback])
 
     def _startup_leader_fill_backfill_start_ms(self, now_ms: int | None = None) -> int | None:
         window_seconds = max(float(getattr(self.settings, "leader_fill_startup_backfill_seconds", 0) or 0), 0.0)
@@ -4749,46 +8090,156 @@ class HyperliquidLowLatencyWatcher:
         leader_fill_ready = not self.state.ws_leaders or self.state.leader_fills_ws_connected
         self.state.websocket_connected = bool(self.state.market_ws_connected and leader_fill_ready)
 
-    async def _backfill_leader_fills_since(self, start_time_ms: int) -> None:
+    async def _backfill_leader_fills_since(self, start_time_ms: int) -> bool:
         async with self._leader_lock:
             leaders = sorted(self.state.ws_leaders)
         if not leaders:
-            return
+            return True
+        end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        all_succeeded = True
         for address in leaders:
             try:
-                fills = await self.info_client.user_fills_by_time(
+                fills = await self._fetch_leader_fills_range(
                     address,
                     start_time_ms,
-                    aggregate_by_time=False,
+                    end_time_ms,
+                )
+                fills = _causal_sort_fill_payloads(fills)
+                if fills:
+                    await self._handle_ws_message(
+                        json.dumps({"channel": "userFills", "data": {"user": address, "fills": fills}}),
+                        ws_received_at=datetime.now(timezone.utc),
+                    )
+                await self._mark_leader_backfill_complete(address, end_time_ms)
+                normalized_address = normalize_leader_address(address)
+                self._leader_snapshot_backfilled_through_ms[normalized_address] = max(
+                    end_time_ms,
+                    self._leader_snapshot_backfilled_through_ms.get(normalized_address, 0),
                 )
             except Exception as exc:
-                self.state.last_error = f"leader fill backfill {mask_address(address)}: {str(exc)[:160]}"
+                all_succeeded = False
+                if self._leader_fill_backfill_start_ms is None:
+                    self._leader_fill_backfill_start_ms = start_time_ms
+                else:
+                    self._leader_fill_backfill_start_ms = min(
+                        self._leader_fill_backfill_start_ms,
+                        start_time_ms,
+                    )
+                safe_error = redact_text(exc)
+                self.state.last_error = (
+                    f"leader fill backfill {mask_address(address)}: {safe_error[:160]}"
+                )
                 log.warning(
                     "low_latency_leader_fill_backfill_failed",
                     leader_address=mask_address(address),
                     start_time_ms=start_time_ms,
-                    error=str(exc),
+                    error=safe_error,
                 )
-                continue
-            fills = [
-                fill
-                for fill in list(fills or [])
-                if (_int_or_none(fill.get("time")) or 0) >= int(start_time_ms)
-            ]
-            fills = sorted(
-                fills,
-                key=lambda item: (
-                    _int_or_none(item.get("time")) or 0,
-                    str(item.get("oid") or ""),
-                    str(item.get("tid") or ""),
-                ),
+        if all_succeeded and str(self.state.last_error or "").startswith(
+            "leader fill backfill "
+        ):
+            self.state.last_error = None
+        return all_succeeded
+
+    async def _leader_fill_backfill_retry_loop(self) -> None:
+        next_reconcile_at = 0.0
+        retry_not_before = 0.0
+        consecutive_failures = 0
+        while not self._stopped.is_set():
+            start_time_ms = self._leader_fill_backfill_start_ms
+            loop_time = asyncio.get_running_loop().time()
+            retry_due = start_time_ms is not None and loop_time >= retry_not_before
+            periodic_due = start_time_ms is None and loop_time >= next_reconcile_at
+            if self.state.leader_fills_ws_connected and (retry_due or periodic_due):
+                if start_time_ms is None:
+                    start_time_ms = await self._durable_leader_fill_backfill_start_ms()
+                self._leader_fill_backfill_start_ms = None
+                async with self._leader_fill_backfill_lock:
+                    succeeded = await self._backfill_leader_fills_since(start_time_ms)
+                loop_time = asyncio.get_running_loop().time()
+                if succeeded:
+                    consecutive_failures = 0
+                    retry_not_before = 0.0
+                else:
+                    consecutive_failures += 1
+                    retry_not_before = loop_time + _leader_fill_backfill_retry_delay_seconds(
+                        consecutive_failures
+                    )
+                next_reconcile_at = loop_time + max(
+                    5.0,
+                    float(getattr(self.settings, "leader_fill_reconcile_seconds", 15.0) or 15.0),
+                )
+            try:
+                await asyncio.wait_for(self._stopped.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _fetch_leader_fills_range(
+        self,
+        address: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        *,
+        depth: int = 0,
+    ) -> list[dict[str, Any]]:
+        page = await self.info_client.user_fills_by_time(
+            address,
+            start_time_ms,
+            end_time_ms=end_time_ms,
+            aggregate_by_time=False,
+        )
+        page = [
+            fill
+            for fill in list(page or [])
+            if int(start_time_ms) <= (_int_or_none(fill.get("time")) or 0) <= int(end_time_ms)
+        ]
+        if len(page) < LEADER_FILL_BACKFILL_PAGE_SIZE:
+            return page
+        if start_time_ms >= end_time_ms or depth >= 32:
+            raise RuntimeError(
+                "leader fill backfill saturated the 2000-fill API limit in one time window"
             )
-            if not fills:
-                continue
-            await self._handle_ws_message(
-                json.dumps({"channel": "userFills", "data": {"user": address, "fills": fills}}),
-                ws_received_at=datetime.now(timezone.utc),
+        midpoint = (int(start_time_ms) + int(end_time_ms)) // 2
+        left = await self._fetch_leader_fills_range(
+            address,
+            start_time_ms,
+            midpoint,
+            depth=depth + 1,
+        )
+        right = await self._fetch_leader_fills_range(
+            address,
+            midpoint + 1,
+            end_time_ms,
+            depth=depth + 1,
+        )
+        by_source_fill_id: dict[str, dict[str, Any]] = {}
+        for fill in [*left, *right]:
+            by_source_fill_id[fill_unique_id(address, fill)] = fill
+        return list(by_source_fill_id.values())
+
+    async def _mark_leader_backfill_complete(self, address: str, end_time_ms: int) -> None:
+        now = datetime.now(timezone.utc)
+        async with self.db_session_factory() as db:
+            cursor_insert = insert(LeaderFillCursor).values(
+                leader_address=normalize_leader_address(address),
+                last_fill_time_ms=0,
+                last_fill_tid=None,
+                backfilled_through_ms=end_time_ms,
+                updated_at=now,
             )
+            await db.execute(
+                cursor_insert.on_conflict_do_update(
+                    index_elements=[LeaderFillCursor.leader_address],
+                    set_={
+                        "backfilled_through_ms": func.greatest(
+                            LeaderFillCursor.backfilled_through_ms,
+                            cursor_insert.excluded.backfilled_through_ms,
+                        ),
+                        "updated_at": now,
+                    },
+                )
+            )
+            await db.commit()
 
     async def _subscribe_follower(self, ws: Any) -> None:
         follower = self.settings.hyperliquid_follower_account_address()
@@ -4796,13 +8247,16 @@ class HyperliquidLowLatencyWatcher:
             return
         subscriptions = {
             "orderUpdates": "follower_order_updates_subscribed",
-            "userEvents": "follower_user_events_subscribed",
             "userFills": "follower_user_fills_subscribed",
-            "clearinghouseState": "follower_clearinghouse_subscribed",
+            "allDexsClearinghouseState": "follower_all_dexs_clearinghouse_subscribed",
         }
         for sub_type, attr in subscriptions.items():
             await self._subscribe(ws, {"type": sub_type, "user": follower})
             setattr(self.state, attr, True)
+            if sub_type == "allDexsClearinghouseState":
+                # Preserve the existing status contract while exposing the
+                # more precise all-DEX subscription field separately.
+                self.state.follower_clearinghouse_subscribed = True
 
     async def _subscribe_market_data(self, ws: Any) -> None:
         for dex in HyperliquidDexRegistry(self.settings).enabled_dexes():
@@ -4817,7 +8271,14 @@ class HyperliquidLowLatencyWatcher:
     async def _send_ws_ping(self, ws: Any) -> None:
         await ws.send(json.dumps({"method": "ping"}))
 
-    async def _handle_ws_message(self, raw_message: str | bytes, *, ws_received_at: datetime | None = None) -> None:
+    async def _handle_ws_message(
+        self,
+        raw_message: str | bytes,
+        *,
+        ws_received_at: datetime | None = None,
+        defer_leader_fill_persist: bool = False,
+        leader_ingress_source: str | None = None,
+    ) -> None:
         try:
             message = json.loads(raw_message)
         except Exception:
@@ -4844,6 +8305,12 @@ class HyperliquidLowLatencyWatcher:
             if channel == "clearinghouseState":
                 await self._handle_follower_clearinghouse_state(data, ws_received_at=ws_received_at)
                 return
+            if channel == "allDexsClearinghouseState":
+                await self._handle_follower_all_dexs_clearinghouse_state(
+                    data,
+                    ws_received_at=ws_received_at,
+                )
+                return
             if channel in {"userFills", "userEvents"}:
                 await self._handle_follower_user_fills(channel, data, ws_received_at=ws_received_at)
                 return
@@ -4853,6 +8320,7 @@ class HyperliquidLowLatencyWatcher:
         fills = _fills_from_message(channel, data)
         if not fills:
             return
+        fills = _causal_sort_fill_payloads(fills)
         leader_address = user_address
         async with self._leader_lock:
             leader = self.state.active_leaders.get(leader_address)
@@ -4860,25 +8328,61 @@ class HyperliquidLowLatencyWatcher:
         if leader is None or not ws_leader:
             return
         is_snapshot = bool(data.get("isSnapshot"))
+        snapshot_covered_through_ms = (
+            self._leader_snapshot_backfilled_through_ms.get(leader_address)
+            if is_snapshot
+            else None
+        )
         events: list[FillEvent] = []
+        parse_failures: list[str] = []
         for fill in fills:
+            fill_time_ms = _int_or_none(fill.get("time"))
+            if (
+                is_snapshot
+                and snapshot_covered_through_ms is not None
+                and fill_time_ms is not None
+                and fill_time_ms <= snapshot_covered_through_ms
+            ):
+                # A successful REST backfill already ran this fill through the
+                # durable exactly-once path.  Redundant subscription history
+                # must not compete with a new live fill during reconnect.
+                continue
+            event_is_snapshot = bool(
+                is_snapshot
+                and (snapshot_covered_through_ms is None or fill_time_ms is None)
+            )
             try:
                 event = build_fill_event(
                     leader_address,
                     fill,
-                    is_snapshot=is_snapshot,
+                    is_snapshot=event_is_snapshot,
                     ws_received_at=ws_received_at,
+                    ingress_channel=leader_ingress_source or str(channel or ""),
                 )
             except Exception as exc:
-                await self._record_parse_error(leader_address, fill, str(exc))
+                safe_error = redact_text(exc)
+                parse_failures.append(safe_error)
+                await self._record_parse_error(leader_address, fill, safe_error)
                 continue
-            self.state.last_event_time_by_dex[event.market.dex] = event.ws_received_at.isoformat()
+            if not event.is_snapshot:
+                self.state.last_event_time_by_dex[event.market.dex] = (
+                    event.ws_received_at.isoformat()
+                )
             events.append(event)
-        if not is_snapshot:
+        if events and not all(event.is_snapshot for event in events):
             events = await self._filter_suppressed_events(events)
-            if not events:
-                return
-        await self._enqueue_fill_events(events, leader)
+        if events:
+            await self._enqueue_fill_events(
+                events,
+                leader,
+                persist=not defer_leader_fill_persist,
+                ensure_persist_in_worker=defer_leader_fill_persist,
+            )
+        if parse_failures:
+            raise RetryableFillProcessingError(
+                f"{len(parse_failures)} leader fill(s) could not be parsed; backfill cursor not advanced: "
+                f"{parse_failures[0][:160]}"
+            )
 
     async def _handle_follower_user_fills(
         self,
@@ -4890,6 +8394,7 @@ class HyperliquidLowLatencyWatcher:
         fills = _fills_from_message(channel, data)
         if not fills:
             return
+        fills = _causal_sort_fill_payloads(fills)
         affected_dexes: set[str] = set()
         is_snapshot = bool(data.get("isSnapshot"))
         if is_snapshot:
@@ -4905,6 +8410,7 @@ class HyperliquidLowLatencyWatcher:
                     reason="FOLLOWER_USER_FILL_SNAPSHOT",
                 )
             return
+        durable_guards: dict[tuple[str, str], tuple[MarketKey, FollowerMarketGuard]] = {}
         async with self.db_session_factory() as db:
             for fill in fills:
                 try:
@@ -4914,11 +8420,39 @@ class HyperliquidLowLatencyWatcher:
                 affected_dexes.add(market.dex)
                 if await self._follower_fill_matches_auto_copy_order(db, fill):
                     continue
+                confirmation_spec = _manual_fill_position_confirmation_spec(fill)
                 self.manual_position_guard.mark(
                     market,
                     reason="follower fill was not linked to an AUTO_COPY order",
                     observed_at=ws_received_at,
+                    expected_position_side=(confirmation_spec or (None, None, None))[0],
+                    expected_position_qty=(confirmation_spec or (None, None, None))[1],
+                    expected_position_relation=(confirmation_spec or (None, None, None))[2],
                 )
+                guard = await self._persist_unmatched_follower_fill_guard(
+                    db,
+                    market=market,
+                    fill=fill,
+                    observed_at=ws_received_at,
+                )
+                durable_guards[(market.dex, market.canonical_coin.upper())] = (market, guard)
+            await db.commit()
+        for market, guard in durable_guards.values():
+            if bool(guard.active):
+                self.manual_position_guard.mark(
+                    market,
+                    reason=guard.reason or "follower fill was not linked to an AUTO_COPY order",
+                    observed_at=guard.observed_at,
+                    position_version=int(guard.position_version or 0),
+                    expected_position_side=guard.expected_position_side,
+                    expected_position_qty=guard.expected_position_qty,
+                    expected_position_relation=guard.expected_position_relation,
+                    position_change_confirmed_at=guard.position_change_confirmed_at,
+                )
+            else:
+                # A duplicated websocket delivery of an already reconciled
+                # fill must not reactivate the guard.
+                self.manual_position_guard.clear(market)
         if affected_dexes:
             self._schedule_follower_state_refresh(
                 affected_dexes,
@@ -4939,10 +8473,153 @@ class HyperliquidLowLatencyWatcher:
         row = await db.scalar(
             select(ExecutionOrder.id)
             .where(ExecutionOrder.source_type == "AUTO_COPY")
+            .where(ExecutionOrder.venue_account == self.execution_scope)
             .where(or_(*filters))
             .limit(1)
         )
         return row is not None
+
+    async def _persist_unmatched_follower_fill_guard(
+        self,
+        db: Any,
+        *,
+        market: MarketKey,
+        fill: dict[str, Any],
+        observed_at: datetime | None,
+    ) -> FollowerMarketGuard:
+        confirmation_spec = _manual_fill_position_confirmation_spec(fill)
+        expected_position_side = (confirmation_spec or (None, None, None))[0]
+        expected_position_qty = (confirmation_spec or (None, None, None))[1]
+        expected_position_relation = (confirmation_spec or (None, None, None))[2]
+        if not isinstance(db, AsyncSession):
+            return FollowerMarketGuard(
+                execution_account=self.execution_scope,
+                execution_venue=ExecutionVenue.HYPERLIQUID.value,
+                dex=market.dex,
+                canonical_coin=market.canonical_coin,
+                position_version=1,
+                active=True,
+                reason="follower fill was not linked to an AUTO_COPY order",
+                observed_at=observed_at or datetime.now(timezone.utc),
+                expected_position_side=(
+                    expected_position_side.value if expected_position_side is not None else None
+                ),
+                expected_position_qty=expected_position_qty,
+                expected_position_relation=expected_position_relation,
+                position_change_confirmed_at=None,
+            )
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(:market_key)"),
+            {"market_key": _market_transaction_key(market, self.execution_scope)},
+        )
+        row = await db.scalar(
+            _follower_market_guard_query(
+                market,
+                execution_scope=self.execution_scope,
+            ).with_for_update()
+        )
+        follower = self.settings.hyperliquid_follower_account_address() or "follower"
+        unmatched_fill_id = fill_unique_id(follower, fill)
+        cloid, oid = _fill_order_identifiers(fill)
+        now = datetime.now(timezone.utc)
+        event_at = _datetime_or_none(observed_at) or now
+        inserted_fill_id = await db.scalar(
+            insert(UnmatchedFollowerFill)
+            .values(
+                follower_fill_id=unmatched_fill_id,
+                execution_account=self.execution_scope,
+                execution_venue=ExecutionVenue.HYPERLIQUID.value,
+                dex=str(market.dex or "").lower(),
+                canonical_coin=market.canonical_coin.upper(),
+                observed_at=event_at,
+                cloid=cloid,
+                order_id=oid,
+                updated_at=now,
+            )
+            .on_conflict_do_nothing(index_elements=[UnmatchedFollowerFill.follower_fill_id])
+            .returning(UnmatchedFollowerFill.follower_fill_id)
+        )
+        if inserted_fill_id is None:
+            if row is None:
+                raise RuntimeError(
+                    "unmatched follower fill was deduplicated without a durable market guard"
+                )
+            return row
+        if row is None:
+            row = FollowerMarketGuard(
+                execution_account=self.execution_scope,
+                execution_venue=ExecutionVenue.HYPERLIQUID.value,
+                dex=str(market.dex or "").lower(),
+                canonical_coin=market.canonical_coin.upper(),
+                position_version=1,
+                active=True,
+                reason="follower fill was not linked to an AUTO_COPY order",
+                observed_at=event_at,
+                reconciled_at=None,
+                last_unmatched_fill_id=unmatched_fill_id,
+                last_cloid=cloid,
+                last_order_id=oid,
+                expected_position_side=(
+                    expected_position_side.value if expected_position_side is not None else None
+                ),
+                expected_position_qty=expected_position_qty,
+                expected_position_relation=expected_position_relation,
+                position_change_confirmed_at=None,
+            )
+            db.add(row)
+            await db.flush()
+            return row
+        row.position_version = int(row.position_version or 0) + 1
+        row.active = True
+        row.reason = "follower fill was not linked to an AUTO_COPY order"
+        row.observed_at = event_at
+        row.reconciled_at = None
+        row.last_unmatched_fill_id = unmatched_fill_id
+        row.last_cloid = cloid
+        row.last_order_id = oid
+        row.expected_position_side = (
+            expected_position_side.value if expected_position_side is not None else None
+        )
+        row.expected_position_qty = expected_position_qty
+        row.expected_position_relation = expected_position_relation
+        row.position_change_confirmed_at = None
+        row.updated_at = now
+        await db.flush()
+        return row
+
+    async def _restore_persistent_manual_position_guards(self) -> int:
+        async with self.db_session_factory() as db:
+            if not isinstance(db, AsyncSession):
+                return 0
+            rows = (
+                await db.execute(
+                    select(FollowerMarketGuard)
+                    .where(FollowerMarketGuard.execution_account == self.execution_scope)
+                    .where(FollowerMarketGuard.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                    .where(FollowerMarketGuard.active.is_(True))
+                )
+            ).scalars().all()
+        for row in rows:
+            parsed = parse_coin(row.canonical_coin, default_dex=row.dex)
+            market = MarketKey(
+                dex=str(row.dex or "").lower(),
+                coin=parsed.coin,
+                canonical_coin=str(row.canonical_coin or "").upper(),
+                raw_coin=str(row.canonical_coin or ""),
+                asset_id=None,
+                venue_symbol=str(row.canonical_coin or ""),
+            )
+            self.manual_position_guard.mark(
+                market,
+                reason=row.reason or "durable unmatched follower fill guard",
+                observed_at=row.observed_at,
+                position_version=int(row.position_version or 0),
+                expected_position_side=row.expected_position_side,
+                expected_position_qty=row.expected_position_qty,
+                expected_position_relation=row.expected_position_relation,
+                position_change_confirmed_at=row.position_change_confirmed_at,
+            )
+        return len(rows)
 
     async def _handle_follower_clearinghouse_state(
         self,
@@ -4955,33 +8632,274 @@ class HyperliquidLowLatencyWatcher:
             return
         payload = _clearinghouse_state_payload_from_ws(data)
         dex = _dex_from_ws_account_state(data)
-        reason = "FOLLOWER_CLEARINGHOUSE_WS" if payload is not None else "FOLLOWER_CLEARINGHOUSE_WS_EMPTY"
-        self._schedule_follower_state_refresh([dex], reason=reason)
+        if payload is None:
+            self._schedule_follower_state_refresh([dex], reason="FOLLOWER_CLEARINGHOUSE_WS_EMPTY")
+            return
+        observed_at = ws_received_at or datetime.now(timezone.utc)
+        state = parse_account_state(
+            role=FOLLOWER,
+            address=follower,
+            dex=dex,
+            clearinghouse_state=payload,
+            account_label=f"My Hyperliquid Follower Account / {dex_display_name(dex)}",
+            source="FOLLOWER_CLEARINGHOUSE_WS",
+            updated_at=observed_at,
+            price_mids=self.price_cache.fresh_mids_for_dex(dex),
+        )
+        async with self.db_session_factory() as db:
+            await save_account_state(db, state)
+            await self._reconcile_manual_position_guards(db, dexes={dex})
+            await db.commit()
+        self._follower_position_stream_observed_at[dex] = observed_at
+
+    async def _handle_follower_all_dexs_clearinghouse_state(
+        self,
+        data: dict[str, Any],
+        *,
+        ws_received_at: datetime | None,
+    ) -> None:
+        follower = self.settings.hyperliquid_follower_account_address()
+        if not follower:
+            return
+        states = _all_dexs_clearinghouse_states(data)
+        enabled_dexes = {
+            str(item.dex_name or "").lower()
+            for item in HyperliquidDexRegistry(self.settings).enabled_dexes()
+        }
+        states = {
+            dex: payload
+            for dex, payload in states.items()
+            if dex in enabled_dexes
+        }
+        if not states:
+            self._schedule_follower_state_refresh(
+                enabled_dexes,
+                reason="FOLLOWER_ALL_DEXS_CLEARINGHOUSE_WS_EMPTY",
+            )
+            return
+        observed_at = ws_received_at or datetime.now(timezone.utc)
+        parsed_states = []
+        for dex, payload in states.items():
+            try:
+                parsed_states.append(
+                    parse_account_state(
+                        role=FOLLOWER,
+                        address=follower,
+                        dex=dex,
+                        clearinghouse_state=payload,
+                        account_label=(
+                            f"My Hyperliquid Follower Account / {dex_display_name(dex)}"
+                        ),
+                        source="FOLLOWER_ALL_DEXS_CLEARINGHOUSE_WS",
+                        updated_at=observed_at,
+                        price_mids=self.price_cache.fresh_mids_for_dex(dex),
+                    )
+                )
+            except Exception as exc:
+                log.warning(
+                    "follower_all_dexs_state_parse_failed",
+                    dex=dex,
+                    error=redact_text(exc)[:200],
+                )
+        if not parsed_states:
+            self._schedule_follower_state_refresh(
+                enabled_dexes,
+                reason="FOLLOWER_ALL_DEXS_CLEARINGHOUSE_WS_PARSE_FAILED",
+            )
+            return
+        parsed_dexes = {str(state.dex or "").lower() for state in parsed_states}
+        async with self.db_session_factory() as db:
+            for state in parsed_states:
+                await save_account_state(db, state)
+            await self._reconcile_manual_position_guards(db, dexes=parsed_dexes)
+            await db.commit()
+        # Trust is published only after every saved state is durable. A failed
+        # transaction therefore falls back to REST rather than blessing a
+        # memory-only snapshot.
+        for dex in parsed_dexes:
+            self._follower_position_stream_observed_at[dex] = observed_at
 
     def _schedule_follower_state_refresh(self, dexes: list[str] | set[str], *, reason: str) -> None:
         normalized = {str(dex or "").lower() for dex in dexes}
         if not normalized:
             normalized = {dex.dex_name for dex in HyperliquidDexRegistry(self.settings).enabled_dexes()}
         self._follower_state_refresh_pending_dexes.update(normalized)
-        if self._follower_state_refresh_task is not None and not self._follower_state_refresh_task.done():
-            return
-        task = asyncio.create_task(self._follower_state_refresh_worker(reason=reason))
-        self._follower_state_refresh_task = task
+        for dex in normalized:
+            self._follower_state_refresh_reasons[dex] = reason
+            task = self._follower_state_refresh_tasks.get(dex)
+            if task is not None and not task.done():
+                continue
+            self._start_follower_state_refresh_task(dex)
+
+    def _follower_position_stream_is_trusted(self, dex: str) -> bool:
+        """Use the all-DEX state stream only while its liveness is proven.
+
+        The subscription delivers an authoritative initial snapshot and
+        causally ordered updates.  Follower fills are handled on the same
+        connection and still install their durable manual-position guard.
+        Disconnects clear this trust immediately; a quiet/stalled stream
+        expires quickly and falls back to the existing REST refresh path.
+        """
+
+        if (
+            not self.state.market_ws_connected
+            or not self.state.follower_all_dexs_clearinghouse_subscribed
+        ):
+            return False
+        observed_at = self._follower_position_stream_observed_at.get(
+            str(dex or "").lower()
+        )
+        if observed_at is None:
+            return False
+        return observed_at >= datetime.now(timezone.utc) - timedelta(
+            seconds=FOLLOWER_POSITION_STREAM_TRUST_SECONDS
+        )
+
+    def _start_follower_state_refresh_task(self, dex: str) -> None:
+        task = asyncio.create_task(self._follower_state_refresh_worker(dex=dex))
+        self._follower_state_refresh_tasks[dex] = task
         self._background_tasks.add(task)
         task.add_done_callback(self._background_task_done)
-        task.add_done_callback(self._follower_state_refresh_done)
+        task.add_done_callback(
+            lambda completed, dex=dex: self._follower_state_refresh_done(dex, completed)
+        )
 
-    def _follower_state_refresh_done(self, task: asyncio.Task) -> None:
-        if self._follower_state_refresh_task is task:
-            self._follower_state_refresh_task = None
+    def _follower_state_refresh_done(self, dex: str, task: asyncio.Task) -> None:
+        if self._follower_state_refresh_tasks.get(dex) is not task:
+            return
+        self._follower_state_refresh_tasks.pop(dex, None)
+        # A request can arrive after the worker observes an empty pending set
+        # but before its done callback runs.  Restart here so that narrow race
+        # cannot strand a manual-fill confirmation or a leader-fill prefetch.
+        if dex in self._follower_state_refresh_pending_dexes and not self._stopped.is_set():
+            self._start_follower_state_refresh_task(dex)
 
-    async def _follower_state_refresh_worker(self, *, reason: str) -> None:
-        while self._follower_state_refresh_pending_dexes:
-            dexes = sorted(self._follower_state_refresh_pending_dexes)
-            self._follower_state_refresh_pending_dexes.clear()
-            await self._refresh_follower_positions_for_dexes(dexes, source=reason)
+    async def _follower_state_refresh_worker(self, *, dex: str) -> None:
+        while dex in self._follower_state_refresh_pending_dexes:
+            # Coalesce every request that arrives during the REST cooldown into
+            # this single sleeping task.  Previously a sustained fill burst
+            # could repeatedly open/commit empty DB sessions while the actual
+            # request was rate-limited, an avoidable scheduler/SQL livelock.
+            retry_at = self._follower_rest_refresh_next_at.get(dex, 0.0)
+            delay = retry_at - asyncio.get_running_loop().time()
+            if delay > 0:
+                try:
+                    await asyncio.wait_for(self._stopped.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+                if self._stopped.is_set():
+                    return
+            self._follower_state_refresh_pending_dexes.discard(dex)
+            reason = self._follower_state_refresh_reasons.pop(dex, "FOLLOWER_STATE_REFRESH")
+            refreshed = await self._refresh_follower_positions_for_dexes([dex], source=reason)
+            if refreshed:
+                # A stale-position fill used to wait for the fixed durable retry
+                # deadline even when this refresh had already completed.  Move
+                # only those durable freshness retries back to "ready now" and
+                # wake the inbox.  The fill is still claimed through the normal
+                # market FIFO/exactly-once path; this only removes blind sleep.
+                await self._wake_stale_follower_position_retries(dex)
+
+    async def _wake_stale_follower_position_retries(self, dex: str) -> int:
+        now = datetime.now(timezone.utc)
+        async with self.db_session_factory() as db:
+            if not isinstance(db, AsyncSession):
+                return 0
+            result = await db.execute(
+                update(SourceFill)
+                .where(SourceFill.execution_account == self.execution_scope)
+                .where(SourceFill.processed_at.is_(None))
+                .where(SourceFill.is_snapshot.is_(False))
+                .where(SourceFill.dex == str(dex or "").lower())
+                .where(SourceFill.last_processing_error.ilike("%follower position state is stale%"))
+                .values(next_retry_at=now, updated_at=now)
+            )
+            await db.commit()
+        awakened = max(0, int(getattr(result, "rowcount", 0) or 0))
+        if awakened:
+            self._schedule_durable_replay_wakeup(0.0)
+        return awakened
+
+    async def _await_fresh_follower_state_for_retry(self, dex: str) -> bool:
+        """Wait for the already-prefetched DEX snapshot, then verify freshness.
+
+        This wait runs in the per-market fill worker, never in either websocket
+        receive loop.  Other markets and leader sockets therefore remain fully
+        concurrent.  A timeout leaves the fill in the durable inbox and uses the
+        existing bounded retry path.
+        """
+        dex_name = str(dex or "").lower()
+        self._schedule_follower_state_refresh(
+            {dex_name},
+            reason="STALE_FOLLOWER_POSITION_RETRY",
+        )
+        task = self._follower_state_refresh_tasks.get(dex_name)
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.75)
+            except asyncio.TimeoutError:
+                return False
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return False
+
+        follower = self.settings.hyperliquid_follower_account_address()
+        if not follower:
+            return False
+        async with self.db_session_factory() as db:
+            state = await db.scalar(
+                select(LatestAccountState)
+                .where(LatestAccountState.role == FOLLOWER)
+                .where(LatestAccountState.address == follower.lower())
+                .where(LatestAccountState.dex == dex_name)
+                .limit(1)
+            )
+        refreshed_at = _state_updated_at(state)
+        stale_seconds = max(
+            0.5,
+            float(getattr(self.settings, "account_state_stale_seconds", 2) or 2),
+        )
+        return bool(
+            refreshed_at is not None
+            and refreshed_at >= datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
+        )
 
     async def _reconcile_manual_position_guards(self, db: Any, *, dexes: set[str] | None = None) -> int:
+        persistent_by_scope: dict[tuple[str, str], FollowerMarketGuard] = {}
+        if isinstance(db, AsyncSession):
+            stmt = (
+                select(FollowerMarketGuard)
+                .where(FollowerMarketGuard.execution_account == self.execution_scope)
+                .where(FollowerMarketGuard.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                .where(FollowerMarketGuard.active.is_(True))
+            )
+            if dexes is not None:
+                stmt = stmt.where(
+                    FollowerMarketGuard.dex.in_({str(dex or "").lower() for dex in dexes})
+                )
+            persistent_rows = (await db.execute(stmt)).scalars().all()
+            for row in persistent_rows:
+                key = (str(row.dex or "").lower(), str(row.canonical_coin or "").upper())
+                persistent_by_scope[key] = row
+                parsed = parse_coin(key[1], default_dex=key[0])
+                self.manual_position_guard.mark(
+                    MarketKey(
+                        dex=key[0],
+                        coin=parsed.coin,
+                        canonical_coin=key[1],
+                        raw_coin=key[1],
+                        asset_id=None,
+                        venue_symbol=key[1],
+                    ),
+                    reason=row.reason or "durable unmatched follower fill guard",
+                    observed_at=row.observed_at,
+                    position_version=int(row.position_version or 0),
+                    expected_position_side=row.expected_position_side,
+                    expected_position_qty=row.expected_position_qty,
+                    expected_position_relation=row.expected_position_relation,
+                    position_change_confirmed_at=row.position_change_confirmed_at,
+                )
         entries = self.manual_position_guard.entries()
         if not entries:
             return 0
@@ -5013,7 +8931,26 @@ class HyperliquidLowLatencyWatcher:
                 canonical_coin=market.canonical_coin,
                 base_qtys=allocation_qty_by_side,
             )
+            allocation_mismatch = any(
+                abs(
+                    Decimal(follower_qty_by_side.get(side, 0))
+                    - Decimal(allocation_qty_by_side.get(side, 0))
+                )
+                > ALLOCATION_TRANSITION_TOLERANCE
+                for side in (PositionSide.LONG, PositionSide.SHORT)
+            )
             before = self.manual_position_guard.active_entry(market)
+            confirmation_before = before.position_change_confirmed_at if before is not None else None
+            confirmation_at = self.manual_position_guard.confirm_if_observed(
+                market,
+                follower_qty_by_side=follower_qty_by_side,
+                allocation_qty_by_side=allocation_qty_by_side,
+                follower_state_at=follower_state_at,
+            )
+            persistent = persistent_by_scope.get((entry.dex, entry.canonical_coin.upper()))
+            if persistent is not None and confirmation_before is None and confirmation_at is not None:
+                persistent.position_change_confirmed_at = confirmation_at
+                persistent.updated_at = datetime.now(timezone.utc)
             self.manual_position_guard.reconcile(
                 market,
                 unmanaged_qty_by_side=_unmanaged_follower_position_qtys(
@@ -5021,10 +8958,462 @@ class HyperliquidLowLatencyWatcher:
                     allocation_qty_by_side=allocation_qty_by_side,
                 ),
                 follower_state_at=follower_state_at,
+                allocation_mismatch=allocation_mismatch,
+                follower_qty_by_side=follower_qty_by_side,
+                allocation_qty_by_side=allocation_qty_by_side,
             )
             if before is not None and self.manual_position_guard.active_entry(market) is None:
+                if persistent is not None:
+                    persistent.active = False
+                    persistent.reconciled_at = datetime.now(timezone.utc)
+                    persistent.updated_at = persistent.reconciled_at
                 cleared += 1
         return cleared
+
+    async def _persist_fill_inbox(self, events: list[FillEvent]) -> None:
+        """Commit fills before they depend on an in-memory worker queue."""
+        if not events:
+            return
+        async with self.db_session_factory() as db:
+            await self._persist_fill_inbox_rows(db, events)
+            await db.commit()
+
+    def _schedule_unpersisted_fill_backfill(self, events: list[FillEvent]) -> None:
+        """Make a rolled-back live batch eligible for the one-second backfill loop."""
+        event_times = [int(event.time_ms) for event in events if int(event.time_ms or 0) > 0]
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        earliest_ms = min(event_times) if event_times else now_ms
+        start_time_ms = max(earliest_ms - LEADER_FILL_BACKFILL_OVERLAP_MS, 0)
+        if self._leader_fill_backfill_start_ms is None:
+            self._leader_fill_backfill_start_ms = start_time_ms
+        else:
+            self._leader_fill_backfill_start_ms = min(
+                self._leader_fill_backfill_start_ms,
+                start_time_ms,
+            )
+
+    async def _make_deferred_fill_batch_durable(self, events: list[FillEvent]) -> bool:
+        """Persist a rolled-back live batch or explicitly hand it to backfill.
+
+        A database outage must not terminate the per-market worker.  If even the
+        fallback inbox commit fails, the durable cursor is still unchanged; the
+        websocket backfill loop will therefore fetch the batch again.
+        """
+        if not events:
+            return True
+        try:
+            await self._persist_fill_inbox(events)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._schedule_unpersisted_fill_backfill(events)
+            self.state.last_error = redact_text(exc)[:200]
+            log.exception(
+                "low_latency_deferred_fill_persist_failed_backfill_scheduled",
+                source_fill_id=events[0].source_fill_id,
+                fill_count=len(events),
+                error=redact_text(exc),
+            )
+            return False
+        return True
+
+    async def _persist_fill_inbox_rows(self, db: Any, events: list[FillEvent]) -> None:
+        """Insert inbox/cursor rows into the caller's current transaction.
+
+        Live websocket fills use this inside the same transaction that creates
+        their logical order, source outcomes and allocation transition.  A
+        retryable planning failure rolls the transaction back and the worker
+        falls back to ``_persist_fill_inbox`` before scheduling durable replay.
+        """
+        if not events:
+            return
+        values = [
+            {
+                "source_fill_id": event.source_fill_id,
+                "execution_account": self.execution_scope,
+                "leader_address": event.leader_address,
+                "coin": event.market.coin,
+                "dex": event.market.dex,
+                "canonical_coin": event.market.canonical_coin,
+                "raw_coin": event.market.raw_coin,
+                "asset_id": event.market.asset_id,
+                "side": event.side,
+                "price": event.price,
+                "size": event.size,
+                "source_time_ms": event.time_ms,
+                "ws_received_at": event.ws_received_at,
+                "raw_fill": event.raw,
+                "is_snapshot": event.is_snapshot,
+                "processed_at": None,
+                "processing_attempts": 0,
+            }
+            for event in events
+        ]
+        if isinstance(db, AsyncSession):
+            # Serialize durable arrival assignment per follower market before
+            # inserting rows. This keeps the source-fill id sequence aligned
+            # with the later FIFO claim across concurrent leader streams.
+            market_lock_keys = sorted(
+                {_market_arrival_key(event.market, self.execution_scope) for event in events}
+            )
+            for market_lock_key in market_lock_keys:
+                await db.execute(
+                    text("SELECT pg_advisory_xact_lock(:market_key)"),
+                    {"market_key": market_lock_key},
+                )
+        await db.execute(
+            insert(SourceFill)
+            .values(values)
+            .on_conflict_do_nothing(index_elements=[SourceFill.source_fill_id])
+        )
+        cursor_candidates: dict[str, tuple[int, int | None]] = {}
+        for event in events:
+            if event.is_snapshot or event.time_ms <= 0:
+                continue
+            address = normalize_leader_address(event.leader_address)
+            candidate = (int(event.time_ms), _event_tid(event))
+            current = cursor_candidates.get(address)
+            if current is None or _fill_cursor_key(candidate) > _fill_cursor_key(current):
+                cursor_candidates[address] = candidate
+        for address, (time_ms, tid) in cursor_candidates.items():
+            cursor_insert = insert(LeaderFillCursor).values(
+                leader_address=address,
+                last_fill_time_ms=time_ms,
+                last_fill_tid=tid,
+                backfilled_through_ms=0,
+                updated_at=datetime.now(timezone.utc),
+            )
+            excluded = cursor_insert.excluded
+            await db.execute(
+                cursor_insert.on_conflict_do_update(
+                    index_elements=[LeaderFillCursor.leader_address],
+                    set_={
+                        "last_fill_tid": case(
+                            (
+                                excluded.last_fill_time_ms > LeaderFillCursor.last_fill_time_ms,
+                                excluded.last_fill_tid,
+                            ),
+                            (
+                                excluded.last_fill_time_ms == LeaderFillCursor.last_fill_time_ms,
+                                func.greatest(
+                                    func.coalesce(LeaderFillCursor.last_fill_tid, 0),
+                                    func.coalesce(excluded.last_fill_tid, 0),
+                                ),
+                            ),
+                            else_=LeaderFillCursor.last_fill_tid,
+                        ),
+                        "last_fill_time_ms": func.greatest(
+                            LeaderFillCursor.last_fill_time_ms,
+                            excluded.last_fill_time_ms,
+                        ),
+                        "updated_at": datetime.now(timezone.utc),
+                    },
+                )
+            )
+
+    async def _durable_replay_loop(self) -> None:
+        active_interval = max(
+            0.01,
+            float(getattr(self.settings, "durable_fill_replay_interval_seconds", 0.1) or 0.1),
+        )
+        idle_interval = max(
+            active_interval,
+            float(getattr(self.settings, "durable_fill_replay_idle_seconds", 1.0) or 1.0),
+        )
+        order_resume_interval = max(
+            active_interval,
+            float(getattr(self.settings, "durable_order_resume_scan_seconds", 1.0) or 1.0),
+        )
+        loop = asyncio.get_running_loop()
+        next_order_resume_at = 0.0
+        last_replay_scan_at = loop.time()
+        while not self._stopped.is_set():
+            replayed = 0
+            resumed = 0
+            try:
+                loop_time = loop.time()
+                hot_path_busy = self._hot_path_busy()
+                replay_scan_due = _durable_replay_should_scan(
+                    hot_path_busy=hot_path_busy,
+                    wakeup_requested=self._durable_replay_wakeup.is_set(),
+                    now=loop_time,
+                    last_scan_at=last_replay_scan_at,
+                )
+                if not replay_scan_due:
+                    self.state.background_cycles_deferred_for_hot_path += 1
+                else:
+                    replayed = await self._replay_unprocessed_fills_once()
+                    self.state.durable_replay_scan_count += 1
+                    last_replay_scan_at = loop.time()
+                    now = loop.time()
+                    if replayed or now >= next_order_resume_at:
+                        resumed = await self._resume_unstarted_orders_once()
+                        self.state.durable_order_resume_scan_count += 1
+                        next_order_resume_at = loop.time() + order_resume_interval
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.state.last_error = f"durable replay: {redact_text(exc)[:160]}"
+                log.exception("low_latency_durable_replay_failed", error=redact_text(exc))
+            now = loop.time()
+            wait_seconds = (
+                active_interval
+                if self._hot_path_busy()
+                else _durable_replay_wait_seconds(
+                    active_interval=active_interval,
+                    idle_interval=idle_interval,
+                    order_resume_interval=order_resume_interval,
+                    now=now,
+                    next_order_resume_at=next_order_resume_at,
+                    replayed=replayed,
+                    resumed=resumed,
+                )
+            )
+            if self._hot_path_busy() and not self._durable_replay_wakeup.is_set():
+                # A continuously busy live queue must not starve a durable
+                # inbox row.  Shorten the final hot-path sleep so the next
+                # scan happens at the deadline rather than one whole polling
+                # interval after it.
+                until_forced_scan = (
+                    DURABLE_REPLAY_MAX_HOT_PATH_DEFER_SECONDS
+                    - (now - last_replay_scan_at)
+                )
+                wait_seconds = min(wait_seconds, max(0.01, until_forced_scan))
+            if not replayed and not resumed and wait_seconds > active_interval:
+                self.state.durable_replay_idle_wait_count += 1
+            try:
+                await asyncio.wait_for(
+                    self._durable_replay_wakeup.wait(),
+                    timeout=wait_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
+            else:
+                # Clear immediately after consuming the wakeup. Any retry
+                # discovered by the following replay pass can then schedule a
+                # new precise deadline without spawning helper tasks per tick.
+                self._durable_replay_wakeup.clear()
+
+    def _hot_path_busy(self) -> bool:
+        """Return true while a live fill or exchange submit needs priority."""
+        return bool(self._queued_source_fill_ids or self._queued_submit_order_ids)
+
+    def _schedule_durable_replay_wakeup(self, delay_seconds: float) -> None:
+        """Wake the durable inbox at an exact retry deadline.
+
+        The periodic replay scan remains the crash-safe fallback. This timer
+        only removes up to one polling interval of avoidable latency from a
+        fill that is already durable and waiting on a transient condition.
+        """
+        loop = asyncio.get_running_loop()
+        delay = max(float(delay_seconds), 0.0)
+        wake_at = loop.time() + delay
+        if self._durable_replay_wakeup.is_set():
+            return
+        if (
+            self._durable_replay_wakeup_handle is not None
+            and not self._durable_replay_wakeup_handle.cancelled()
+            and self._durable_replay_wakeup_at is not None
+            and self._durable_replay_wakeup_at <= wake_at
+        ):
+            return
+        if self._durable_replay_wakeup_handle is not None:
+            self._durable_replay_wakeup_handle.cancel()
+
+        def wake() -> None:
+            self._durable_replay_wakeup_handle = None
+            self._durable_replay_wakeup_at = None
+            self._durable_replay_wakeup.set()
+
+        self._durable_replay_wakeup_at = wake_at
+        self._durable_replay_wakeup_handle = loop.call_later(delay, wake)
+
+    async def _replay_unprocessed_fills_once(self) -> int:
+        now = datetime.now(timezone.utc)
+        limit = max(1, int(getattr(self.settings, "durable_fill_replay_batch_size", 1000) or 1000))
+        async with self.db_session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(SourceFill)
+                    .where(SourceFill.execution_account == self.execution_scope)
+                    .where(SourceFill.processed_at.is_(None))
+                    .where(SourceFill.is_snapshot.is_(False))
+                    .where(or_(SourceFill.next_retry_at.is_(None), SourceFill.next_retry_at <= now))
+                    # Preserve the durable websocket-arrival sequence.  Source
+                    # timestamps can tie and separate leader streams can arrive
+                    # out of order; the insertion id is our total first-arrival
+                    # order and is also used by the market FIFO claim.
+                    .order_by(SourceFill.id)
+                    .limit(limit)
+                )
+            ).scalars().all()
+            if not rows:
+                return 0
+            addresses = sorted({normalize_leader_address(row.leader_address) for row in rows})
+            leaders = (
+                await db.execute(
+                    select(LeaderConfig).where(func.lower(LeaderConfig.leader_address).in_(addresses))
+                )
+            ).scalars().all()
+
+        leader_by_address = {
+            normalize_leader_address(item.leader_address): item
+            for item in leaders
+        }
+        missing_leader_events: list[FillEvent] = []
+        replay_items: list[tuple[FillEvent, LeaderConfig]] = []
+        for row in rows:
+            event = _fill_event_from_source_row(row)
+            address = normalize_leader_address(row.leader_address)
+            if address not in leader_by_address:
+                missing_leader_events.append(event)
+                continue
+            replay_items.append((event, leader_by_address[address]))
+        if missing_leader_events:
+            await self._record_fill_processing_failure(
+                missing_leader_events,
+                RuntimeError("leader configuration missing for durable fill replay"),
+            )
+        replayed = 0
+        # Do not regroup by leader here: regrouping A1, B1, A2 as A1, A2, B1
+        # would change first-arrival order for a shared market after restart.
+        for event, replay_leader in replay_items:
+            # The database query above is authoritative: this row is
+            # unprocessed and due now. Never let a stale in-memory
+            # completed/suppressed cache entry hide it. The queue membership
+            # set plus the durable claim still prevent concurrent duplicates.
+            await self._enqueue_fill_events(
+                [event],
+                replay_leader,
+                persist=False,
+                authoritative_replay=True,
+            )
+            replayed += 1
+        return replayed
+
+    async def _resume_unstarted_orders_once(self) -> int:
+        now = datetime.now(timezone.utc)
+        stale_after = max(
+            2.0,
+            float(getattr(self.settings, "order_recovery_stale_pending_submit_seconds", 10.0) or 10.0),
+        )
+        stale_before = now - timedelta(seconds=stale_after)
+        async with self.db_session_factory() as db:
+            await db.execute(
+                update(ExecutionOrder)
+                .where(ExecutionOrder.source_type == "AUTO_COPY")
+                .where(ExecutionOrder.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                .where(ExecutionOrder.venue_account == self.execution_scope)
+                .where(ExecutionOrder.status == "SUBMITTING")
+                .where(ExecutionOrder.order_submit_started_at.is_(None))
+                .where(ExecutionOrder.updated_at < stale_before)
+                .values(status="PENDING_SUBMIT", updated_at=now)
+            )
+            rows = (
+                await db.execute(
+                    select(ExecutionOrder)
+                    .where(ExecutionOrder.source_type == "AUTO_COPY")
+                    .where(ExecutionOrder.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                    .where(ExecutionOrder.venue_account == self.execution_scope)
+                    .where(ExecutionOrder.status == "PENDING_SUBMIT")
+                    .where(ExecutionOrder.order_submit_started_at.is_(None))
+                    .order_by(ExecutionOrder.created_at, ExecutionOrder.id)
+                    .limit(max(1, int(getattr(self.settings, "durable_fill_replay_batch_size", 1000) or 1000)))
+                )
+            ).scalars().all()
+            source_ids = [row.source_fill_id for row in rows if row.source_fill_id]
+            allocation_ids = [row.allocation_id for row in rows if row.allocation_id is not None]
+            source_rows = (
+                await db.execute(
+                    select(SourceFill)
+                    .where(SourceFill.execution_account == self.execution_scope)
+                    .where(SourceFill.source_fill_id.in_(source_ids))
+                )
+            ).scalars().all() if source_ids else []
+            allocations = (
+                await db.execute(
+                    select(LeaderPositionAllocationRecord).where(
+                        LeaderPositionAllocationRecord.id.in_(allocation_ids)
+                    ).where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
+                )
+            ).scalars().all() if allocation_ids else []
+            await db.commit()
+
+        source_by_id = {row.source_fill_id: row for row in source_rows}
+        allocation_by_id = {row.id: row for row in allocations}
+        resumed = 0
+        for order in rows:
+            source_row = source_by_id.get(order.source_fill_id)
+            allocation = allocation_by_id.get(order.allocation_id)
+            if source_row is None or allocation is None:
+                continue
+            self.engine.pending_intents.reserve(order, allocation)
+            if not self.engine.pending_intents.has_active_order(order):
+                continue
+            await self._enqueue_submit_order(order, _fill_event_from_source_row(source_row))
+            resumed += 1
+        return resumed
+
+    async def _record_fill_processing_failure(
+        self,
+        events: list[FillEvent],
+        exc: Exception,
+        *,
+        retry_delay_override_seconds: float | None = None,
+        follower_refresh_already_requested: bool = False,
+    ) -> None:
+        if _follower_position_freshness_retry(exc) and not follower_refresh_already_requested:
+            self._schedule_follower_state_refresh(
+                {event.market.dex for event in events},
+                reason="STALE_FOLLOWER_POSITION_RETRY",
+            )
+        source_fill_ids = _flatten_source_fill_ids(events)
+        if not source_fill_ids:
+            return
+        now = datetime.now(timezone.utc)
+        base = max(0.01, float(getattr(self.settings, "durable_fill_retry_base_seconds", 0.05) or 0.05))
+        cap = max(base, float(getattr(self.settings, "durable_fill_retry_max_seconds", 5.0) or 5.0))
+        earliest_retry_delay: float | None = None
+        async with self.db_session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(SourceFill.source_fill_id, SourceFill.processing_attempts)
+                    .where(SourceFill.execution_account == self.execution_scope)
+                    .where(SourceFill.source_fill_id.in_(source_fill_ids))
+                    .where(SourceFill.processed_at.is_(None))
+                )
+            ).all()
+            for source_fill_id, attempts in rows:
+                next_attempt = int(attempts or 0) + 1
+                delay = _durable_fill_retry_delay_seconds(
+                    exc,
+                    attempt=next_attempt,
+                    base=base,
+                    cap=cap,
+                )
+                if retry_delay_override_seconds is not None:
+                    delay = max(0.0, float(retry_delay_override_seconds))
+                earliest_retry_delay = (
+                    delay
+                    if earliest_retry_delay is None
+                    else min(earliest_retry_delay, delay)
+                )
+                await db.execute(
+                    update(SourceFill)
+                    .where(SourceFill.execution_account == self.execution_scope)
+                    .where(SourceFill.source_fill_id == source_fill_id)
+                    .where(SourceFill.processed_at.is_(None))
+                    .values(
+                        processing_attempts=next_attempt,
+                        last_attempt_at=now,
+                        next_retry_at=now + timedelta(seconds=delay),
+                        last_processing_error=redact_text(exc)[:2000],
+                        updated_at=now,
+                    )
+                )
+            await db.commit()
+        if earliest_retry_delay is not None:
+            self._schedule_durable_replay_wakeup(earliest_retry_delay)
 
     def _fill_queue_key(self, event: FillEvent, leader: LeaderConfig) -> tuple[str, str, str]:
         return (
@@ -5033,95 +9422,272 @@ class HyperliquidLowLatencyWatcher:
             event.market.canonical_coin.upper(),
         )
 
+    async def _acquire_fill_ingress_locks(
+        self,
+        events: list[FillEvent],
+        leader: LeaderConfig,
+    ) -> list[asyncio.Lock]:
+        keys = sorted({self._fill_queue_key(event, leader) for event in events})
+        async with self._fill_ingress_guard:
+            locks = [self._fill_ingress_locks.setdefault(key, asyncio.Lock()) for key in keys]
+        acquired: list[asyncio.Lock] = []
+        try:
+            for lock in locks:
+                await lock.acquire()
+                acquired.append(lock)
+            return acquired
+        except BaseException:
+            # Cancellation between the first and last acquisition used to leak
+            # the already-held prefix forever.  Sorted acquisition prevents
+            # cycles; this rollback makes partial acquisition cancellation-safe.
+            for lock in reversed(acquired):
+                lock.release()
+            raise
+
     async def _enqueue_fill_event(self, event: FillEvent, leader: LeaderConfig) -> None:
         await self._enqueue_fill_events([event], leader)
 
-    async def _enqueue_fill_events(self, events: list[FillEvent], leader: LeaderConfig) -> None:
+    async def _enqueue_fill_events(
+        self,
+        events: list[FillEvent],
+        leader: LeaderConfig,
+        *,
+        persist: bool = True,
+        ensure_persist_in_worker: bool = False,
+        authoritative_replay: bool = False,
+    ) -> None:
         if not events:
             return
-        grouped: OrderedDict[tuple[str, str, str], list[FillEvent]] = OrderedDict()
-        for event in events:
-            grouped.setdefault(self._fill_queue_key(event, leader), []).append(event)
-        async with self._fill_queue_guard:
-            for key, key_events in grouped.items():
-                queue = self._fill_queues.get(key)
-                if queue is None:
-                    queue = asyncio.Queue()
-                    self._fill_queues[key] = queue
-                for event in key_events:
-                    queue.put_nowait((event, leader))
-                worker = self._fill_workers.get(key)
-                if worker is None or worker.done():
-                    worker = asyncio.create_task(self._fill_worker(key, queue))
-                    self._fill_workers[key] = worker
+        ingress_locks = await self._acquire_fill_ingress_locks(events, leader)
+        queued_any = False
+        refresh_dexes: set[str] = set()
+        try:
+            # Both websocket handlers can pass the optimistic filter before
+            # either one acquires this market's ingress lock. Recheck here so a
+            # very fast winning channel cannot finish and leave the loser doing
+            # a redundant durable claim/database round trip.
+            if not events[0].is_snapshot:
+                if authoritative_replay:
+                    # PostgreSQL has proven these rows are unfinished. Erase
+                    # all contradictory memory-only hints before queueing; the
+                    # queue membership set and durable DB claims remain the
+                    # duplicate-prevention authorities.
+                    await self._forget_suppressed_events(events)
+                    await self._forget_completed_events(events)
+                else:
+                    events = await self._filter_suppressed_events(events)
+                    if not events:
+                        return
+            fill_engine = isinstance(self.engine, FillDrivenExecutionEngine)
+            if persist and fill_engine:
+                await self._persist_fill_inbox(events)
+            grouped: OrderedDict[tuple[str, str, str], list[FillEvent]] = OrderedDict()
+            for event in events:
+                grouped.setdefault(self._fill_queue_key(event, leader), []).append(event)
+            async with self._fill_queue_guard:
+                for key, key_events in grouped.items():
+                    queue = self._fill_queues.get(key)
+                    if queue is None:
+                        queue = asyncio.Queue()
+                        self._fill_queues[key] = queue
+                    for event in key_events:
+                        if event.source_fill_id in self._queued_source_fill_ids:
+                            continue
+                        self._queued_source_fill_ids.add(event.source_fill_id)
+                        if not event.is_snapshot:
+                            refresh_dexes.add(event.market.dex)
+                        queued_event = replace(
+                            event,
+                            queue_enqueued_at=datetime.now(timezone.utc),
+                        )
+                        queue.put_nowait(
+                            (
+                                queued_event,
+                                leader,
+                                bool(ensure_persist_in_worker and fill_engine),
+                            )
+                        )
+                        queued_any = True
+                    worker = self._fill_workers.get(key)
+                    if worker is None or worker.done():
+                        worker = asyncio.create_task(self._fill_worker(key, queue))
+                        self._fill_workers[key] = worker
+            if (persist or ensure_persist_in_worker) and fill_engine and refresh_dexes:
+                # Only the channel that actually queued a new fill starts the
+                # prefetch. The duplicate channel must not double REST traffic.
+                refresh_dexes = {
+                    dex
+                    for dex in refresh_dexes
+                    if not self._follower_position_stream_is_trusted(dex)
+                }
+                if refresh_dexes:
+                    self._schedule_follower_state_refresh(
+                        refresh_dexes,
+                        reason="LEADER_FILL_POSITION_PRECHECK",
+                    )
+        finally:
+            for lock in reversed(ingress_locks):
+                lock.release()
+        if queued_any:
+            # Give the market worker an immediate scheduling point instead of
+            # letting a burst of websocket callbacks monopolize the event loop.
+            await asyncio.sleep(0)
 
     async def _fill_worker(
         self,
         key: tuple[str, str, str],
-        queue: asyncio.Queue[tuple[FillEvent, LeaderConfig]],
+        queue: asyncio.Queue[tuple[FillEvent, LeaderConfig, bool]],
     ) -> None:
         while not self._stopped.is_set():
-            first_event, first_leader = await queue.get()
-            batch: list[tuple[FillEvent, LeaderConfig]] = [(first_event, first_leader)]
+            first_event, first_leader, first_needs_persist = await queue.get()
+            first_event = replace(
+                first_event,
+                fill_worker_started_at=datetime.now(timezone.utc),
+            )
+            batch: list[tuple[FillEvent, LeaderConfig, bool]] = [
+                (first_event, first_leader, first_needs_persist)
+            ]
             while True:
                 try:
-                    batch.append(queue.get_nowait())
+                    event, leader, needs_persist = queue.get_nowait()
+                    batch.append(
+                        (
+                            replace(
+                                event,
+                                fill_worker_started_at=datetime.now(timezone.utc),
+                            ),
+                            leader,
+                            needs_persist,
+                        )
+                    )
                 except asyncio.QueueEmpty:
                     break
-            events = [event for event, _leader in batch]
-            leader_by_source_fill_id = {event.source_fill_id: leader for event, leader in batch}
+            events = [event for event, _leader, _needs_persist in batch]
+            deferred_persist_events = [
+                event for event, _leader, needs_persist in batch if needs_persist
+            ]
+            leader_by_source_fill_id = {
+                event.source_fill_id: leader for event, leader, _needs_persist in batch
+            }
             skipped_events: list[FillEvent] = []
             try:
                 selected_events = events
                 if not first_event.is_snapshot:
-                    selected_events, skipped_events, has_order_keys = _aggregate_same_order_fills(events)
-                    if not has_order_keys:
-                        selected_events = events
-                        skipped_events = []
-                    elif skipped_events:
+                    selected_events, fragment_skipped, _has_order_keys = _aggregate_same_order_fills(events)
+                    selected_events, lifecycle_skipped = _coalesce_queued_lifecycle_fills(selected_events)
+                    skipped_events = [*fragment_skipped, *lifecycle_skipped]
+                    if skipped_events:
                         await self._remember_suppressed_events(skipped_events)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.state.last_error = str(exc)[:200]
+                durable = await self._make_deferred_fill_batch_durable(
+                    deferred_persist_events
+                )
+                self.state.last_error = redact_text(exc)[:200]
                 log.exception(
                     "low_latency_fill_worker_batch_prepare_failed",
                     queue_key=":".join(key),
                     dex=key[1],
                     canonical_coin=key[2],
                     source_fill_id=first_event.source_fill_id,
-                    error=str(exc),
+                    error=redact_text(exc),
                 )
+                if durable:
+                    await self._record_fill_processing_failure(events, exc)
             else:
                 selected_ok = True
-                for event in selected_events:
+                for selected_index, event in enumerate(selected_events):
                     leader = leader_by_source_fill_id.get(event.source_fill_id, first_leader)
                     try:
                         async with self.db_session_factory() as db:
+                            if selected_index == 0 and deferred_persist_events:
+                                # Common live path: one atomic commit contains
+                                # source fills, cursor, source outcomes, order plan
+                                # and allocation transition. This removes the
+                                # former inbox-commit round trip without weakening
+                                # crash recovery or exactly-once constraints.
+                                await self._persist_fill_inbox_rows(db, deferred_persist_events)
                             if isinstance(self.engine, FillDrivenExecutionEngine):
                                 order = await self.engine.handle_fill(db, event, leader, submit_order=False)
                             else:
                                 order = await self.engine.handle_fill(db, event, leader)
-                        if order is not None and order.status == "PENDING_SUBMIT" and order.id is not None:
-                            await self._enqueue_submit_order(order, event)
+                            if order is None and selected_index == 0 and deferred_persist_events:
+                                await db.commit()
+                            if order is not None and order.status == "PENDING_SUBMIT" and order.id is not None:
+                                # handle_fill has already committed the durable
+                                # fill outcome, cloid and order plan. Publish the
+                                # committed object before AsyncSession context
+                                # cleanup so the submit worker can start its CAS
+                                # and signed-envelope preparation immediately.
+                                # Detaching is synchronous and makes it safe to
+                                # attach to the submit worker's session without
+                                # an intervening full-row database read.  The
+                                # durable SUBMITTING marker CAS remains the sole
+                                # authority that permits an exchange send.
+                                if isinstance(db, AsyncSession):
+                                    db.expunge(order)
+                                await self._enqueue_submit_order(order, event)
+                        durable_order_confirmed = order is not None or not isinstance(
+                            self.engine,
+                            FillDrivenExecutionEngine,
+                        )
+                        if durable_order_confirmed and not event.is_snapshot:
+                            # The transaction above has committed (or found the
+                            # fill already committed with a durable logical
+                            # outcome). Suppress the losing WS delivery in
+                            # memory so it does not add a second database round
+                            # trip. An order=None result is not proof of a
+                            # durable outcome and must never hide an unprocessed
+                            # inbox row.
+                            await self._remember_completed_events([event])
+                        if selected_index == 0:
+                            deferred_persist_events = []
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
+                        if selected_index == 0 and deferred_persist_events:
+                            # The combined transaction rolled back. Commit the
+                            # raw source rows/cursor first so the normal durable
+                            # retry record below can never lose this fill.
+                            durable = await self._make_deferred_fill_batch_durable(
+                                deferred_persist_events
+                            )
+                            deferred_persist_events = []
+                            if not durable:
+                                selected_ok = False
+                                break
                         selected_ok = False
-                        self.state.last_error = str(exc)[:200]
-                        log.exception(
-                            "low_latency_fill_worker_failed",
-                            queue_key=":".join(key),
-                            leader_id=getattr(leader, "id", None),
-                            dex=key[1],
-                            canonical_coin=key[2],
-                            source_fill_id=event.source_fill_id,
-                            error=str(exc),
+                        follower_refresh_ready = False
+                        if _follower_position_freshness_retry(exc):
+                            follower_refresh_ready = await self._await_fresh_follower_state_for_retry(
+                                event.market.dex
+                            )
+                        if not _expected_fill_retry(exc):
+                            self.state.last_error = redact_text(exc)[:200]
+                            log.exception(
+                                "low_latency_fill_worker_failed",
+                                queue_key=":".join(key),
+                                leader_id=getattr(leader, "id", None),
+                                dex=key[1],
+                                canonical_coin=key[2],
+                                source_fill_id=event.source_fill_id,
+                                error=redact_text(exc),
+                            )
+                        await self._record_fill_processing_failure(
+                            [event],
+                            exc,
+                            retry_delay_override_seconds=0.0 if follower_refresh_ready else None,
+                            follower_refresh_already_requested=_follower_position_freshness_retry(exc),
                         )
+                    else:
+                        if _expected_fill_retry(self.state.last_error):
+                            self.state.last_error = None
                 if skipped_events and selected_ok:
                     await self._record_skipped_source_fills(skipped_events)
             finally:
-                for _event, _leader in batch:
+                for queued_event, _leader, _needs_persist in batch:
+                    self._queued_source_fill_ids.discard(queued_event.source_fill_id)
                     queue.task_done()
 
     def _submit_queue_key(
@@ -5142,7 +9708,12 @@ class HyperliquidLowLatencyWatcher:
             (_open_like_action(order.order_action) and not bool(order.reduce_only))
             or _reduce_like_action(order.order_action)
         ):
-            return f"{base}:serial"
+            parallelism = max(
+                1,
+                int(getattr(self.settings, "max_parallel_order_submits_per_market", 8) or 8),
+            )
+            shard = int(order.id or order_id or 0) % parallelism
+            return f"{base}:parallel:{shard}"
         unique = order_id if order is None else None
         return f"{base}:serial" if unique is None else f"{base}:fast:{unique}"
 
@@ -5155,7 +9726,29 @@ class HyperliquidLowLatencyWatcher:
         else:
             order_id = int(order_or_id)
         key = self._submit_queue_key(event, order=order, order_id=order_id)
+        published = False
         async with self._submit_queue_guard:
+            if order_id in self._queued_submit_order_ids:
+                return
+            retry_not_before = self._submit_retry_not_before.get(order_id)
+            loop_time = asyncio.get_running_loop().time()
+            if retry_not_before is not None and retry_not_before > loop_time:
+                self._schedule_durable_replay_wakeup(retry_not_before - loop_time)
+                return
+            self._submit_retry_not_before.pop(order_id, None)
+            if order is not None:
+                # Store only objects that are actually published.  A duplicate
+                # or deferred enqueue must not leave an unowned detached ORM
+                # object behind in the live handoff table.
+                self._committed_submit_orders.setdefault(order_id, order)
+                # handle_fill returns only after its exactly-once plan/outcome/
+                # allocation transaction commits. Preserve that handoff instant
+                # only for the item we actually publish, without another write.
+                self._submit_plan_committed_at.setdefault(
+                    order_id,
+                    datetime.now(timezone.utc),
+                )
+            self._queued_submit_order_ids.add(order_id)
             queue = self._submit_queues.get(key)
             if queue is None:
                 queue = asyncio.Queue()
@@ -5164,7 +9757,17 @@ class HyperliquidLowLatencyWatcher:
             if worker is None or worker.done():
                 worker = asyncio.create_task(self._submit_worker(key, queue))
                 self._submit_workers[key] = worker
-        queue.put_nowait((order_id, event))
+            # Publishing the item and selecting/starting its worker must be one
+            # atomic queue-lifecycle operation.  Otherwise an idle worker can
+            # time out, remove this queue after the producer releases the guard,
+            # and strand the newly published item until durable replay runs.
+            queue.put_nowait((order_id, event))
+            published = True
+        if published:
+            # Start the exchange-submit worker before the fill planner continues
+            # through another burst item. This bounds plan-commit -> worker-start
+            # scheduler lag without serializing on the exchange response.
+            await asyncio.sleep(0)
 
     async def _submit_worker(
         self,
@@ -5175,60 +9778,145 @@ class HyperliquidLowLatencyWatcher:
             try:
                 order_id, event = await asyncio.wait_for(queue.get(), timeout=10.0)
             except asyncio.TimeoutError:
-                if queue.empty():
-                    async with self._submit_queue_guard:
-                        if self._submit_queues.get(key) is queue:
-                            self._submit_queues.pop(key, None)
-                        if self._submit_workers.get(key) is asyncio.current_task():
-                            self._submit_workers.pop(key, None)
+                # Producers publish while holding this same guard.  Rechecking
+                # under the guard closes the idle-retirement race: either the
+                # item is already visible and this worker keeps running, or the
+                # queue is retired before a producer can select it.
+                async with self._submit_queue_guard:
+                    if not queue.empty():
+                        continue
+                    if self._submit_queues.get(key) is queue:
+                        self._submit_queues.pop(key, None)
+                    if self._submit_workers.get(key) is asyncio.current_task():
+                        self._submit_workers.pop(key, None)
                     return
-                continue
+            requeued = False
             try:
                 await self._process_submit_queue_item(order_id, event)
                 self._submit_retry_counts.pop(int(order_id), None)
+                self._submit_retry_not_before.pop(int(order_id), None)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                # The object used by the failed attempt belonged to the submit
+                # session that has just rolled back/closed.  Never carry that
+                # ORM state into another attempt: a safe retry must reload the
+                # authoritative durable row before it can reach the final CAS.
+                self._committed_submit_orders.pop(int(order_id), None)
                 retry_safe = False
                 if _is_transient_submit_exception(exc):
                     retry_safe = await self._prepare_submit_retry_if_safe(order_id)
                 retry_count = self._submit_retry_counts.get(int(order_id), 0)
-                if retry_safe and retry_count < 3:
-                    self._submit_retry_counts[int(order_id)] = retry_count + 1
-                    log.warning(
-                        "low_latency_submit_worker_retrying",
-                        dex=key,
-                        order_id=order_id,
-                        source_fill_id=event.source_fill_id,
-                        retry_count=retry_count + 1,
-                        error=str(exc)[:300],
-                    )
-                    queue.put_nowait((order_id, event))
+                if retry_safe:
+                    next_retry_count = retry_count + 1
+                    self._submit_retry_counts[int(order_id)] = next_retry_count
+                    if next_retry_count <= 3:
+                        log.warning(
+                            "low_latency_submit_worker_retrying",
+                            dex=key,
+                            order_id=order_id,
+                            source_fill_id=event.source_fill_id,
+                            retry_count=next_retry_count,
+                            error=redact_text(exc)[:300],
+                        )
+                        queue.put_nowait((order_id, event))
+                        requeued = True
+                    else:
+                        delay = _durable_submit_retry_delay_seconds(next_retry_count)
+                        self._submit_retry_not_before[int(order_id)] = (
+                            asyncio.get_running_loop().time() + delay
+                        )
+                        self._schedule_durable_replay_wakeup(delay)
+                        log.warning(
+                            "low_latency_submit_worker_retry_deferred",
+                            dex=key,
+                            order_id=order_id,
+                            source_fill_id=event.source_fill_id,
+                            retry_count=next_retry_count,
+                            retry_delay_seconds=delay,
+                            error=redact_text(exc)[:300],
+                        )
                 else:
                     self._submit_retry_counts.pop(int(order_id), None)
-                    self.state.last_error = str(exc)[:200]
+                    self._submit_retry_not_before.pop(int(order_id), None)
+                    self.state.last_error = redact_text(exc)[:200]
                     log.exception(
                         "low_latency_submit_worker_failed",
                         dex=key,
                         order_id=order_id,
                         source_fill_id=event.source_fill_id,
-                        error=str(exc),
+                        error=redact_text(exc),
                     )
             finally:
+                if not requeued:
+                    self._queued_submit_order_ids.discard(int(order_id))
+                    self._committed_submit_orders.pop(int(order_id), None)
+                    self._submit_plan_committed_at.pop(int(order_id), None)
                 queue.task_done()
 
     async def _process_submit_queue_item(self, order_id: int, event: FillEvent) -> None:
-        async with self.db_session_factory() as db:
-            order = await db.get(ExecutionOrder, order_id)
+        wake_market_waiters = False
+        submit_worker_started_at = datetime.now(timezone.utc)
+        order_plan_committed_at = self._submit_plan_committed_at.get(int(order_id))
+        # Barrier waiting can last until an earlier exchange response arrives. Do not
+        # pin a database transaction/connection during that network-dependent wait.
+        # The durable plan is mirrored in PendingIntentLedger, so the normal path
+        # does not need to open and discard a first session merely to read it.
+        barrier_wait_started_at, barrier_wait_done_at = await self._wait_for_submit_barrier(order_id)
+        submit_session_started_at = datetime.now(timezone.utc)
+        async with self.submit_db_session_factory() as db:
+            submit_db_connection_acquire_started_at = datetime.now(timezone.utc)
+            if isinstance(db, AsyncSession):
+                await db.connection()
+            submit_db_connection_acquired_at = datetime.now(timezone.utc)
+            submit_order_query_started_at = datetime.now(timezone.utc)
+            order = self._committed_submit_orders.get(int(order_id))
+            submit_order_source = "committed_memory_handoff"
+            if order is not None:
+                db.add(order)
+            else:
+                submit_order_source = "durable_database_reload"
+                order = await db.get(ExecutionOrder, order_id)
+            submit_order_query_done_at = datetime.now(timezone.utc)
             if order is None:
                 return
+            if str(order.venue_account or "").lower() != self.execution_scope:
+                raise RuntimeError("submit worker refused an order for another execution account")
+            submit_order_loaded_at = datetime.now(timezone.utc)
+            _trace_set(order, "submit_worker_started_at", submit_worker_started_at)
+            if order_plan_committed_at is not None:
+                _trace_set(order, "order_plan_committed_at", order_plan_committed_at)
+            _trace_set(order, "submit_session_started_at", submit_session_started_at)
+            _trace_set(
+                order,
+                "submit_db_connection_acquire_started_at",
+                submit_db_connection_acquire_started_at,
+            )
+            _trace_set(
+                order,
+                "submit_db_connection_acquired_at",
+                submit_db_connection_acquired_at,
+            )
+            _trace_set(order, "submit_order_query_started_at", submit_order_query_started_at)
+            _trace_set(order, "submit_order_query_done_at", submit_order_query_done_at)
+            _trace_set(order, "submit_order_loaded_at", submit_order_loaded_at)
+            _trace_set_detail(order, "submit_order_source", submit_order_source)
+            _trace_set_detail(
+                order,
+                "submit_database_pool",
+                "isolated_low_latency" if self._submit_database_pool_isolated else "shared_default",
+            )
+            if barrier_wait_started_at is not None:
+                _trace_set(order, "submit_barrier_wait_started_at", barrier_wait_started_at)
+                _trace_set(order, "submit_barrier_wait_done_at", barrier_wait_done_at)
+                _trace_set_detail(order, "submit_barrier_waited", True)
             status = str(order.status or "").upper()
             if status == "SUBMITTING":
                 return
             if status != "PENDING_SUBMIT":
                 self.engine.pending_intents.release(order)
                 return
-            if not self.engine.pending_intents.has_active_order(order):
+            if not self.engine.pending_intents.has_active_order_id(order_id):
                 order.status = "BLOCKED"
                 order.dry_run = True
                 order.error_message = "pending intent missing before submit; blocked to prevent duplicate order"
@@ -5248,14 +9936,43 @@ class HyperliquidLowLatencyWatcher:
                 )
                 await db.commit()
                 return
-            await self._wait_for_submit_barrier(order)
             await self.engine.submit_planned_order(db, order, event)
+            self._record_submit_latency_sample(order)
+            wake_market_waiters = bool(
+                _reduce_like_action(order.order_action)
+                and str(order.status or "").upper() not in RECOVERY_ORDER_STATUSES
+            )
+        if wake_market_waiters:
+            # A close/reduce finalization may have changed the allocation to
+            # CLOSED. Wake durable ownership waiters immediately instead of
+            # making the next leader wait for the periodic replay tick.
+            await self._replay_unprocessed_fills_once()
+
+    def _record_submit_latency_sample(self, order: ExecutionOrder) -> None:
+        metrics = (order.latency_trace or {}).get("metrics") or {}
+        actual_send_ms = _int_or_none(metrics.get("ws_to_actual_send_ms"))
+        marker_ms = _int_or_none(order.ws_to_submit_ms)
+        if actual_send_ms is None and marker_ms is None:
+            return
+        self._recent_submit_latency_samples.append(
+            {
+                "order_id": int(order.id) if order.id is not None else None,
+                "canonical_coin": order.canonical_coin,
+                "order_action": order.order_action,
+                "ws_to_submit_ms": marker_ms,
+                "ws_to_actual_send_ms": actual_send_ms,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        del self._recent_submit_latency_samples[:-100]
 
     async def _prepare_submit_retry_if_safe(self, order_id: int) -> bool:
         try:
             async with self.db_session_factory() as db:
                 order = await db.get(ExecutionOrder, order_id)
                 if order is None:
+                    return False
+                if str(order.venue_account or "").lower() != self.execution_scope:
                     return False
                 status = str(order.status or "").upper()
                 if status == "PENDING_SUBMIT":
@@ -5278,34 +9995,46 @@ class HyperliquidLowLatencyWatcher:
                 await db.commit()
                 return True
         except Exception as exc:
-            self.state.last_error = str(exc)[:200]
+            self.state.last_error = redact_text(exc)[:200]
             log.warning(
                 "low_latency_submit_worker_retry_prepare_failed",
                 order_id=order_id,
-                error=str(exc),
+                error=redact_text(exc),
             )
             return False
 
-    async def _wait_for_submit_barrier(self, order: ExecutionOrder) -> None:
+    async def _wait_for_submit_barrier(
+        self,
+        order: ExecutionOrder | int,
+    ) -> tuple[datetime | None, datetime | None]:
         wait_started_at: datetime | None = None
         logged = False
+        last_durable_reconcile_at = 0.0
         while True:
-            barriers = self.engine.pending_intents.submit_barriers_before(order)
+            barriers = (
+                self.engine.pending_intents.submit_barriers_before_order_id(order)
+                if isinstance(order, int)
+                else self.engine.pending_intents.submit_barriers_before(order)
+            )
             if not barriers:
                 if wait_started_at is not None:
-                    _trace_set(order, "submit_barrier_wait_done_at", datetime.now(timezone.utc))
-                    _trace_set_detail(order, "submit_barrier_waited", True)
-                return
+                    wait_done_at = datetime.now(timezone.utc)
+                    if not isinstance(order, int):
+                        _trace_set(order, "submit_barrier_wait_done_at", wait_done_at)
+                        _trace_set_detail(order, "submit_barrier_waited", True)
+                    return wait_started_at, wait_done_at
+                return None, None
             if wait_started_at is None:
                 wait_started_at = datetime.now(timezone.utc)
-                _trace_set(order, "submit_barrier_wait_started_at", wait_started_at)
+                if not isinstance(order, int):
+                    _trace_set(order, "submit_barrier_wait_started_at", wait_started_at)
             waited_ms = _delta_ms(wait_started_at, datetime.now(timezone.utc)) or 0
             if not logged and waited_ms >= 100:
                 logged = True
                 log.warning(
                     "low_latency_submit_barrier_waiting",
-                    order_id=order.id,
-                    source_fill_id=order.source_fill_id,
+                    order_id=order if isinstance(order, int) else order.id,
+                    source_fill_id=None if isinstance(order, int) else order.source_fill_id,
                     waited_ms=waited_ms,
                     blockers=[
                         {
@@ -5317,7 +10046,54 @@ class HyperliquidLowLatencyWatcher:
                         for intent in barriers[:5]
                     ],
                 )
-            await asyncio.sleep(0.005)
+            loop_time = asyncio.get_running_loop().time()
+            reconcile_interval = _submit_barrier_reconcile_interval_seconds(waited_ms)
+            if (
+                waited_ms >= 100
+                and loop_time - last_durable_reconcile_at >= reconcile_interval
+            ):
+                # A completed prior order should release its in-memory intent in
+                # the normal path.  Reconcile against the durable order state as
+                # a self-healing fallback so a lost callback cannot leave the
+                # next order behind an immortal memory-only barrier.
+                await self._release_resolved_submit_barriers(barriers)
+                last_durable_reconcile_at = loop_time
+                continue
+            await asyncio.sleep(_submit_barrier_poll_delay_seconds(waited_ms))
+
+    async def _release_resolved_submit_barriers(
+        self,
+        barriers: list[PendingIntent],
+    ) -> int:
+        order_ids = sorted(
+            {
+                int(intent.order_id)
+                for intent in barriers
+                if intent.order_id is not None
+            }
+        )
+        if not order_ids:
+            return 0
+        async with self.db_session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(ExecutionOrder.id, ExecutionOrder.status).where(
+                        ExecutionOrder.id.in_(order_ids)
+                    )
+                )
+            ).all()
+        active_ids = {
+            int(order_id)
+            for order_id, status in rows
+            if str(status or "").upper() in RECOVERY_ORDER_STATUSES
+        }
+        released = 0
+        for order_id in order_ids:
+            if order_id in active_ids:
+                continue
+            self.engine.pending_intents.release_order_id(order_id)
+            released += 1
+        return released
 
     async def _drain_fill_queues(self) -> None:
         queues = list(self._fill_queues.values())
@@ -5348,6 +10124,10 @@ class HyperliquidLowLatencyWatcher:
             worker.cancel()
         if workers:
             await asyncio.gather(*workers, return_exceptions=True)
+        # Orders left in queues were never handed to a submit session.  Their
+        # plans remain durable and will be recovered from PostgreSQL on the
+        # next run, so retaining detached objects here can only be stale/leaky.
+        self._committed_submit_orders.clear()
 
     async def _cancel_background_tasks(self) -> None:
         tasks = list(self._background_tasks)
@@ -5366,7 +10146,24 @@ class HyperliquidLowLatencyWatcher:
                 event
                 for event in events
                 if event.source_fill_id not in self._suppressed_source_fill_ids
+                and event.source_fill_id not in self._recently_completed_source_fill_ids
             ]
+
+    async def _remember_completed_events(self, events: list[FillEvent]) -> None:
+        source_fill_ids = _flatten_source_fill_ids(events)
+        if not source_fill_ids:
+            return
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(seconds=60)
+        async with self._suppressed_source_fill_guard:
+            self._prune_suppressed_source_fill_ids(now)
+            for source_fill_id in source_fill_ids:
+                self._recently_completed_source_fill_ids[source_fill_id] = expires_at
+                self._recently_completed_source_fill_ids.move_to_end(source_fill_id)
+            while len(self._recently_completed_source_fill_ids) > RECENT_COMPLETED_SOURCE_FILL_MAX:
+                # Eviction only drops the memory fast path. The durable unique
+                # claim remains authoritative, so this cannot permit a repeat.
+                self._recently_completed_source_fill_ids.popitem(last=False)
 
     async def _remember_suppressed_events(self, events: list[FillEvent]) -> None:
         if not events:
@@ -5377,6 +10174,7 @@ class HyperliquidLowLatencyWatcher:
             self._prune_suppressed_source_fill_ids(now)
             for event in events:
                 self._suppressed_source_fill_ids[event.source_fill_id] = expires_at
+                self._suppressed_source_fill_ids.move_to_end(event.source_fill_id)
 
     async def _forget_suppressed_events(self, events: list[FillEvent]) -> None:
         if not events:
@@ -5385,14 +10183,25 @@ class HyperliquidLowLatencyWatcher:
             for event in events:
                 self._suppressed_source_fill_ids.pop(event.source_fill_id, None)
 
+    async def _forget_completed_events(self, events: list[FillEvent]) -> None:
+        """Remove memory-only completion hints for proven missing outcomes."""
+        source_fill_ids = _flatten_source_fill_ids(events)
+        if not source_fill_ids:
+            return
+        async with self._suppressed_source_fill_guard:
+            for source_fill_id in source_fill_ids:
+                self._recently_completed_source_fill_ids.pop(source_fill_id, None)
+
     def _prune_suppressed_source_fill_ids(self, now: datetime) -> None:
-        expired = [
-            source_fill_id
-            for source_fill_id, expires_at in self._suppressed_source_fill_ids.items()
-            if expires_at <= now
-        ]
-        for source_fill_id in expired:
-            self._suppressed_source_fill_ids.pop(source_fill_id, None)
+        for cache in (
+            self._suppressed_source_fill_ids,
+            self._recently_completed_source_fill_ids,
+        ):
+            while cache:
+                _source_fill_id, expires_at = next(iter(cache.items()))
+                if expires_at > now:
+                    break
+                cache.popitem(last=False)
 
     def _schedule_background_task(self, coro: Any) -> None:
         task = asyncio.create_task(coro)
@@ -5406,29 +10215,79 @@ class HyperliquidLowLatencyWatcher:
         except asyncio.CancelledError:
             return
         if exc is not None:
-            self.state.last_error = str(exc)[:200]
-            log.warning("low_latency_background_task_failed", error=str(exc))
+            self.state.last_error = redact_text(exc)[:200]
+            log.warning("low_latency_background_task_failed", error=redact_text(exc))
 
     async def _record_skipped_source_fills(self, events: list[FillEvent]) -> None:
         if not events:
             return
         recorded = False
+        missing_outcome_events: list[FillEvent] = []
         try:
             async with self.db_session_factory() as db:
+                outcome_source_fill_ids: set[str] | None = None
+                if isinstance(db, AsyncSession) and isinstance(self.engine, FillDrivenExecutionEngine):
+                    non_snapshot_ids = [
+                        event.source_fill_id for event in events if not event.is_snapshot
+                    ]
+                    outcome_source_fill_ids = set(
+                        (
+                            await db.execute(
+                                select(SourceFillOutcome.source_fill_id).where(
+                                    SourceFillOutcome.source_fill_id.in_(non_snapshot_ids)
+                                )
+                            )
+                        ).scalars().all()
+                    ) if non_snapshot_ids else set()
                 for event in events:
-                    await self.engine._record_source_fill(db, event, processed=not event.is_snapshot)
+                    processed = not event.is_snapshot
+                    if outcome_source_fill_ids is not None and processed:
+                        processed = event.source_fill_id in outcome_source_fill_ids
+                        if not processed:
+                            missing_outcome_events.append(event)
+                    await self.engine._record_source_fill(db, event, processed=processed)
+                if missing_outcome_events:
+                    missing_ids = [event.source_fill_id for event in missing_outcome_events]
+                    await db.execute(
+                        update(SourceFill)
+                        .where(SourceFill.execution_account == self.execution_scope)
+                        .where(SourceFill.source_fill_id.in_(missing_ids))
+                        .where(
+                            ~select(SourceFillOutcome.id)
+                            .where(SourceFillOutcome.source_fill_id == SourceFill.source_fill_id)
+                            .exists()
+                        )
+                        .values(
+                            processed_at=None,
+                            next_retry_at=None,
+                            last_processing_error=None,
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
                 await db.commit()
             recorded = True
         except Exception as exc:
-            self.state.last_error = str(exc)[:200]
+            self.state.last_error = redact_text(exc)[:200]
             log.warning(
                 "low_latency_skipped_source_fill_record_failed",
-                error=str(exc),
+                error=redact_text(exc),
                 source_fill_ids=[event.source_fill_id for event in events[:10]],
                 count=len(events),
             )
         if recorded:
             await self._forget_suppressed_events(events)
+        if missing_outcome_events:
+            # A durable row without an outcome is unfinished by definition.
+            # Clear every memory-only completion hint before scheduling replay;
+            # otherwise the former 60-second cache TTL can turn a safe replay
+            # into a severe execution delay.
+            await self._forget_completed_events(missing_outcome_events)
+            await self._record_fill_processing_failure(
+                missing_outcome_events,
+                RetryableFillProcessingError(
+                    "coalesced source fill has no durable outcome; returned to replay"
+                ),
+            )
 
     async def _record_parse_error(self, leader_address: str, fill: dict[str, Any], message: str) -> None:
         async with self.db_session_factory() as db:
@@ -5438,19 +10297,29 @@ class HyperliquidLowLatencyWatcher:
                     event_type="FILL_PARSE_FAILED",
                     symbol=str(fill.get("coin") or ""),
                     leader_address=leader_address,
-                    message=message,
+                    message=redact_text(message),
                     metadata_json={"fill": {k: str(v) for k, v in fill.items() if k in {"coin", "hash", "tid", "oid", "time"}}},
                 )
             )
             await db.commit()
 
     async def _status_loop(self) -> None:
+        interval = max(
+            0.5,
+            float(getattr(self.settings, "watcher_status_refresh_seconds", 2.0) or 2.0),
+        )
         while not self._stopped.is_set():
+            if self._hot_path_busy():
+                self.state.background_cycles_deferred_for_hot_path += 1
+                await asyncio.sleep(0.05)
+                continue
+            started = asyncio.get_running_loop().time()
             try:
                 await self.store_status()
             except Exception as exc:
-                self.state.last_error = str(exc)[:200]
-            await asyncio.sleep(1)
+                self.state.last_error = redact_text(exc)[:200]
+            elapsed = asyncio.get_running_loop().time() - started
+            await asyncio.sleep(max(0.05, interval - elapsed))
 
     async def _account_value_readiness(
         self,
@@ -5459,6 +10328,7 @@ class HyperliquidLowLatencyWatcher:
         dexes: list[str],
         active_leaders: list[str],
     ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
         follower = self.settings.hyperliquid_follower_account_address()
         requests: list[tuple[str, str]] = []
         if follower:
@@ -5520,15 +10390,26 @@ class HyperliquidLowLatencyWatcher:
                 continue
             for dex in dexes:
                 label = dex or "default"
-                resolved = resolved_value_payload(payload, dex)
+                resolved = _resolved_account_value_payload(payload, dex)
                 ok, reason = _account_value_payload_ready(resolved, role=role)
+                stale = _account_value_payload_is_stale(
+                    resolved,
+                    max_age_seconds=float(
+                        getattr(self.settings, "account_value_max_stale_seconds", 30.0) or 30.0
+                    ),
+                    now=now,
+                )
                 details[scope][label] = {
                     "ready": ok,
+                    "stale": stale,
                     "source": (resolved or {}).get("account_value_source") or (resolved or {}).get("source"),
                     "mode": (resolved or {}).get("account_abstraction_mode") or (resolved or {}).get("mode"),
                     "account_value": (resolved or {}).get("account_value_used_for_sizing")
                     or (resolved or {}).get("accountValueUsedForSizing"),
                     "reason": reason,
+                    "warning": "account value snapshot is stale; using last known good value"
+                    if ok and stale
+                    else None,
                 }
                 if not ok:
                     blockers.append(f"{scope} {label}: {reason}")
@@ -5541,20 +10422,61 @@ class HyperliquidLowLatencyWatcher:
         now = datetime.now(timezone.utc)
         last_age = int((now - self.state.last_ws_event_at).total_seconds() * 1000) if self.state.last_ws_event_at else None
         async with self.db_session_factory() as db:
-            allocation_dexes = {
-                str(row or "").lower()
-                for row in (
-                    await db.execute(
-                        select(LeaderPositionAllocationRecord.dex)
-                        .join(LeaderConfig, LeaderConfig.id == LeaderPositionAllocationRecord.leader_id)
-                        .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
-                        .where(LeaderPositionAllocationRecord.status != "CLOSED")
-                        .where(LeaderConfig.enabled.is_(True))
-                        .where(LeaderConfig.deleted_at.is_(None))
-                        .distinct()
+            # Health/status snapshots are reconstructable and must never force
+            # an fsync ahead of a durable order-plan or submit-marker commit.
+            # Trading transactions retain PostgreSQL synchronous_commit=on.
+            if isinstance(db, AsyncSession):
+                await db.execute(text("SET LOCAL synchronous_commit = OFF"))
+            allocation_market_rows = (
+                await db.execute(
+                    select(
+                        LeaderPositionAllocationRecord.dex,
+                        LeaderPositionAllocationRecord.canonical_coin,
+                        LeaderPositionAllocationRecord.hyperliquid_coin,
                     )
-                ).scalars().all()
+                    .join(LeaderConfig, LeaderConfig.id == LeaderPositionAllocationRecord.leader_id)
+                    .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                    .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
+                    .where(LeaderPositionAllocationRecord.status != "CLOSED")
+                    .where(LeaderConfig.enabled.is_(True))
+                    .where(LeaderConfig.deleted_at.is_(None))
+                    .distinct()
+                )
+            ).all()
+            allocation_dexes = {
+                str(dex or "").lower()
+                for dex, _canonical, _coin in allocation_market_rows
             }
+            status_price_markets = {
+                str(canonical or canonical_coin(dex=str(dex or ""), coin=str(coin or "")))
+                for dex, canonical, coin in allocation_market_rows
+                if canonical or coin
+            }
+            active_position_markets = (
+                await db.execute(
+                    select(
+                        LatestAccountPosition.dex,
+                        LatestAccountPosition.canonical_coin,
+                        LatestAccountPosition.coin,
+                    )
+                    .join(
+                        LatestAccountState,
+                        LatestAccountState.id == LatestAccountPosition.account_state_id,
+                    )
+                    .where(LatestAccountState.role == FOLLOWER)
+                    .where(
+                        LatestAccountState.address
+                        == str(self.settings.hyperliquid_follower_account_address() or "").lower()
+                    )
+                    .where(LatestAccountPosition.active.is_(True))
+                    .distinct()
+                )
+            ).all()
+            status_price_markets.update(
+                str(canonical or canonical_coin(dex=str(dex or ""), coin=str(coin or "")))
+                for dex, canonical, coin in active_position_markets
+                if canonical or coin
+            )
             required_price_dexes = _required_price_status_dexes(
                 enabled_dexes=dexes,
                 event_dexes=set(self.state.last_event_time_by_dex),
@@ -5567,6 +10489,150 @@ class HyperliquidLowLatencyWatcher:
             )
             account_value_status = await self._account_value_readiness(db, dexes=dexes, active_leaders=active)
             follower_position_freshness = await self._active_follower_position_freshness(db, now=now)
+            pending_fill_count = int(
+                await db.scalar(
+                    select(func.count(SourceFill.id))
+                    .where(SourceFill.execution_account == self.execution_scope)
+                    .where(SourceFill.processed_at.is_(None))
+                    .where(SourceFill.is_snapshot.is_(False))
+                )
+                or 0
+            )
+            if pending_fill_count:
+                # Status polling is an independent liveness watchdog. If a
+                # wakeup was ever lost, observing durable unfinished work
+                # immediately wakes the replay loop instead of merely
+                # reporting the problem after the stuck threshold.
+                self._schedule_durable_replay_wakeup(0.0)
+            oldest_pending_fill_at = await db.scalar(
+                select(func.min(SourceFill.created_at))
+                .where(SourceFill.execution_account == self.execution_scope)
+                .where(SourceFill.processed_at.is_(None))
+                .where(SourceFill.is_snapshot.is_(False))
+            )
+            retrying_fill_count = int(
+                await db.scalar(
+                    select(func.count(SourceFill.id))
+                    .where(SourceFill.execution_account == self.execution_scope)
+                    .where(SourceFill.processed_at.is_(None))
+                    .where(SourceFill.is_snapshot.is_(False))
+                    .where(SourceFill.processing_attempts > 0)
+                )
+                or 0
+            )
+            pending_submit_count = int(
+                await db.scalar(
+                    select(func.count(ExecutionOrder.id))
+                    .where(ExecutionOrder.source_type == "AUTO_COPY")
+                    .where(ExecutionOrder.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                    .where(ExecutionOrder.venue_account == self.execution_scope)
+                    .where(ExecutionOrder.status == "PENDING_SUBMIT")
+                )
+                or 0
+            )
+            submitting_count = int(
+                await db.scalar(
+                    select(func.count(ExecutionOrder.id))
+                    .where(ExecutionOrder.source_type == "AUTO_COPY")
+                    .where(ExecutionOrder.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                    .where(ExecutionOrder.venue_account == self.execution_scope)
+                    .where(ExecutionOrder.status == "SUBMITTING")
+                )
+                or 0
+            )
+            unknown_submit_count = int(
+                await db.scalar(
+                    select(func.count(ExecutionOrder.id))
+                    .where(ExecutionOrder.source_type == "AUTO_COPY")
+                    .where(ExecutionOrder.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                    .where(ExecutionOrder.venue_account == self.execution_scope)
+                    .where(ExecutionOrder.status == "UNKNOWN")
+                )
+                or 0
+            )
+            oldest_unresolved_order_at = await db.scalar(
+                select(func.min(ExecutionOrder.created_at))
+                .where(ExecutionOrder.source_type == "AUTO_COPY")
+                .where(ExecutionOrder.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                .where(ExecutionOrder.venue_account == self.execution_scope)
+                .where(
+                    ExecutionOrder.status.in_(["PENDING_SUBMIT", "SUBMITTING", "UNKNOWN"])
+                )
+            )
+            processed_without_outcome_count = int(
+                await db.scalar(
+                    select(func.count(SourceFill.id))
+                    .where(SourceFill.execution_account == self.execution_scope)
+                    .where(SourceFill.processed_at.is_not(None))
+                    .where(SourceFill.is_snapshot.is_(False))
+                    .where(
+                        ~select(SourceFillOutcome.id)
+                        .where(SourceFillOutcome.source_fill_id == SourceFill.source_fill_id)
+                        .exists()
+                    )
+                )
+                or 0
+            )
+            unresolved_outcome_count = int(
+                await db.scalar(
+                    _unresolved_source_fill_outcomes_query(self.execution_scope)
+                )
+                or 0
+            )
+            stuck_threshold_ms = int(
+                max(
+                    1.0,
+                    float(
+                        getattr(self.settings, "durable_pipeline_stuck_seconds", 10.0)
+                        or 10.0
+                    ),
+                )
+                * 1000
+            )
+            oldest_pending_fill_age_ms = _delta_ms(oldest_pending_fill_at, now)
+            oldest_unresolved_order_age_ms = _delta_ms(oldest_unresolved_order_at, now)
+            durable_inbox_stuck = bool(
+                pending_fill_count > 0
+                and oldest_pending_fill_age_ms is not None
+                and oldest_pending_fill_age_ms >= stuck_threshold_ms
+            )
+            unresolved_order_count = pending_submit_count + submitting_count + unknown_submit_count
+            durable_outbox_stuck = bool(
+                unresolved_order_count > 0
+                and oldest_unresolved_order_age_ms is not None
+                and oldest_unresolved_order_age_ms >= stuck_threshold_ms
+            )
+            liveness_ready = not durable_inbox_stuck and not durable_outbox_stuck
+            stuck_parts: list[str] = []
+            if durable_inbox_stuck:
+                stuck_parts.append(
+                    f"durable inbox has {pending_fill_count} pending fill(s), oldest "
+                    f"{oldest_pending_fill_age_ms}ms"
+                )
+            if durable_outbox_stuck:
+                stuck_parts.append(
+                    f"durable outbox has {unresolved_order_count} unresolved order(s), oldest "
+                    f"{oldest_unresolved_order_age_ms}ms"
+                )
+            liveness_signature = "; ".join(stuck_parts) or None
+            if liveness_signature != self._liveness_stuck_signature:
+                if liveness_signature:
+                    log.error(
+                        "durable_pipeline_liveness_stuck",
+                        reason=liveness_signature,
+                        threshold_ms=stuck_threshold_ms,
+                    )
+                    self.state.last_error = f"DURABLE_PIPELINE_STUCK: {liveness_signature}"
+                else:
+                    if str(self.state.last_error or "").startswith("DURABLE_PIPELINE_STUCK:"):
+                        self.state.last_error = None
+                    if self._liveness_stuck_signature:
+                        log.info("durable_pipeline_liveness_recovered")
+                self._liveness_stuck_signature = liveness_signature
+            if liveness_signature:
+                # Other background diagnostics must not make a stuck durable
+                # pipeline disappear from the primary health/error field.
+                self.state.last_error = f"DURABLE_PIPELINE_STUCK: {liveness_signature}"
             ready = (
                 self.state.websocket_connected
                 and bool(active)
@@ -5575,9 +10641,17 @@ class HyperliquidLowLatencyWatcher:
                 and price_fresh
                 and bool(account_value_status.get("ready"))
                 and bool(follower_position_freshness.get("ready"))
+                and processed_without_outcome_count == 0
+                and liveness_ready
             )
             self.state.low_latency_ready = ready
+            recent_submit_latency = _recent_submit_latency_summary(
+                self._recent_submit_latency_samples,
+                threshold_ms=PER_FILL_INTERNAL_LATENCY_WARN_MS,
+            )
             payload = {
+                "execution_account": self.settings.hyperliquid_follower_account_address(),
+                "execution_scope": self.execution_scope,
                 "mode": "websocket" if self.state.websocket_connected else "disconnected",
                 "low_latency_watcher_running": True,
                 "low_latency_primary": self.state.low_latency_primary,
@@ -5590,6 +10664,16 @@ class HyperliquidLowLatencyWatcher:
                 "account_value_ready": bool(account_value_status.get("ready")),
                 "account_value_blockers": account_value_status.get("blockers") or [],
                 "account_value_readiness": account_value_status.get("details") or {},
+                "account_value_refresh_count": self.state.account_value_refresh_count,
+                "account_value_last_refresh_at": (
+                    self.state.account_value_last_refresh_at.isoformat()
+                    if self.state.account_value_last_refresh_at
+                    else None
+                ),
+                "account_value_last_refresh_duration_ms": (
+                    self.state.account_value_last_refresh_duration_ms
+                ),
+                "account_value_refresh_last_error": self.state.account_value_refresh_last_error,
                 "follower_position_fresh": bool(follower_position_freshness.get("ready")),
                 "follower_position_freshness": follower_position_freshness,
                 "poll_fallback_count": len(self.state.poll_fallback_leaders),
@@ -5606,27 +10690,84 @@ class HyperliquidLowLatencyWatcher:
                 "allocation_sync_count": self.state.allocation_sync_count,
                 "allocation_sync_skipped_count": self.state.allocation_sync_skipped_count,
                 "allocation_sync_last_error": self.state.allocation_sync_last_error,
+                "event_loop_lag_ms": self.state.event_loop_lag_ms,
+                "max_event_loop_lag_ms": self.state.max_event_loop_lag_ms,
+                "durable_replay_scan_count": self.state.durable_replay_scan_count,
+                "durable_order_resume_scan_count": self.state.durable_order_resume_scan_count,
+                "durable_replay_idle_wait_count": self.state.durable_replay_idle_wait_count,
+                "background_cycles_deferred_for_hot_path": self.state.background_cycles_deferred_for_hot_path,
                 "manual_position_guards": self.manual_position_guard.snapshot(),
                 "follower_order_updates_subscribed": self.state.follower_order_updates_subscribed,
                 "follower_user_events_subscribed": self.state.follower_user_events_subscribed,
                 "follower_user_fills_subscribed": self.state.follower_user_fills_subscribed,
                 "follower_clearinghouse_subscribed": self.state.follower_clearinghouse_subscribed,
+                "follower_all_dexs_clearinghouse_subscribed": (
+                    self.state.follower_all_dexs_clearinghouse_subscribed
+                ),
+                "follower_position_stream_trusted_dexes": sorted(
+                    dex
+                    for dex in dexes
+                    if self._follower_position_stream_is_trusted(dex)
+                ),
+                "follower_position_stream_age_ms_by_dex": {
+                    dex: max(
+                        0,
+                        int(
+                            (
+                                now
+                                - self._follower_position_stream_observed_at[dex]
+                            ).total_seconds()
+                            * 1000
+                        ),
+                    )
+                    for dex in dexes
+                    if dex in self._follower_position_stream_observed_at
+                },
                 "leader_user_fills_subscribed_count": self.state.leader_user_fills_subscribed_count,
                 "dex_price_cache_status": price_status,
                 "price_cache_required_dexes": required_price_dexes,
                 "price_cache_all_dexes_fresh": all(item["fresh"] for item in price_status.values()) if price_status else False,
-                "price_cache": self.price_cache.snapshot(dexes),
+                # The dashboard only consumes prices for currently displayed
+                # positions. Persisting every known market (~1,100 rows) once a
+                # second produced a 228KB update and avoidable WAL/fsync load.
+                "price_cache": self.price_cache.snapshot(
+                    dexes,
+                    canonical_coins=status_price_markets,
+                ),
                 "default_dex_price_cache_fresh": price_status.get("", {}).get("fresh", False),
                 "xyz_price_cache_fresh": price_status.get("xyz", {}).get("fresh", False),
                 "last_ws_event_at": self.state.last_ws_event_at.isoformat() if self.state.last_ws_event_at else None,
                 "last_ws_event_age_ms": last_age,
                 "reconnect_count": self.state.reconnect_count,
-                "last_error": self.state.last_error,
+                "durable_inbox_pending_count": pending_fill_count,
+                "durable_inbox_retrying_count": retrying_fill_count,
+                "durable_inbox_oldest_age_ms": oldest_pending_fill_age_ms,
+                "durable_inbox_stuck": durable_inbox_stuck,
+                "durable_outbox_pending_submit_count": pending_submit_count,
+                "durable_outbox_submitting_count": submitting_count,
+                "durable_outbox_unknown_count": unknown_submit_count,
+                "durable_outbox_oldest_age_ms": oldest_unresolved_order_age_ms,
+                "durable_outbox_stuck": durable_outbox_stuck,
+                "durable_pipeline_stuck_threshold_ms": stuck_threshold_ms,
+                "durable_pipeline_liveness_ready": liveness_ready,
+                "outcome_integrity_ready": processed_without_outcome_count == 0 and liveness_ready,
+                "processed_without_outcome_count": processed_without_outcome_count,
+                "unresolved_fill_outcome_count": unresolved_outcome_count,
+                "writer_lease_acquired": self._writer_lease_connection is not None,
+                "submit_database_pool_isolated": self._submit_database_pool_isolated,
+                "in_memory_fill_queue_count": len(self._queued_source_fill_ids),
+                "in_memory_submit_queue_count": len(self._queued_submit_order_ids),
+                "recent_submit_latency": recent_submit_latency,
+                "last_error": redact_text(self.state.last_error) if self.state.last_error else None,
                 "updated_at": now.isoformat(),
             }
             stmt = (
                 insert(AppSetting)
-                .values(key="watcher_status", value=payload, updated_at=now)
+                .values(
+                    key=self.settings.low_latency_watcher_status_key(),
+                    value=payload,
+                    updated_at=now,
+                )
                 .on_conflict_do_update(
                     index_elements=[AppSetting.key],
                     set_={"value": payload, "updated_at": now},
@@ -5635,18 +10776,44 @@ class HyperliquidLowLatencyWatcher:
             await db.execute(stmt)
             await store_task_status(
                 db,
-                task_name="low_latency_watcher",
-                last_error=self.state.last_error,
+                task_name="low_latency_watcher"
+                if not self.execution_scope
+                else f"low_latency_watcher:{self.execution_scope}",
+                last_error=redact_text(self.state.last_error) if self.state.last_error else None,
                 metadata={
                     "websocket_connected": self.state.websocket_connected,
                     "ready_for_low_latency_live": ready,
                     "active_leaders": active,
+                    "durable_inbox_pending_count": pending_fill_count,
+                    "durable_inbox_retrying_count": retrying_fill_count,
+                    "durable_inbox_oldest_age_ms": oldest_pending_fill_age_ms,
+                    "durable_inbox_stuck": durable_inbox_stuck,
+                    "durable_outbox_pending_submit_count": pending_submit_count,
+                    "durable_outbox_submitting_count": submitting_count,
+                    "durable_outbox_unknown_count": unknown_submit_count,
+                    "durable_outbox_oldest_age_ms": oldest_unresolved_order_age_ms,
+                    "durable_outbox_stuck": durable_outbox_stuck,
+                    "durable_pipeline_liveness_ready": liveness_ready,
+                    "processed_without_outcome_count": processed_without_outcome_count,
+                    "unresolved_fill_outcome_count": unresolved_outcome_count,
+                    "writer_lease_acquired": self._writer_lease_connection is not None,
+                    "event_loop_lag_ms": self.state.event_loop_lag_ms,
+                    "max_event_loop_lag_ms": self.state.max_event_loop_lag_ms,
+                    "durable_replay_scan_count": self.state.durable_replay_scan_count,
+                    "durable_order_resume_scan_count": self.state.durable_order_resume_scan_count,
+                    "durable_replay_idle_wait_count": self.state.durable_replay_idle_wait_count,
+                    "background_cycles_deferred_for_hot_path": self.state.background_cycles_deferred_for_hot_path,
+                    "recent_submit_latency": recent_submit_latency,
                 },
             )
             await store_task_status(
                 db,
                 task_name="price_cache_updater",
-                last_error=self.state.last_error if not price_fresh else None,
+                last_error=(
+                    redact_text(self.state.last_error)
+                    if not price_fresh and self.state.last_error
+                    else None
+                ),
                 metadata={"dex_price_cache_status": price_status},
             )
             await db.commit()
@@ -5676,7 +10843,11 @@ class HyperliquidLowLatencyWatcher:
             async with self.db_session_factory() as db:
                 stmt = (
                     insert(AppSetting)
-                    .values(key="watcher_status", value=payload, updated_at=now)
+                    .values(
+                        key=self.settings.low_latency_watcher_status_key(),
+                        value=payload,
+                        updated_at=now,
+                    )
                     .on_conflict_do_update(
                         index_elements=[AppSetting.key],
                         set_={"value": payload, "updated_at": now},
@@ -5685,7 +10856,44 @@ class HyperliquidLowLatencyWatcher:
                 await db.execute(stmt)
                 await db.commit()
         except Exception as exc:
-            log.warning("starting_status_store_failed", error=str(exc)[:160])
+            safe_error = redact_text(exc)
+            log.warning("starting_status_store_failed", error=safe_error[:160])
+
+    async def _store_standby_status(self) -> None:
+        now = datetime.now(timezone.utc)
+        payload = {
+            "mode": "standby",
+            "low_latency_watcher_running": True,
+            "low_latency_ready": False,
+            "ready_for_low_latency_live": False,
+            "writer_lease_acquired": False,
+            "updated_at": now.isoformat(),
+        }
+        async with self.db_session_factory() as db:
+            standby_key = (
+                f"watcher_standby_status:{self.execution_scope}"
+                if self.execution_scope
+                else "watcher_standby_status"
+            )
+            await db.execute(
+                insert(AppSetting)
+                .values(key=standby_key, value=payload, updated_at=now)
+                .on_conflict_do_update(
+                    index_elements=[AppSetting.key],
+                    set_={"value": payload, "updated_at": now},
+                )
+            )
+            await store_task_status(
+                db,
+                task_name=(
+                    f"low_latency_watcher_standby:{self.execution_scope}"
+                    if self.execution_scope
+                    else "low_latency_watcher_standby"
+                ),
+                status="standby_writer_lease",
+                metadata={"writer_lease_acquired": False},
+            )
+            await db.commit()
 
     async def _active_follower_position_freshness(self, db: Any, *, now: datetime) -> dict[str, Any]:
         follower = normalize_leader_address(self.settings.hyperliquid_follower_account_address() or "")
@@ -5701,6 +10909,7 @@ class HyperliquidLowLatencyWatcher:
                 )
                 .join(LeaderConfig, LeaderConfig.id == LeaderPositionAllocationRecord.leader_id)
                 .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+                .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
                 .where(LeaderPositionAllocationRecord.status != "CLOSED")
                 .where(LeaderPositionAllocationRecord.allocated_qty > Decimal("0"))
                 .where(LeaderConfig.enabled.is_(True))
@@ -5747,18 +10956,38 @@ class HyperliquidLowLatencyWatcher:
         threshold_ms = int(max(0.5, stale_seconds) * 1000)
         missing = sorted(f"{dex}:{coin}:{side}" for dex, coin, side in allocation_keys if positions_by_key.get((dex, coin, side)) is None)
         max_age_ms = 0
+        stale: list[str] = []
+        stream_trusted_dexes: set[str] = set()
         for key in allocation_keys:
             updated_at = positions_by_key.get(key)
             if updated_at is None:
                 continue
-            max_age_ms = max(max_age_ms, int((now - updated_at).total_seconds() * 1000))
-        ready = not missing and max_age_ms <= threshold_ms
+            age_ms = max(0, int((now - updated_at).total_seconds() * 1000))
+            max_age_ms = max(max_age_ms, age_ms)
+            dex, coin, side = key
+            stream_trusted = self._follower_position_stream_is_trusted(dex)
+            if stream_trusted:
+                stream_trusted_dexes.add(dex)
+            # Use the exact same policy as the execution engine. Keeping the
+            # readiness gate and the hot path on this shared function prevents
+            # one from accepting a live stream while the other still applies
+            # the legacy wall-clock-only rule.
+            if not _follower_position_state_is_fresh(
+                state_at=updated_at,
+                now=now,
+                stale_seconds=stale_seconds,
+                stream_trusted=stream_trusted,
+            ):
+                stale.append(f"{dex}:{coin}:{side}")
+        ready = not missing and not stale
         return {
             "ready": ready,
             "active_allocation_count": len(allocation_keys),
             "max_age_ms": max_age_ms,
             "threshold_ms": threshold_ms,
             "missing": missing,
+            "stale": sorted(stale),
+            "stream_trusted_dexes": sorted(stream_trusted_dexes),
         }
 
 
@@ -6078,7 +11307,7 @@ def _aggregate_order_segment(events: list[FillEvent], indexes: list[int]) -> tup
     raw[_COALESCED_FILL_NOTIONAL_KEY] = _decimal_string(total_notional)
     raw[_COALESCED_FILL_SIZE_KEY] = _decimal_string(total_size)
     raw[_COALESCED_FILL_COUNT_KEY] = len(segment)
-    raw[_COALESCED_SOURCE_IDS_KEY] = [event.source_fill_id for event in segment]
+    raw[_COALESCED_SOURCE_IDS_KEY] = _flatten_source_fill_ids(segment)
 
     return representative_idx, replace(
         representative,
@@ -6258,8 +11487,35 @@ def _with_coalesced_fill_segment(event: FillEvent, segment: list[FillEvent]) -> 
     raw[_COALESCED_FILL_NOTIONAL_KEY] = str(coalesced_notional)
     raw[_COALESCED_FILL_SIZE_KEY] = str(coalesced_size)
     raw[_COALESCED_FILL_COUNT_KEY] = len(segment)
-    raw[_COALESCED_SOURCE_IDS_KEY] = [item.source_fill_id for item in segment]
+    raw[_COALESCED_SOURCE_IDS_KEY] = _flatten_source_fill_ids(segment)
     return replace(event, raw=raw)
+
+
+def _coalesced_source_fill_ids(fill: FillEvent) -> list[str]:
+    raw_ids = (fill.raw or {}).get(_COALESCED_SOURCE_IDS_KEY)
+    values = list(raw_ids) if isinstance(raw_ids, list) else []
+    values.insert(0, fill.source_fill_id)
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        source_fill_id = str(value or "").strip()
+        if not source_fill_id or source_fill_id in seen:
+            continue
+        seen.add(source_fill_id)
+        result.append(source_fill_id)
+    return result
+
+
+def _flatten_source_fill_ids(events: list[FillEvent]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for event in events:
+        for source_fill_id in _coalesced_source_fill_ids(event):
+            if source_fill_id in seen:
+                continue
+            seen.add(source_fill_id)
+            result.append(source_fill_id)
+    return result
 
 
 def _fill_notional_for_sizing(fill: FillEvent) -> Decimal:
@@ -6275,6 +11531,7 @@ def build_fill_event(
     *,
     is_snapshot: bool,
     ws_received_at: datetime | None = None,
+    ingress_channel: str | None = None,
 ) -> FillEvent:
     parse_started_at = datetime.now(timezone.utc)
     ws_received_at = ws_received_at or parse_started_at
@@ -6293,17 +11550,91 @@ def build_fill_event(
         ws_received_at=ws_received_at,
         parse_started_at=parse_started_at,
         parse_done_at=parse_done_at,
+        ingress_channel=ingress_channel,
     )
 
 
-def unresolved_same_market_order_query(*, leader_address: str, dex: str, canonical_coin: str):
+def _fill_event_from_source_row(row: SourceFill) -> FillEvent:
+    event = build_fill_event(
+        row.leader_address,
+        dict(row.raw_fill or {}),
+        is_snapshot=bool(row.is_snapshot),
+        ws_received_at=row.ws_received_at or row.created_at or datetime.now(timezone.utc),
+        ingress_channel="durable_replay",
+    )
+    if event.source_fill_id == row.source_fill_id:
+        return event
+    return replace(event, source_fill_id=row.source_fill_id)
+
+
+def unresolved_same_market_order_query(
+    *,
+    leader_address: str,
+    dex: str,
+    canonical_coin: str,
+    execution_scope: str = "",
+):
     return (
         select(ExecutionOrder)
         .where(ExecutionOrder.source_type == "AUTO_COPY")
         .where(ExecutionOrder.status.in_(RECOVERY_ORDER_STATUSES))
+        .where(ExecutionOrder.venue_account == str(execution_scope or "").lower())
         .where(ExecutionOrder.leader_address == leader_address.lower())
         .where(ExecutionOrder.dex == str(dex or "").lower())
         .where(func.upper(ExecutionOrder.canonical_coin) == str(canonical_coin).upper())
+    )
+
+
+def _ambiguous_signer_order_query(*, signer_scope: str, current_order_id: int):
+    return (
+        select(ExecutionOrder.id)
+        .where(ExecutionOrder.source_type == "AUTO_COPY")
+        .where(ExecutionOrder.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+        .where(ExecutionOrder.id != int(current_order_id))
+        .where(ExecutionOrder.status == "UNKNOWN")
+        .where(ExecutionOrder.order_submit_started_at.is_not(None))
+        .where(
+            or_(
+                ExecutionOrder.submit_signer_scope == str(signer_scope),
+                ExecutionOrder.submit_signer_scope.is_(None),
+            )
+        )
+        .order_by(ExecutionOrder.order_submit_started_at.asc(), ExecutionOrder.id.asc())
+        .limit(1)
+    )
+
+
+def _earlier_unprocessed_market_fill_query(
+    market: MarketKey,
+    *,
+    current_id: int,
+    execution_scope: str = "",
+):
+    return (
+        select(SourceFill.id)
+        .where(SourceFill.id < int(current_id))
+        .where(SourceFill.is_snapshot.is_(False))
+        .where(SourceFill.processed_at.is_(None))
+        .where(SourceFill.execution_account == str(execution_scope or "").lower())
+        .where(SourceFill.dex == str(market.dex or "").lower())
+        .where(func.upper(SourceFill.canonical_coin) == market.canonical_coin.upper())
+        .order_by(SourceFill.id.asc())
+        .limit(1)
+    )
+
+
+def _unresolved_source_fill_outcomes_query(execution_scope: str):
+    """Keep main/sub-account outcome diagnostics completely independent."""
+
+    return (
+        select(func.count(SourceFillOutcome.id))
+        .join(SourceFill, SourceFill.source_fill_id == SourceFillOutcome.source_fill_id)
+        .where(SourceFill.execution_account == str(execution_scope or "").lower())
+        .where(
+            SourceFillOutcome.disposition.in_(
+                [FILL_OUTCOME_SUBMISSION_UNKNOWN, FILL_OUTCOME_MANUAL_REVIEW]
+            )
+        )
     )
 
 
@@ -6334,6 +11665,40 @@ def _required_price_status_dexes(
     required.update(str(dex or "").lower() for dex in event_dexes)
     required.update(str(dex or "").lower() for dex in allocation_dexes)
     return sorted(dex for dex in required if dex in enabled)
+
+
+def _price_fallback_dexes(
+    *,
+    enabled_dexes: list[str],
+    active_allocation_dexes: set[str],
+    last_event_time_by_dex: dict[str, str | None],
+    now: datetime,
+    recent_event_seconds: float = PRICE_FALLBACK_RECENT_EVENT_SECONDS,
+) -> set[str]:
+    """Limit REST mids traffic without weakening first-fill execution.
+
+    Every enabled DEX remains websocket-subscribed.  REST is only a liveness
+    fallback for currently relevant DEXes; a genuinely new fill carries its own
+    authoritative positive execution reference price and immediately makes its
+    DEX recent for subsequent fills.
+    """
+
+    cutoff = now - timedelta(seconds=max(1.0, float(recent_event_seconds)))
+    recent_event_dexes = {
+        str(dex or "").lower()
+        for dex, raw_observed_at in last_event_time_by_dex.items()
+        if (observed_at := _datetime_or_none(raw_observed_at)) is not None
+        and observed_at >= cutoff
+    }
+    return set(
+        _required_price_status_dexes(
+            enabled_dexes=enabled_dexes,
+            event_dexes=recent_event_dexes,
+            allocation_dexes={
+                str(dex or "").lower() for dex in active_allocation_dexes
+            },
+        )
+    )
 
 
 def _price_status_ready_for_low_latency_live(
@@ -6386,6 +11751,30 @@ def _clearinghouse_state_payload_from_ws(data: dict[str, Any]) -> dict[str, Any]
     if any(key in data for key in ("marginSummary", "assetPositions", "withdrawable")):
         return data
     return None
+
+
+def _all_dexs_clearinghouse_states(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Normalize the documented map and the live API's pair-list encoding."""
+
+    raw_states = data.get("clearinghouseStates")
+    if raw_states is None:
+        raw_states = data.get("clearinghouse_states")
+    result: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_states, dict):
+        items = raw_states.items()
+    elif isinstance(raw_states, list):
+        items = (
+            (item[0], item[1])
+            for item in raw_states
+            if isinstance(item, (list, tuple)) and len(item) == 2
+        )
+    else:
+        return result
+    for raw_dex, payload in items:
+        if not isinstance(payload, dict):
+            continue
+        result[str(raw_dex or "").lower()] = payload
+    return result
 
 
 def _dex_from_ws_account_state(data: dict[str, Any]) -> str:
@@ -6469,6 +11858,8 @@ def _is_definitely_not_submitted_hyperliquid_error(exc: Exception) -> bool:
 
 
 def _is_transient_submit_exception(exc: Exception) -> bool:
+    if isinstance(exc, RetryablePreExchangeSubmitError):
+        return True
     text = f"{type(exc).__name__}: {exc}".lower()
     transient_fragments = (
         "deadlock detected",
@@ -6477,6 +11868,8 @@ def _is_transient_submit_exception(exc: Exception) -> bool:
         "serializationfailure",
         "lock timeout",
         "pendingrollbackerror",
+        "infailedsqltransactionerror",
+        "current transaction is aborted",
         "connection reset",
         "connection refused",
         "server closed the connection",
@@ -6533,6 +11926,70 @@ def _order_quantity_for_transition(
     if reduce_only and aggregate_follower_qty is not None:
         quantity = min(quantity, aggregate_follower_qty)
     return quantity
+
+
+def _close_instead_of_leaving_untradeable_residual(
+    *,
+    transition_plan: Any | None,
+    current_allocation: LeaderPositionAllocationRecord | None,
+    min_order_value: Decimal,
+) -> tuple[Any | None, bool]:
+    """Turn a proportional reduce into a full close when its target is untradeable.
+
+    Hyperliquid applies its minimum notional to reduce-only orders too.  Leaving
+    a sub-minimum target therefore creates a follower position that a later
+    close or flip cannot remove.  The formula is still evaluated first and is
+    retained in ``formula_inputs``; only the untradeable residual is skipped.
+    """
+    if transition_plan is None or current_allocation is None:
+        return transition_plan, False
+    action = getattr(transition_plan, "action", None)
+    action_value = action.value if hasattr(action, "value") else str(action or "").upper()
+    if action_value != AllocationTransitionAction.REDUCE.value:
+        return transition_plan, False
+
+    target = abs(Decimal(getattr(transition_plan, "target_notional", 0) or 0))
+    minimum = abs(Decimal(min_order_value or 0))
+    allocation_qty = abs(Decimal(current_allocation.allocated_qty or 0))
+    current_notional = abs(
+        Decimal(
+            getattr(transition_plan, "current_allocation_notional", None)
+            or current_allocation.allocated_notional
+            or 0
+        )
+    )
+    if (
+        minimum <= ALLOCATION_TRANSITION_TOLERANCE
+        or target <= ALLOCATION_TRANSITION_TOLERANCE
+        or target >= minimum
+        or allocation_qty <= ALLOCATION_TRANSITION_TOLERANCE
+        or current_notional <= ALLOCATION_TRANSITION_TOLERANCE
+    ):
+        return transition_plan, False
+
+    formula_inputs = dict(getattr(transition_plan, "formula_inputs", None) or {})
+    formula_inputs["formula_target_notional_before_minimum_residual_close"] = str(target)
+    formula_inputs["minimum_tradeable_notional"] = str(minimum)
+    formula_inputs["minimum_residual_early_close"] = True
+    formula_inputs["execution_target_notional"] = "0"
+    formula_inputs["execution_formula"] = (
+        "when the proportional follower remainder is below the venue minimum, "
+        "close the full follower allocation so no untradeable residual survives"
+    )
+    return (
+        replace(
+            transition_plan,
+            target_notional=Decimal("0"),
+            delta_notional=-current_notional,
+            close_qty_limit=allocation_qty,
+            reason=(
+                "leader proportional reduce target is below the venue minimum; "
+                "close follower allocation instead of creating an untradeable residual"
+            ),
+            formula_inputs=formula_inputs,
+        ),
+        True,
+    )
 
 
 def _reduce_quantity_guard_blockers(
@@ -6626,46 +12083,7 @@ def _override_final_close_min_order_validator(
     transition_plan: Any | None,
     validator_result: ValidatedOrderParams,
 ) -> tuple[ValidatedOrderParams, bool]:
-    if not _is_final_close_min_order_only_block(
-        reduce_only=reduce_only,
-        transition_plan=transition_plan,
-        validator_result=validator_result,
-    ):
-        return validator_result, False
-    warnings = list(validator_result.warnings or [])
-    warnings.append(
-        "final close below Hyperliquid minimum order value; attempting reduce-only close so copied allocation can flatten"
-    )
-    return (
-        replace(
-            validator_result,
-            errors=[],
-            warnings=warnings,
-            block_reason=None,
-        ),
-        True,
-    )
-
-
-def _is_final_close_min_order_only_block(
-    *,
-    reduce_only: bool,
-    transition_plan: Any | None,
-    validator_result: ValidatedOrderParams,
-) -> bool:
-    if not reduce_only or transition_plan is None:
-        return False
-    action = getattr(transition_plan, "action", None)
-    action_value = action.value if hasattr(action, "value") else str(action or "").upper()
-    if action_value not in {
-        AllocationTransitionAction.CLOSE.value,
-        AllocationTransitionAction.FLIP_CLOSE_FIRST.value,
-    }:
-        return False
-    errors = {str(item).upper() for item in (validator_result.errors or [])}
-    if errors != {"BELOW_MIN_ORDER_VALUE"}:
-        return False
-    return validator_result.rounded_size > 0 and validator_result.rounded_price > 0
+    return validator_result, False
 
 
 def _is_pending_open_block(
@@ -6773,6 +12191,40 @@ def _preserve_allocation_state_after_direction_guard(
     source_fill_id: str,
     now: datetime,
 ) -> None:
+    allocation.target_notional = Decimal(allocation.allocated_notional or 0)
+    allocation.last_leader_account_value = leader_account_value
+    allocation.last_leader_position_notional = leader_position_notional
+    allocation.last_leader_position_size = leader_position_size
+    allocation.copy_multiplier = copy_multiplier
+    allocation.last_source_fill_id = source_fill_id
+    allocation.last_reconcile_at = now
+    if _allocation_needs_manual_review(allocation):
+        allocation.status = "NEEDS_MANUAL_REVIEW"
+        return
+    if _decimal_from_value(allocation.pending_reduce_qty) and _decimal_from_value(allocation.pending_reduce_qty) > 0:
+        allocation.status = "REDUCING"
+    elif str(allocation.status or "").upper() == "BLOCKED":
+        allocation.status = "OPEN"
+
+
+def _preserve_allocation_state_after_position_cap_rejection(
+    allocation: LeaderPositionAllocationRecord,
+    *,
+    leader_account_value: Decimal | None,
+    leader_position_notional: Decimal | None,
+    leader_position_size: Decimal | None,
+    copy_multiplier: Decimal,
+    source_fill_id: str,
+    now: datetime,
+) -> None:
+    """Advance the leader checkpoint without pretending the rejected add filled.
+
+    The follower allocation remains exactly where it was, while the leader's
+    post-fill position becomes the baseline for the next proportional reduce.
+    This prevents a cap rejection from being retried implicitly or from making
+    a later reduce use stale leader state.
+    """
+
     allocation.target_notional = Decimal(allocation.allocated_notional or 0)
     allocation.last_leader_account_value = leader_account_value
     allocation.last_leader_position_notional = leader_position_notional
@@ -6966,6 +12418,33 @@ def _mark_deferred_reduce(
     allocation.pending_reduce_source_fill_id = order.source_fill_id
 
 
+def _mark_minimum_residual_release_pending(
+    allocation: LeaderPositionAllocationRecord,
+    *,
+    order: ExecutionOrder,
+    quantity: Decimal,
+    now: datetime,
+) -> None:
+    """Persist that a full economic close will release market ownership."""
+    allocation_qty = abs(Decimal(allocation.allocated_qty or 0))
+    pending_qty = min(
+        allocation_qty,
+        max(Decimal("0"), abs(Decimal(quantity or 0))),
+    )
+    allocation.status = "REDUCING"
+    allocation.target_notional = Decimal("0")
+    allocation.pending_reduce_qty = _q(pending_qty)
+    allocation.pending_reduce_notional = abs(
+        Decimal(allocation.allocated_notional or 0)
+    )
+    allocation.pending_reduce_reason = (
+        MINIMUM_RESIDUAL_ECONOMIC_FLAT_PENDING_REASON
+    )
+    allocation.pending_reduce_since = now
+    allocation.pending_reduce_source_fill_id = order.source_fill_id
+    allocation.last_reconcile_at = now
+
+
 def _pending_reduce_notional(
     *,
     allocation: LeaderPositionAllocationRecord,
@@ -6982,6 +12461,26 @@ def _pending_reduce_notional(
 
 def _clear_deferred_reduce(allocation: LeaderPositionAllocationRecord) -> None:
     clear_deferred_reduce_state(allocation)
+
+
+def _clear_deferred_reduce_after_follower_flat(
+    allocation: LeaderPositionAllocationRecord,
+) -> None:
+    """Clear pending state while retaining an economic-flat lifecycle boundary."""
+    minimum_residual_release_confirmed = bool(
+        str(getattr(allocation, "status", "") or "").upper() == "CLOSED"
+        and abs(Decimal(getattr(allocation, "allocated_qty", 0) or 0))
+        <= ALLOCATION_TRANSITION_TOLERANCE
+        and abs(Decimal(getattr(allocation, "allocated_notional", 0) or 0))
+        <= ALLOCATION_TRANSITION_TOLERANCE
+        and str(getattr(allocation, "pending_reduce_reason", "") or "")
+        == MINIMUM_RESIDUAL_ECONOMIC_FLAT_PENDING_REASON
+    )
+    clear_deferred_reduce_state(allocation)
+    if minimum_residual_release_confirmed:
+        allocation.pending_reduce_reason = (
+            MINIMUM_RESIDUAL_ECONOMIC_FLAT_REASON
+        )
 
 
 def _apply_pending_reduce_offset_from_plan(
@@ -7021,6 +12520,65 @@ def _effective_leverage_plan(settings: Settings, leader_position: LatestAccountP
         default_leverage=settings.hyperliquid_default_leverage,
         coin_max_leverage=raw.get("maxLeverage"),
     )
+
+
+def _market_policy_effective_leverage(
+    market_meta: dict[str, Any] | None,
+    *,
+    canonical_coin_value: str,
+    configured_default_leverage: int,
+) -> int:
+    """Resolve the no-I/O market policy from prewarmed exchange metadata."""
+
+    meta = market_meta if isinstance(market_meta, dict) else {}
+    market_max = _int_or_none(meta.get("maxLeverage"))
+    if market_max is None:
+        return int(configured_default_leverage or 50)
+    margin_mode = (
+        FALLBACK_MARGIN_MODE
+        if market_requires_isolated_margin(meta)
+        else DESIRED_MARGIN_MODE
+    )
+    policy_default = 1 if margin_mode == FALLBACK_MARGIN_MODE else market_max
+    return (
+        effective_leverage_for_margin_mode(
+            market_max,
+            desired_default_leverage=policy_default,
+            margin_mode=margin_mode,
+            canonical_coin_value=canonical_coin_value,
+        )
+        or policy_default
+    )
+
+
+def _resolved_market_effective_leverage(
+    leverage_plan: Any,
+    *,
+    configured_default_leverage: int,
+    required_margin_mode: str,
+    canonical_coin_value: str,
+) -> int:
+    """Use the persisted/confirmed market target for sizing and margin checks.
+
+    ``leverage_plan.effective_leverage`` is built from MarketRiskSetting when a
+    market has already been configured.  The process-wide default is only a
+    fallback for a genuinely new market.  Reapplying the global default here
+    would understate required margin whenever a market is deliberately set
+    below its exchange maximum (for example, SOL at cross 10x with a higher
+    market maximum).
+    """
+
+    planned_leverage = (
+        _int_or_none(getattr(leverage_plan, "effective_leverage", None))
+        or int(configured_default_leverage or 10)
+    )
+    resolved = effective_leverage_for_margin_mode(
+        getattr(leverage_plan, "max_leverage", None),
+        desired_default_leverage=planned_leverage,
+        margin_mode=required_margin_mode,
+        canonical_coin_value=canonical_coin_value,
+    )
+    return resolved or planned_leverage
 
 
 def _observed_margin_mode(leader_position: LatestAccountPosition | None) -> str | None:
@@ -7310,6 +12868,139 @@ def _account_value_payload_needs_refresh(payload: dict[str, Any] | None) -> bool
     return any("account value unavailable" in blocker for blocker in blockers)
 
 
+def _account_abstraction_payload_has_usable_value(
+    payload: dict[str, Any] | None,
+    *,
+    dexes: list[str] | tuple[str, ...] | set[str],
+) -> bool:
+    normalized_dexes = [str(dex or "").lower() for dex in dexes]
+    if not payload or not normalized_dexes:
+        return False
+    for dex in normalized_dexes:
+        resolved = _resolved_account_value_payload(payload, dex)
+        ready, _ = _account_value_payload_ready(resolved, role=FOLLOWER)
+        if not ready:
+            return False
+    return True
+
+
+def _shared_market_meta_setting_key(*, network: str, dex: str) -> str:
+    return (
+        f"hyperliquid_market_meta:{SHARED_MARKET_META_CACHE_VERSION}:"
+        f"{str(network or 'mainnet').lower()}:{str(dex or 'default').lower()}"
+    )
+
+
+def _shared_perp_dex_directory_setting_key(*, network: str) -> str:
+    return (
+        f"hyperliquid_perp_dex_directory:{SHARED_PERP_DEX_DIRECTORY_CACHE_VERSION}:"
+        f"{str(network or 'mainnet').lower()}"
+    )
+
+
+def _perp_dex_asset_offsets_from_payload(payload: Any) -> dict[str, int]:
+    """Translate Hyperliquid's ordered perpDexs response into SDK offsets."""
+
+    if not isinstance(payload, list) or not payload:
+        return {}
+    offsets: dict[str, int] = {"": 0}
+    for index, item in enumerate(payload[1:]):
+        if not isinstance(item, dict):
+            continue
+        dex = str(item.get("name") or "").strip().lower()
+        if not dex or dex in offsets:
+            continue
+        # Matches the official SDK: builder DEX asset ranges begin at 110000
+        # and advance by 10000 in the order returned by perpDexs.
+        offsets[dex] = 110_000 + index * 10_000
+    return offsets
+
+
+def _parse_shared_perp_dex_directory_payload(
+    payload: dict[str, Any] | None,
+    *,
+    expected_network: str,
+) -> tuple[dict[str, int], datetime] | None:
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("version") or "") != SHARED_PERP_DEX_DIRECTORY_CACHE_VERSION:
+        return None
+    if str(payload.get("network") or "").lower() != str(expected_network or "").lower():
+        return None
+    refreshed_at = _datetime_or_none(payload.get("refreshed_at"))
+    raw_offsets = payload.get("asset_offsets")
+    if refreshed_at is None or not isinstance(raw_offsets, dict):
+        return None
+    offsets: dict[str, int] = {}
+    for raw_dex, raw_offset in raw_offsets.items():
+        dex = str(raw_dex or "").strip().lower()
+        offset = _int_or_none(raw_offset)
+        if offset is None or offset < 0 or dex in offsets:
+            return None
+        offsets[dex] = offset
+    if offsets.get("") != 0:
+        return None
+    return offsets, refreshed_at
+
+
+def _parse_shared_market_meta_payload(
+    payload: dict[str, Any] | None,
+    *,
+    expected_dex: str,
+) -> tuple[dict[str, Any], datetime, int] | None:
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("version") or "") != SHARED_MARKET_META_CACHE_VERSION:
+        return None
+    if str(payload.get("dex") or "").lower() != str(expected_dex or "").lower():
+        return None
+    meta = payload.get("meta")
+    if not isinstance(meta, dict) or not isinstance(meta.get("universe"), list):
+        return None
+    refreshed_at = _datetime_or_none(payload.get("refreshed_at"))
+    asset_offset = _int_or_none(payload.get("asset_offset"))
+    if refreshed_at is None or asset_offset is None or asset_offset < 0:
+        return None
+    return dict(meta), refreshed_at, asset_offset
+
+
+def _resolved_account_value_payload(
+    payload: dict[str, Any] | None,
+    dex: str,
+) -> dict[str, Any] | None:
+    resolved = resolved_value_payload(payload, dex)
+    if resolved is None:
+        return None
+    snapshot_updated_at = (payload or {}).get("updated_at") or (payload or {}).get("updatedAt")
+    if snapshot_updated_at is not None:
+        resolved["snapshot_updated_at"] = snapshot_updated_at
+    return resolved
+
+
+def _account_value_payload_is_stale(
+    payload: dict[str, Any] | None,
+    *,
+    max_age_seconds: float,
+    now: datetime | None = None,
+) -> bool:
+    if not payload:
+        return False
+    raw_updated_at = payload.get("snapshot_updated_at")
+    if raw_updated_at is None:
+        # Older tests and pre-migration payloads do not carry freshness
+        # metadata. Missing/zero values are handled by the separate readiness
+        # guard; a newly persisted production snapshot always has this field.
+        return False
+    updated_at = _datetime_or_none(raw_updated_at)
+    if updated_at is None:
+        return True
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    max_age = max(1.0, float(max_age_seconds or 0.0))
+    return updated_at < current - timedelta(seconds=max_age)
+
+
 def _account_value_payload_ready(payload: dict[str, Any] | None, *, role: str) -> tuple[bool, str | None]:
     value = _decimal_from_payload(payload, "account_value_used_for_sizing")
     if value is None or value <= 0:
@@ -7422,6 +13113,8 @@ def _latency_trace_payload(
             "ws_received_at": _iso_or_none(fill.ws_received_at),
             "parse_started_at": _iso_or_none(fill.parse_started_at),
             "parse_done_at": _iso_or_none(fill.parse_done_at),
+            "fill_queue_enqueued_at": _iso_or_none(fill.queue_enqueued_at),
+            "fill_worker_started_at": _iso_or_none(fill.fill_worker_started_at),
             "dedupe_started_at": _iso_or_none(dedupe_started_at),
             "dedupe_done_at": _iso_or_none(dedupe_done_at),
             "debounce_started_at": _iso_or_none(debounce_started_at),
@@ -7450,7 +13143,9 @@ def _latency_trace_payload(
             "state_refresh_scheduled_at": None,
         },
         "metrics": {},
-        "details": {},
+        "details": {
+            "leader_fill_ingress_channel": fill.ingress_channel,
+        },
         "missing_latency_fields": [],
     }
 
@@ -7529,6 +13224,48 @@ def _record_allocation_event(
     )
 
 
+def _recent_submit_latency_summary(
+    samples: list[dict[str, Any]],
+    *,
+    threshold_ms: int,
+) -> dict[str, Any]:
+    def values(key: str) -> list[int]:
+        return sorted(
+            parsed
+            for sample in samples
+            if (parsed := _int_or_none(sample.get(key))) is not None
+        )
+
+    def percentile(items: list[int], fraction: float) -> int | None:
+        if not items:
+            return None
+        index = min(len(items) - 1, max(0, round((len(items) - 1) * fraction)))
+        return int(items[index])
+
+    marker_values = values("ws_to_submit_ms")
+    actual_values = values("ws_to_actual_send_ms")
+    misses = [
+        sample
+        for sample in samples
+        if (
+            (_int_or_none(sample.get("ws_to_actual_send_ms")) or -1) > threshold_ms
+            or (_int_or_none(sample.get("ws_to_submit_ms")) or -1) > threshold_ms
+        )
+    ]
+    return {
+        "threshold_ms": int(threshold_ms),
+        "sample_count": len(samples),
+        "slo_miss_count": len(misses),
+        "ws_to_submit_p50_ms": percentile(marker_values, 0.50),
+        "ws_to_submit_p95_ms": percentile(marker_values, 0.95),
+        "ws_to_submit_max_ms": max(marker_values) if marker_values else None,
+        "ws_to_actual_send_p50_ms": percentile(actual_values, 0.50),
+        "ws_to_actual_send_p95_ms": percentile(actual_values, 0.95),
+        "ws_to_actual_send_max_ms": max(actual_values) if actual_values else None,
+        "last_slo_miss": dict(misses[-1]) if misses else None,
+    }
+
+
 def _set_latency_fields(order: ExecutionOrder) -> None:
     trace = _latency_trace_copy(getattr(order, "latency_trace", None))
     timestamps = trace["timestamps"]
@@ -7552,9 +13289,45 @@ def _set_latency_fields(order: ExecutionOrder) -> None:
     )
     order.sizing_ms = _delta_ms(_trace_time(timestamps, "allocation_read_done_at"), _trace_time(timestamps, "sizing_done_at"))
     metrics["dedupe_ms"] = _delta_ms(_trace_time(timestamps, "dedupe_started_at"), order.dedupe_done_at)
+    metrics["parse_to_fill_queue_ms"] = _delta_ms(
+        _trace_time(timestamps, "parse_done_at"),
+        _trace_time(timestamps, "fill_queue_enqueued_at"),
+    )
+    metrics["fill_queue_wait_ms"] = _delta_ms(
+        _trace_time(timestamps, "fill_queue_enqueued_at"),
+        _trace_time(timestamps, "fill_worker_started_at"),
+    )
+    metrics["fill_worker_to_dedupe_ms"] = _delta_ms(
+        _trace_time(timestamps, "fill_worker_started_at"),
+        _trace_time(timestamps, "dedupe_started_at"),
+    )
     metrics["account_cache_read_ms"] = account_cache_read_ms
     metrics["price_cache_read_ms"] = price_cache_read_ms
     metrics["allocation_read_ms"] = allocation_read_ms
+    metrics["aggregate_allocation_read_ms"] = _delta_ms(
+        _trace_time(timestamps, "aggregate_allocation_read_started_at"),
+        _trace_time(timestamps, "aggregate_allocation_read_done_at"),
+    )
+    metrics["follower_position_read_ms"] = _delta_ms(
+        _trace_time(timestamps, "follower_position_read_started_at"),
+        _trace_time(timestamps, "follower_position_read_done_at"),
+    )
+    metrics["opposite_allocation_guard_ms"] = _delta_ms(
+        _trace_time(timestamps, "opposite_allocation_guard_started_at"),
+        _trace_time(timestamps, "opposite_allocation_guard_done_at"),
+    )
+    metrics["market_leverage_plan_ms"] = _delta_ms(
+        _trace_time(timestamps, "market_leverage_plan_started_at"),
+        _trace_time(timestamps, "market_leverage_plan_done_at"),
+    )
+    metrics["sizing_guard_ms"] = _delta_ms(
+        _trace_time(timestamps, "sizing_guard_started_at"),
+        _trace_time(timestamps, "sizing_guard_done_at"),
+    )
+    metrics["post_sizing_guard_chain_ms"] = _delta_ms(
+        _trace_time(timestamps, "sizing_done_at"),
+        _trace_time(timestamps, "validator_started_at"),
+    )
     metrics["validator_ms"] = _delta_ms(
         _trace_time(timestamps, "validator_started_at"),
         _trace_time(timestamps, "validator_done_at"),
@@ -7563,6 +13336,54 @@ def _set_latency_fields(order: ExecutionOrder) -> None:
     metrics["pending_submit_db_write_ms"] = _delta_ms(
         _trace_time(timestamps, "pending_submit_write_started_at"),
         _trace_time(timestamps, "pending_submit_write_done_at"),
+    )
+    metrics["plan_commit_to_submit_worker_ms"] = _delta_ms(
+        _trace_time(timestamps, "order_plan_commit_started_at"),
+        _trace_time(timestamps, "submit_worker_started_at"),
+    )
+    metrics["order_plan_commit_ms"] = _delta_ms(
+        _trace_time(timestamps, "order_plan_commit_started_at"),
+        _trace_time(timestamps, "order_plan_committed_at"),
+    )
+    metrics["submit_scheduler_lag_ms"] = _delta_ms(
+        _trace_time(timestamps, "order_plan_committed_at"),
+        _trace_time(timestamps, "submit_worker_started_at"),
+    )
+    metrics["submit_worker_barrier_ms"] = _delta_ms(
+        _trace_time(timestamps, "submit_worker_started_at"),
+        _trace_time(timestamps, "submit_session_started_at"),
+    )
+    metrics["submit_order_load_ms"] = _delta_ms(
+        _trace_time(timestamps, "submit_session_started_at"),
+        _trace_time(timestamps, "submit_order_loaded_at"),
+    )
+    metrics["submit_db_connection_acquire_ms"] = _delta_ms(
+        _trace_time(timestamps, "submit_db_connection_acquire_started_at"),
+        _trace_time(timestamps, "submit_db_connection_acquired_at"),
+    )
+    metrics["submit_order_query_ms"] = _delta_ms(
+        _trace_time(timestamps, "submit_order_query_started_at"),
+        _trace_time(timestamps, "submit_order_query_done_at"),
+    )
+    metrics["submit_plan_guard_ms"] = _delta_ms(
+        _trace_time(timestamps, "submit_plan_guard_started_at"),
+        _trace_time(timestamps, "submit_plan_guard_done_at"),
+    )
+    metrics["submit_claim_ms"] = _delta_ms(
+        _trace_time(timestamps, "submit_claim_started_at"),
+        _trace_time(timestamps, "submit_claim_done_at"),
+    )
+    metrics["submit_marker_cas_ms"] = _delta_ms(
+        _trace_time(timestamps, "submit_marker_write_started_at"),
+        _trace_time(timestamps, "submit_marker_cas_done_at"),
+    )
+    metrics["submit_marker_commit_ms"] = _delta_ms(
+        _trace_time(timestamps, "submit_marker_cas_done_at"),
+        _trace_time(timestamps, "submit_marker_commit_done_at"),
+    )
+    metrics["submit_marker_db_ms"] = _delta_ms(
+        _trace_time(timestamps, "submit_marker_write_started_at"),
+        _trace_time(timestamps, "submit_marker_commit_done_at"),
     )
     metrics["asset_id_hydrate_ms"] = _delta_ms(
         _trace_time(timestamps, "asset_id_hydrate_started_at"),
@@ -7585,8 +13406,10 @@ def _set_latency_fields(order: ExecutionOrder) -> None:
         _trace_time(timestamps, "sdk_exchange_ready_at"),
     )
     metrics["sdk_prepare_sign_ms"] = _delta_ms(
-        _trace_time(timestamps, "sdk_order_call_started_at"),
-        _trace_time(timestamps, "sdk_http_post_started_at"),
+        _trace_time(timestamps, "sdk_prepare_started_at")
+        or _trace_time(timestamps, "sdk_order_call_started_at"),
+        _trace_time(timestamps, "sdk_prepare_done_at")
+        or _trace_time(timestamps, "sdk_http_post_started_at"),
     )
     metrics["direct_http_submit_slot_wait_ms"] = _delta_ms(
         _trace_time(timestamps, "direct_http_submit_slot_wait_started_at"),
@@ -7625,6 +13448,31 @@ def _set_latency_fields(order: ExecutionOrder) -> None:
         _trace_time(timestamps, "allocation_update_done_at"),
     )
     metrics["ack_to_final_ms"] = _delta_ms(order.order_ack_at, order.order_finalized_at)
+    first_ws_send_at = _trace_time(timestamps, "ws_action_send_started_at")
+    fallback_at = _trace_time(timestamps, "websocket_http_fallback_at")
+    http_send_at = _trace_time(timestamps, "sdk_http_post_started_at")
+    # An explicit WebSocket error proves that the action was not accepted and
+    # permits a safe HTTP fallback. In that case the effective submit is the
+    # later HTTP write, not the rejected WS attempt; using the first attempt
+    # here previously understated two live orders by roughly 164ms.
+    actual_send_at = http_send_at if fallback_at is not None else first_ws_send_at or http_send_at
+    metrics["ws_to_first_transport_attempt_ms"] = _delta_ms(
+        order.ws_received_at,
+        first_ws_send_at or http_send_at,
+    )
+    metrics["websocket_rejection_to_http_send_ms"] = _delta_ms(
+        fallback_at,
+        http_send_at,
+    )
+    metrics["websocket_attempt_to_fallback_ms"] = _delta_ms(
+        first_ws_send_at,
+        fallback_at,
+    )
+    metrics["ws_to_actual_send_ms"] = _delta_ms(order.ws_received_at, actual_send_at)
+    metrics["submit_marker_to_actual_send_ms"] = _delta_ms(
+        order.order_submit_started_at,
+        actual_send_at,
+    )
     order.checklist_ms = _delta_ms(_trace_time(timestamps, "validator_done_at") or _trace_time(timestamps, "sizing_done_at"), _trace_time(timestamps, "checklist_done_at"))
     order.ws_to_submit_ms = _delta_ms(order.ws_received_at, order.order_submit_started_at)
     order.receive_to_submit_ms = order.ws_to_submit_ms
@@ -7755,6 +13603,36 @@ def _opposite_side(side: PositionSide) -> PositionSide:
     return PositionSide.SHORT if side == PositionSide.LONG else PositionSide.LONG
 
 
+def _opposite_allocation_exists_in_snapshot(
+    *,
+    allocation_qty_by_side: dict[PositionSide, Decimal],
+    current_allocation: LeaderPositionAllocationRecord | None,
+    current_leader_id: int | None,
+    new_side: PositionSide,
+) -> bool:
+    """Apply the aggregate netting guard using the already-loaded snapshot.
+
+    The aggregate snapshot contains all enabled leaders.  The SQL guard this
+    replaces excludes the current leader, so subtract that leader's sole active
+    opposite-side allocation before deciding.  The partial unique index keeps
+    that active leader/market/side row singular.
+    """
+    opposite = _opposite_side(new_side)
+    opposite_qty = abs(Decimal(allocation_qty_by_side.get(opposite, 0) or 0))
+    if (
+        current_allocation is not None
+        and current_leader_id is not None
+        and getattr(current_allocation, "leader_id", None) == current_leader_id
+        and not _allocation_row_closed(current_allocation)
+        and _position_side_or_none(getattr(current_allocation, "position_side", None)) == opposite
+    ):
+        opposite_qty = max(
+            Decimal("0"),
+            opposite_qty - abs(Decimal(getattr(current_allocation, "allocated_qty", 0) or 0)),
+        )
+    return opposite_qty > ALLOCATION_TRANSITION_TOLERANCE
+
+
 def _state_updated_at(state: LatestAccountState | None) -> datetime | None:
     if state is None:
         return None
@@ -7853,6 +13731,31 @@ def _allocation_lifecycle_active(allocation: LeaderPositionAllocationRecord | No
     return _allocation_active(allocation)
 
 
+def _coin_config_allows_fill(
+    *,
+    config_allowed: bool,
+    allocation: LeaderPositionAllocationRecord | None,
+    fill_implied_position: Any | None,
+    transition_plan: Any | None,
+) -> bool:
+    """Apply coin filters at lifecycle boundaries, not in the middle of a position.
+
+    A newly blocked coin must not claim a released market or open a new/flip
+    lifecycle. An allocation that was already active (including a valid
+    below-minimum pending lifecycle) must still receive increases, reductions,
+    and its final close so filtering cannot strand follower exposure.
+    """
+    if config_allowed:
+        return True
+    if _fill_is_new_open_from_flat(fill_implied_position):
+        return False
+    action = getattr(transition_plan, "action", None)
+    action_value = action.value if hasattr(action, "value") else str(action or "").upper()
+    if action_value == AllocationTransitionAction.FLIP_OPEN_SECOND.value:
+        return False
+    return _allocation_lifecycle_active(allocation)
+
+
 def _allocation_market_owner_active(
     allocation: LeaderPositionAllocationRecord | None,
     pending_intents: PendingIntentLedger | None = None,
@@ -7892,16 +13795,6 @@ def _market_owner_blocker(
         f"{coin} is already owned by leader {mask_address(owner_address)} "
         f"(allocation {getattr(owner_allocation, 'id', None)}); waiting until that allocation is CLOSED"
     )
-
-
-def _order_market_owner_guard_allows_manual_guard(order: ExecutionOrder) -> bool:
-    checklist = order.pre_trade_checklist if isinstance(order.pre_trade_checklist, dict) else {}
-    guard = checklist.get("market_owner_guard")
-    if not isinstance(guard, dict) or guard.get("blocked"):
-        return False
-    owner_allocation_id = _int_or_none(guard.get("owner_allocation_id"))
-    order_allocation_id = _int_or_none(getattr(order, "allocation_id", None))
-    return owner_allocation_id is not None and order_allocation_id is not None and owner_allocation_id == order_allocation_id
 
 
 def _allocation_has_flat_leader_close_intent(allocation: LeaderPositionAllocationRecord | None) -> bool:
@@ -8084,6 +13977,14 @@ def _pending_open_activation_block_reason(
         return None
     if not _valid_pending_open_lifecycle(allocation):
         return "PENDING_OPEN_INVALID_REASON: only below-min initial opens can activate later fills"
+    # The durable allocation can still be PENDING_OPEN while earlier OPEN or
+    # INCREASE orders are represented by the in-memory pending-intent overlay.
+    # Once that overlay has positive quantity, a following reduce/close belongs
+    # to the same active lifecycle.  Submit barriers keep it behind the earlier
+    # increases and the final reduce guard rechecks the filled allocation before
+    # any exchange call.
+    if _allocation_active(allocation):
+        return None
     if transition_plan is None:
         return None
     action = getattr(transition_plan, "action", None)
@@ -8105,6 +14006,7 @@ def _fill_direction_action_block_reason(
     transition_plan: Any | None,
     *,
     allow_missed_reduce_catchup: bool = False,
+    allow_checkpoint_flip_open: bool = False,
 ) -> str | None:
     if transition_plan is None:
         return None
@@ -8115,6 +14017,7 @@ def _fill_direction_action_block_reason(
         action_value,
         allow_missed_reduce_catchup=allow_missed_reduce_catchup,
         allow_reduce_fill_close=_transition_plan_targets_flat_leader(transition_plan),
+        allow_checkpoint_flip_open=allow_checkpoint_flip_open,
     )
 
 
@@ -8208,6 +14111,7 @@ def _fill_direction_action_value_block_reason(
     *,
     allow_missed_reduce_catchup: bool = False,
     allow_reduce_fill_close: bool = False,
+    allow_checkpoint_flip_open: bool = False,
 ) -> str | None:
     action_value = str(action_value or "").upper()
     if action_value in {AllocationTransitionAction.NOOP.value, AllocationTransitionAction.BLOCK.value}:
@@ -8246,7 +14150,7 @@ def _fill_direction_action_value_block_reason(
         return "FILL_DIRECTION_GUARD: leader close fill must close follower allocation"
     if (is_open or is_increase) and action_value in reduce_actions and not allow_missed_reduce_catchup:
         return "FILL_DIRECTION_GUARD: leader open/increase fill cannot reduce or close follower position"
-    if is_flip and action_value in open_actions:
+    if is_flip and action_value in open_actions and not allow_checkpoint_flip_open:
         return "FILL_DIRECTION_GUARD: leader flip fill cannot directly open follower second leg"
     return None
 
@@ -8281,6 +14185,18 @@ def _order_intent_blockers(
         blockers.append("INTERNAL_SUBMIT_GUARD: reduce/close must be reduce_only")
     if action not in open_actions and action not in reduce_actions:
         blockers.append("INTERNAL_SUBMIT_GUARD: unsupported submit action")
+    checklist = getattr(order, "pre_trade_checklist", None) or {}
+    if (
+        bool(checklist.get("market_ownership_acquisition_required"))
+        and not _fill_is_new_open_from_flat(fill_implied_position)
+        and not bool(checklist.get("market_ownership_checkpoint_flip_open"))
+        and not bool(checklist.get("market_ownership_economic_dust_reopen"))
+    ):
+        blockers.append(
+            "OWNERSHIP_ACQUISITION_GUARD: a released market can only be claimed "
+            "by a genuine leader open from startPosition=0, a checkpoint-contiguous "
+            "flip, or a same-side increase from sub-minimum dust into tradeable size"
+        )
     if position_side not in {"LONG", "SHORT"}:
         blockers.append("INTERNAL_SUBMIT_GUARD: missing position_side")
     else:
@@ -8293,6 +14209,9 @@ def _order_intent_blockers(
         fill_implied_position,
         action,
         allow_missed_reduce_catchup=allow_missed_reduce_catchup,
+        allow_checkpoint_flip_open=bool(
+            checklist.get("market_ownership_checkpoint_flip_open")
+        ),
     )
     if direction_reason:
         blockers.append(direction_reason)
@@ -8473,7 +14392,11 @@ def _allocation_sync_in_post_fill_snapshot_lag_guard(
 ) -> bool:
     if guard_seconds <= 0:
         return False
-    checkpoint = _latest_datetime(allocation_reconcile_at, latest_fill_event_at)
+    # A routine successful sync advances allocation.last_reconcile_at on every
+    # poll. Using that heartbeat here delays every genuine manual decrease by
+    # the full guard window. Only an actual bot fill can make a down-snapshot
+    # temporarily stale, so the protection must be anchored to FILL_APPLIED.
+    checkpoint = latest_fill_event_at
     if checkpoint is None:
         return False
     return datetime.now(timezone.utc) - checkpoint <= timedelta(seconds=guard_seconds)
@@ -8487,6 +14410,15 @@ def _unmanaged_follower_position_blocker(
     canonical_coin: str,
 ) -> str | None:
     if transition_plan is None or unmanaged_position_state_lag:
+        return None
+    # A same-side reduce/close remains allocation-bounded, so any excess
+    # follower quantity is left untouched. This is also the safe path when a
+    # clearinghouse snapshot races just behind an already-applied allocation
+    # fill during a burst of reductions.
+    if _unmanaged_follower_position_reduce_safe(
+        transition_plan=transition_plan,
+        unmanaged_qty_by_side=unmanaged_qty_by_side,
+    ):
         return None
     action = getattr(transition_plan, "action", None)
     action_value = action.value if hasattr(action, "value") else str(action or "").upper()
@@ -8503,6 +14435,44 @@ def _unmanaged_follower_position_blocker(
     return (
         "UNMANAGED_FOLLOWER_POSITION: follower has unallocated/manual "
         f"{canonical_coin} position ({details}); all copy actions disabled until follower position is flat"
+    )
+
+
+def _economic_dust_reopen_follower_flat_blocker(
+    *,
+    economic_dust_reopen: bool,
+    follower_qty_by_side: dict[PositionSide, Decimal] | None,
+) -> str | None:
+    """Require literal follower flatness before treating leader dust as flat."""
+    if not economic_dust_reopen:
+        return None
+    if follower_qty_by_side is None:
+        return (
+            "ECONOMIC_DUST_REOPEN_REQUIRES_FOLLOWER_FLAT: follower position "
+            "state is unavailable"
+        )
+    nonflat = {
+        side.value: abs(Decimal(follower_qty_by_side.get(side, 0)))
+        for side in (PositionSide.LONG, PositionSide.SHORT)
+        if abs(Decimal(follower_qty_by_side.get(side, 0)))
+        > ALLOCATION_TRANSITION_TOLERANCE
+    }
+    if not nonflat:
+        return None
+    details = ", ".join(
+        f"{side} qty={qty}" for side, qty in sorted(nonflat.items())
+    )
+    return (
+        "ECONOMIC_DUST_REOPEN_REQUIRES_FOLLOWER_FLAT: follower still has "
+        f"position ({details}); dust increase cannot start a new lifecycle"
+    )
+
+
+def _expected_no_action_block(error_message: str | None) -> bool:
+    """Classify intentional first-owner rejection separately from true failures."""
+    message = str(error_message or "")
+    return message.startswith("MARKET_OWNER_BLOCKED:") or message.startswith(
+        MAX_POSITION_NOTIONAL_CAP_EXCEEDED
     )
 
 
@@ -8557,12 +14527,57 @@ def _allocation_needs_manual_review(allocation: LeaderPositionAllocationRecord |
 def _ignore_without_allocation_reason(
     allocation: LeaderPositionAllocationRecord | None,
     fill_implied_position: Any | None,
+    *,
+    allow_economic_dust_reopen: bool = False,
 ) -> str | None:
     if _allocation_lifecycle_active(allocation):
         return None
     if _fill_is_new_open_from_flat(fill_implied_position):
         return None
+    if _fill_is_checkpoint_contiguous_flip_open(allocation, fill_implied_position):
+        return None
+    if allow_economic_dust_reopen:
+        return None
     return "IGNORED_OLD_LIFECYCLE: no follower allocation exists; waiting for leader open from flat"
+
+
+def _fill_is_checkpoint_contiguous_flip_open(
+    allocation: LeaderPositionAllocationRecord | None,
+    fill_implied_position: Any | None,
+) -> bool:
+    """Allow only the exact flip following a deliberately early follower close.
+
+    A sub-minimum leader remainder may cause the follower allocation to close
+    early.  If the leader's next causal fill crosses that exact checkpoint into
+    the opposite side, the new leg is a real opening lifecycle.  Arbitrary old
+    adds/reduces/closes/flips remain unable to claim a released market.
+    """
+    if allocation is None or fill_implied_position is None:
+        return False
+    if str(getattr(allocation, "status", "") or "").upper() != "CLOSED":
+        return False
+    allocation_qty = abs(Decimal(getattr(allocation, "allocated_qty", 0) or 0))
+    if allocation_qty > ALLOCATION_TRANSITION_TOLERANCE:
+        return False
+    confidence = str(getattr(fill_implied_position, "confidence", "") or "").upper()
+    if confidence not in {"HIGH", "MEDIUM"} or not bool(
+        getattr(fill_implied_position, "is_flip", False)
+    ):
+        return False
+    checkpoint = _decimal_from_value(getattr(allocation, "last_leader_position_size", None))
+    start_position = _decimal_from_value(getattr(fill_implied_position, "start_position", None))
+    side_after = getattr(fill_implied_position, "side_after", None)
+    if (
+        checkpoint is None
+        or start_position is None
+        or abs(checkpoint) <= ALLOCATION_TRANSITION_TOLERANCE
+        or abs(start_position - checkpoint) > ALLOCATION_TRANSITION_TOLERANCE
+        or side_after not in {PositionSide.LONG, PositionSide.SHORT}
+    ):
+        return False
+    return (checkpoint > 0 and side_after == PositionSide.SHORT) or (
+        checkpoint < 0 and side_after == PositionSide.LONG
+    )
 
 
 def _fill_is_new_open_from_flat(fill_implied_position: Any | None) -> bool:
@@ -8575,6 +14590,166 @@ def _fill_is_new_open_from_flat(fill_implied_position: Any | None) -> bool:
     if start_position is None or abs(Decimal(start_position or 0)) > ALLOCATION_TRANSITION_TOLERANCE:
         return False
     return bool(getattr(fill_implied_position, "is_open", False))
+
+
+def _fill_is_economic_dust_reopen(
+    fill_implied_position: Any | None,
+    *,
+    reference_price: Decimal,
+    min_order_value: Decimal,
+) -> bool:
+    """Recognize a same-side add after the leader is economically flat.
+
+    The follower deliberately closes instead of retaining an untradeable
+    residual below the venue minimum.  A later fill may therefore be an
+    ``is_increase`` for the leader while it is a genuine ``OPEN`` for the flat
+    follower.  Require the fill's authoritative startPosition to be below the
+    minimum and the post-fill position to cross back to at least the minimum.
+    """
+    if fill_implied_position is None:
+        return False
+    confidence = str(
+        getattr(fill_implied_position, "confidence", "") or ""
+    ).upper()
+    if confidence not in {"HIGH", "MEDIUM"}:
+        return False
+    if not bool(getattr(fill_implied_position, "is_increase", False)):
+        return False
+    if (
+        bool(getattr(fill_implied_position, "is_open", False))
+        or bool(getattr(fill_implied_position, "is_reduce", False))
+        or bool(getattr(fill_implied_position, "is_close", False))
+        or bool(getattr(fill_implied_position, "is_flip", False))
+    ):
+        return False
+    price = abs(Decimal(reference_price or 0))
+    minimum = abs(Decimal(min_order_value or 0))
+    start_position = _decimal_from_value(
+        getattr(fill_implied_position, "start_position", None)
+    )
+    signed_size_after = _decimal_from_value(
+        getattr(fill_implied_position, "signed_size_after", None)
+    )
+    if (
+        price <= ALLOCATION_TRANSITION_TOLERANCE
+        or minimum <= ALLOCATION_TRANSITION_TOLERANCE
+        or start_position is None
+        or signed_size_after is None
+        or abs(start_position) <= ALLOCATION_TRANSITION_TOLERANCE
+        or abs(signed_size_after) <= abs(start_position)
+        or (start_position > 0) != (signed_size_after > 0)
+    ):
+        return False
+    start_notional = abs(start_position) * price
+    post_notional = abs(signed_size_after) * price
+    return (
+        start_notional < minimum
+        and post_notional >= minimum
+    )
+
+
+def _fill_is_minimum_residual_checkpoint_reopen(
+    allocation: LeaderPositionAllocationRecord | None,
+    fill_implied_position: Any | None,
+) -> bool:
+    """Match a same-side add to a persisted minimum-residual early close."""
+    if allocation is None or fill_implied_position is None:
+        return False
+    if str(getattr(allocation, "status", "") or "").upper() != "CLOSED":
+        return False
+    if (
+        str(getattr(allocation, "pending_reduce_reason", "") or "")
+        != MINIMUM_RESIDUAL_ECONOMIC_FLAT_REASON
+    ):
+        return False
+    if (
+        abs(Decimal(getattr(allocation, "allocated_qty", 0) or 0))
+        > ALLOCATION_TRANSITION_TOLERANCE
+        or abs(Decimal(getattr(allocation, "allocated_notional", 0) or 0))
+        > ALLOCATION_TRANSITION_TOLERANCE
+    ):
+        return False
+    return _fill_matches_minimum_residual_checkpoint(
+        allocation,
+        fill_implied_position,
+    )
+
+
+def _fill_is_minimum_residual_pending_checkpoint_reopen(
+    allocation: LeaderPositionAllocationRecord | None,
+    fill_implied_position: Any | None,
+) -> bool:
+    """Recognize a dust reopen that arrived while its early close is pending."""
+    if allocation is None or fill_implied_position is None:
+        return False
+    if str(getattr(allocation, "status", "") or "").upper() == "CLOSED":
+        return False
+    if (
+        str(getattr(allocation, "pending_reduce_reason", "") or "")
+        != MINIMUM_RESIDUAL_ECONOMIC_FLAT_PENDING_REASON
+    ):
+        return False
+    if (
+        abs(Decimal(getattr(allocation, "target_notional", 0) or 0))
+        > ALLOCATION_TRANSITION_TOLERANCE
+    ):
+        return False
+    return _fill_matches_minimum_residual_checkpoint(
+        allocation,
+        fill_implied_position,
+    )
+
+
+def _fill_matches_minimum_residual_checkpoint(
+    allocation: LeaderPositionAllocationRecord,
+    fill_implied_position: Any,
+) -> bool:
+    confidence = str(
+        getattr(fill_implied_position, "confidence", "") or ""
+    ).upper()
+    if confidence not in {"HIGH", "MEDIUM"} or not bool(
+        getattr(fill_implied_position, "is_increase", False)
+    ):
+        return False
+    if (
+        bool(getattr(fill_implied_position, "is_open", False))
+        or bool(getattr(fill_implied_position, "is_reduce", False))
+        or bool(getattr(fill_implied_position, "is_close", False))
+        or bool(getattr(fill_implied_position, "is_flip", False))
+    ):
+        return False
+    checkpoint_size = _decimal_from_value(
+        getattr(allocation, "last_leader_position_size", None)
+    )
+    start_position = _decimal_from_value(
+        getattr(fill_implied_position, "start_position", None)
+    )
+    signed_size_after = _decimal_from_value(
+        getattr(fill_implied_position, "signed_size_after", None)
+    )
+    allocation_side = _position_side_or_none(
+        getattr(allocation, "position_side", None)
+    )
+    if (
+        checkpoint_size is None
+        or start_position is None
+        or signed_size_after is None
+        or allocation_side is None
+        or abs(checkpoint_size) <= ALLOCATION_TRANSITION_TOLERANCE
+    ):
+        return False
+    signed_checkpoint = (
+        abs(checkpoint_size)
+        if allocation_side == PositionSide.LONG
+        else -abs(checkpoint_size)
+    )
+    return bool(
+        abs(start_position - signed_checkpoint)
+        <= ALLOCATION_TRANSITION_TOLERANCE
+        and (start_position > 0) == (signed_size_after > 0)
+        and abs(signed_size_after)
+        > abs(start_position) + ALLOCATION_TRANSITION_TOLERANCE
+    )
 
 
 def _age_ms(value: datetime | None) -> int:
@@ -8608,3 +14783,138 @@ def _first_present(*values: Any) -> Any:
         if value is not None and str(value) != "":
             return value
     return None
+
+
+def _signed_envelope_hash(envelope: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        _json_safe(envelope),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _event_tid(event: FillEvent) -> int | None:
+    return _int_or_none((event.raw or {}).get("tid"))
+
+
+def _fill_cursor_key(value: tuple[int, int | None]) -> tuple[int, int]:
+    return int(value[0]), int(value[1]) if value[1] is not None else -1
+
+
+def _causal_sort_fill_payloads(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sort same-market fills by their startPosition chain, then by venue tid."""
+    ordered = sorted(
+        list(fills or []),
+        key=lambda fill: (
+            _int_or_none(fill.get("time")) or 0,
+            str(fill.get("coin") or ""),
+            _int_or_none(fill.get("tid")) or -1,
+        ),
+    )
+    result: list[dict[str, Any]] = []
+    index = 0
+    while index < len(ordered):
+        first = ordered[index]
+        group_key = (
+            _int_or_none(first.get("time")) or 0,
+            str(first.get("coin") or ""),
+        )
+        end = index + 1
+        while end < len(ordered):
+            candidate = ordered[end]
+            if (
+                _int_or_none(candidate.get("time")) or 0,
+                str(candidate.get("coin") or ""),
+            ) != group_key:
+                break
+            end += 1
+        result.extend(_causal_sort_same_time_market_group(ordered[index:end]))
+        index = end
+    return result
+
+
+def _causal_sort_same_time_market_group(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(fills) < 2:
+        return fills
+    edges: list[tuple[dict[str, Any], Decimal, Decimal]] = []
+    for fill in fills:
+        start = _decimal_from_value(fill.get("startPosition"))
+        size = _decimal_from_value(fill.get("sz"))
+        side = str(fill.get("side") or "").upper()
+        if start is None or size is None or size < 0 or side not in {"A", "B"}:
+            return fills
+        finish = start + size if side == "B" else start - size
+        edges.append((fill, start, finish))
+    finish_values = {finish for _fill, _start, finish in edges}
+    roots = [edge for edge in edges if edge[1] not in finish_values]
+    if len(roots) != 1:
+        return fills
+    chain: list[dict[str, Any]] = []
+    remaining = list(edges)
+    current = roots[0]
+    while True:
+        chain.append(current[0])
+        remaining.remove(current)
+        if not remaining:
+            return chain
+        next_edges = [edge for edge in remaining if edge[1] == current[2]]
+        if len(next_edges) != 1:
+            return fills
+        current = next_edges[0]
+
+
+def _writer_lease_key(follower_account: str) -> int:
+    digest = hashlib.blake2b(
+        f"copytrade-writer:{str(follower_account or '').lower()}".encode("utf-8"),
+        digest_size=8,
+    ).digest()
+    value = int.from_bytes(digest, byteorder="big", signed=False)
+    return value if value < 2**63 else value - 2**64
+
+
+def _market_transaction_key(market: MarketKey, execution_scope: str = "") -> int:
+    digest = hashlib.blake2b(
+        f"copytrade-market:{str(execution_scope or '').lower()}:{market.dex.lower()}:{market.canonical_coin.upper()}".encode("utf-8"),
+        digest_size=8,
+    ).digest()
+    value = int.from_bytes(digest, byteorder="big", signed=False)
+    return value if value < 2**63 else value - 2**64
+
+
+def _market_arrival_key(market: MarketKey, execution_scope: str = "") -> int:
+    """Separate durable-arrival ordering from the longer planning transaction.
+
+    The singleton writer plus the in-process ingress lock preserves enqueue
+    order. This database namespace additionally preserves source_fills.id order
+    across process handoff without making a newly received fill wait for an
+    unrelated planner/submit transaction holding the market-state lock.
+    """
+    digest = hashlib.blake2b(
+        f"copytrade-arrival:{str(execution_scope or '').lower()}:{market.dex.lower()}:{market.canonical_coin.upper()}".encode("utf-8"),
+        digest_size=8,
+    ).digest()
+    value = int.from_bytes(digest, byteorder="big", signed=False)
+    return value if value < 2**63 else value - 2**64
+
+
+def _follower_market_guard_query(
+    market: MarketKey,
+    *,
+    execution_scope: str = "",
+) -> Any:
+    return (
+        select(FollowerMarketGuard)
+        .where(FollowerMarketGuard.execution_account == str(execution_scope or "").lower())
+        .where(FollowerMarketGuard.execution_venue == ExecutionVenue.HYPERLIQUID.value)
+        .where(FollowerMarketGuard.dex == str(market.dex or "").lower())
+        .where(func.upper(FollowerMarketGuard.canonical_coin) == market.canonical_coin.upper())
+        .limit(1)
+    )
+
+
+def _planned_follower_market_position_version(order: ExecutionOrder) -> int | None:
+    return _int_or_none(
+        (order.pre_trade_checklist or {}).get("follower_market_position_version")
+    )

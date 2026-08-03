@@ -1,11 +1,13 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from app.core.config import Settings
 from app.models import MarketRiskSetting
 from app.services.hyperliquid_risk_settings import (
     DESIRED_MARGIN_MODE,
     FALLBACK_MARGIN_MODE,
+    REASON_LEVERAGE_NOT_CONFIRMED,
     REASON_MAX_LEVERAGE_UNKNOWN,
     STATUS_CONFIRMED,
     STATUS_FAILED,
@@ -154,6 +156,39 @@ def test_ensure_sets_cross_effective_leverage_before_open() -> None:
     assert db.row.status == STATUS_CONFIRMED
 
 
+def test_only_isolated_market_metadata_skips_cross_and_sets_one_x_before_open() -> None:
+    db = FakeDb()
+    client = FakeClient(
+        universe=[
+            {
+                "name": "xyz:GIGADEV",
+                "maxLeverage": 10,
+                "onlyIsolated": True,
+                "marginMode": "noCross",
+            }
+        ]
+    )
+
+    result = asyncio.run(
+        ensure_hyperliquid_market_risk_settings(
+            db=db,
+            client=client,
+            settings=settings(),
+            account_address="0x" + "5" * 40,
+            dex="xyz",
+            canonical_coin_value="xyz:GIGADEV",
+            action_type="OPEN",
+        )
+    )
+
+    assert result.is_ok is True
+    assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
+    assert result.effective_leverage == 1
+    assert client.updates == [{"coin": "xyz:GIGADEV", "leverage": 1, "is_cross": False}]
+    assert db.row.desired_margin_mode == FALLBACK_MARGIN_MODE
+    assert db.row.desired_leverage == 1
+
+
 def test_ensure_hydrates_missing_asset_id_even_when_max_leverage_cached() -> None:
     universe = [{"name": f"DUMMY{i}", "maxLeverage": 10} for i in range(231)]
     universe.append({"name": "CASHCAT", "maxLeverage": 3})
@@ -217,13 +252,13 @@ def test_cross_unsupported_falls_back_to_isolated_before_open() -> None:
     assert result.status == STATUS_CONFIRMED
     assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
     assert result.desired_margin_mode == FALLBACK_MARGIN_MODE
-    assert result.desired_leverage == 4
-    assert result.effective_leverage == 4
-    assert result.actual_leverage == 4
+    assert result.desired_leverage == 1
+    assert result.effective_leverage == 1
+    assert result.actual_leverage == 1
     assert result.warning == "cross margin unsupported; using isolated margin for this market"
     assert client.updates == [
         {"coin": "xyz:CL", "leverage": 10, "is_cross": True},
-        {"coin": "xyz:CL", "leverage": 4, "is_cross": False},
+        {"coin": "xyz:CL", "leverage": 1, "is_cross": False},
     ]
     assert db.row.status == STATUS_CONFIRMED
 
@@ -254,16 +289,16 @@ def test_invalid_cross_leverage_falls_back_to_isolated_before_open() -> None:
     assert result.status == STATUS_CONFIRMED
     assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
     assert result.desired_margin_mode == FALLBACK_MARGIN_MODE
-    assert result.desired_leverage == 4
-    assert result.effective_leverage == 4
+    assert result.desired_leverage == 1
+    assert result.effective_leverage == 1
     assert result.warning == "cross leverage rejected; using isolated margin for this market"
     assert client.updates == [
         {"coin": "xyz:SKHY", "leverage": 10, "is_cross": True},
-        {"coin": "xyz:SKHY", "leverage": 4, "is_cross": False},
+        {"coin": "xyz:SKHY", "leverage": 1, "is_cross": False},
     ]
 
 
-def test_isolated_fallback_uses_market_max_when_below_four() -> None:
+def test_isolated_fallback_is_one_x_even_when_market_max_is_higher() -> None:
     db = FakeDb()
     client = SequenceUpdateClient(
         universe=[{"name": "VIX", "maxLeverage": 3}],
@@ -287,12 +322,260 @@ def test_isolated_fallback_uses_market_max_when_below_four() -> None:
 
     assert result.is_ok is True
     assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
-    assert result.desired_leverage == 4
-    assert result.effective_leverage == 3
-    assert result.actual_leverage == 3
+    assert result.desired_leverage == 1
+    assert result.effective_leverage == 1
+    assert result.actual_leverage == 1
     assert client.updates == [
         {"coin": "xyz:VIX", "leverage": 3, "is_cross": True},
-        {"coin": "xyz:VIX", "leverage": 3, "is_cross": False},
+        {"coin": "xyz:VIX", "leverage": 1, "is_cross": False},
+    ]
+
+
+def test_cxmt_is_forced_to_one_x_even_when_cross_margin_is_supported() -> None:
+    db = FakeDb()
+    client = FakeClient(universe=[{"name": "CXMT", "maxLeverage": 5}])
+
+    result = asyncio.run(
+        ensure_hyperliquid_market_risk_settings(
+            db=db,
+            client=client,
+            settings=settings(),
+            account_address="0x" + "5" * 40,
+            dex="xyz",
+            canonical_coin_value="xyz:CXMT",
+            action_type="OPEN",
+        )
+    )
+
+    assert result.is_ok is True
+    assert result.actual_margin_mode == DESIRED_MARGIN_MODE
+    assert result.desired_leverage == 1
+    assert result.effective_leverage == 1
+    assert result.actual_leverage == 1
+    assert client.updates == [
+        {"coin": "xyz:CXMT", "leverage": 1, "is_cross": True},
+    ]
+
+
+def test_success_response_does_not_confirm_wrong_active_position_leverage() -> None:
+    class ActivePositionClient(SequenceUpdateClient):
+        async def account_state(self, address=None, dex=""):
+            return {
+                "assetPositions": [
+                    {
+                        "position": {
+                            "coin": "CL",
+                            "szi": "1",
+                            "leverage": {"type": "isolated", "value": 4},
+                        }
+                    }
+                ]
+            }
+
+    db = FakeDb()
+    client = ActivePositionClient(
+        universe=[{"name": "CL", "maxLeverage": 20}],
+        responses=[
+            {"status": "err", "response": "Cross margin is not allowed for this asset."},
+            {"status": "ok"},
+        ],
+    )
+
+    result = asyncio.run(
+        ensure_hyperliquid_market_risk_settings(
+            db=db,
+            client=client,
+            settings=settings(),
+            account_address="0x" + "5" * 40,
+            dex="xyz",
+            canonical_coin_value="xyz:CL",
+            action_type="OPEN",
+        )
+    )
+
+    assert result.is_ok is False
+    assert result.status == STATUS_FAILED
+    assert result.reason_code == REASON_LEVERAGE_NOT_CONFIRMED
+
+
+def test_active_isolated_only_position_is_topped_up_to_one_x() -> None:
+    class ActiveIsolatedOnlyClient(AssetAwareClient):
+        def __init__(self):
+            super().__init__(
+                universe=[
+                    {
+                        "name": "EWY",
+                        "maxLeverage": 20,
+                        "marginMode": "noCross",
+                        "onlyIsolated": True,
+                    }
+                ]
+            )
+            self.topped_up = False
+            self.top_ups = []
+
+        async def update_leverage(self, *, coin, leverage, is_cross, asset_id=None):
+            self.updates.append(
+                {"coin": coin, "leverage": leverage, "is_cross": is_cross, "asset_id": asset_id}
+            )
+            return {
+                "status": "err",
+                "response": (
+                    "Isolated position does not have sufficient margin available to decrease leverage. "
+                    "To decrease leverage, add margin to the position."
+                ),
+            }
+
+        async def top_up_isolated_only_margin(self, *, coin, leverage, asset_id=None):
+            self.top_ups.append({"coin": coin, "leverage": leverage, "asset_id": asset_id})
+            self.topped_up = True
+            return {"status": "ok", "response": {"type": "default"}}
+
+        async def account_state(self, address=None, dex=""):
+            return {
+                "assetPositions": [
+                    {
+                        "position": {
+                            "coin": "EWY",
+                            "szi": "8.061",
+                            "leverage": {
+                                "type": "isolated",
+                                "value": 1 if self.topped_up else 4,
+                            },
+                        }
+                    }
+                ]
+            }
+
+    row = MarketRiskSetting(
+        execution_venue="HYPERLIQUID",
+        account_address=("0x" + "5" * 40).lower(),
+        dex="xyz",
+        canonical_coin="xyz:EWY",
+        asset_id=47,
+        desired_margin_mode=FALLBACK_MARGIN_MODE,
+        desired_leverage=4,
+        market_max_leverage=20,
+        status=STATUS_NEEDS_REFRESH,
+    )
+    db = FakeDb(row)
+    client = ActiveIsolatedOnlyClient()
+
+    result = asyncio.run(
+        ensure_hyperliquid_market_risk_settings(
+            db=db,
+            client=client,
+            settings=settings(),
+            account_address="0x" + "5" * 40,
+            dex="xyz",
+            canonical_coin_value="xyz:EWY",
+            action_type="OPEN",
+            force_refresh=True,
+        )
+    )
+
+    assert result.is_ok is True
+    assert result.status == STATUS_CONFIRMED
+    assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
+    assert result.actual_leverage == 1
+    assert client.updates == [
+        {"coin": "xyz:EWY", "leverage": 1, "is_cross": False, "asset_id": 47}
+    ]
+    assert client.top_ups == [{"coin": "xyz:EWY", "leverage": 1, "asset_id": 47}]
+
+
+def test_active_no_cross_position_adds_margin_then_sets_one_x() -> None:
+    class ActiveNoCrossClient(AssetAwareClient):
+        def __init__(self):
+            super().__init__(
+                universe=[
+                    {
+                        "name": "EWY",
+                        "maxLeverage": 20,
+                        "marginMode": "noCross",
+                        "onlyIsolated": True,
+                    }
+                ]
+            )
+            self.update_count = 0
+            self.top_ups = []
+            self.margin_additions = []
+
+        async def update_leverage(self, *, coin, leverage, is_cross, asset_id=None):
+            self.update_count += 1
+            self.updates.append(
+                {"coin": coin, "leverage": leverage, "is_cross": is_cross, "asset_id": asset_id}
+            )
+            if self.update_count == 1:
+                return {
+                    "status": "err",
+                    "response": (
+                        "Isolated position does not have sufficient margin available to decrease leverage. "
+                        "To decrease leverage, add margin to the position."
+                    ),
+                }
+            return {"status": "ok", "response": {"type": "default"}}
+
+        async def top_up_isolated_only_margin(self, *, coin, leverage, asset_id=None):
+            self.top_ups.append({"coin": coin, "leverage": leverage, "asset_id": asset_id})
+            return {"status": "err", "response": "Asset not strict isolated"}
+
+        async def add_isolated_margin(self, *, coin, amount, asset_id=None):
+            self.margin_additions.append({"coin": coin, "amount": amount, "asset_id": asset_id})
+            return {"status": "ok", "response": {"type": "default"}}
+
+        async def account_state(self, address=None, dex=""):
+            return {
+                "assetPositions": [
+                    {
+                        "position": {
+                            "coin": "EWY",
+                            "szi": "8",
+                            "positionValue": "1400",
+                            "marginUsed": "350",
+                            "leverage": {
+                                "type": "isolated",
+                                "value": 1 if self.update_count > 1 else 4,
+                            },
+                        }
+                    }
+                ]
+            }
+
+    row = MarketRiskSetting(
+        execution_venue="HYPERLIQUID",
+        account_address=("0x" + "5" * 40).lower(),
+        dex="xyz",
+        canonical_coin="xyz:EWY",
+        asset_id=47,
+        desired_margin_mode=FALLBACK_MARGIN_MODE,
+        desired_leverage=4,
+        market_max_leverage=20,
+        status=STATUS_NEEDS_REFRESH,
+    )
+    db = FakeDb(row)
+    client = ActiveNoCrossClient()
+
+    result = asyncio.run(
+        ensure_hyperliquid_market_risk_settings(
+            db=db,
+            client=client,
+            settings=settings(),
+            account_address="0x" + "5" * 40,
+            dex="xyz",
+            canonical_coin_value="xyz:EWY",
+            action_type="OPEN",
+            force_refresh=True,
+        )
+    )
+
+    assert result.is_ok is True
+    assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
+    assert result.actual_leverage == 1
+    assert len(client.updates) == 2
+    assert client.top_ups == [{"coin": "xyz:EWY", "leverage": 1, "asset_id": 47}]
+    assert client.margin_additions == [
+        {"coin": "xyz:EWY", "amount": Decimal("1057.000"), "asset_id": 47}
     ]
 
 
@@ -452,7 +735,7 @@ def test_stale_confirmed_cache_refreshes_before_open() -> None:
     assert client.updates == [{"coin": "BTC", "leverage": 10, "is_cross": True}]
 
 
-def test_existing_market_leverage_override_survives_prepare_refresh() -> None:
+def test_legacy_isolated_market_override_is_reduced_to_one_x_on_refresh() -> None:
     row = MarketRiskSetting(
         execution_venue="HYPERLIQUID",
         account_address=("0x" + "5" * 40).lower(),
@@ -468,7 +751,16 @@ def test_existing_market_leverage_override_survives_prepare_refresh() -> None:
         last_confirmed_at=datetime.now(timezone.utc),
     )
     db = FakeDb(row)
-    client = FakeClient(universe=[{"name": "CL", "maxLeverage": 20}])
+    client = FakeClient(
+        universe=[
+            {
+                "name": "CL",
+                "maxLeverage": 20,
+                "marginMode": "noCross",
+                "onlyIsolated": True,
+            }
+        ]
+    )
 
     result = asyncio.run(
         ensure_hyperliquid_market_risk_settings(
@@ -485,12 +777,54 @@ def test_existing_market_leverage_override_survives_prepare_refresh() -> None:
     )
 
     assert result.is_ok is True
-    assert result.desired_leverage == 4
-    assert result.effective_leverage == 4
+    assert result.desired_leverage == 1
+    assert result.effective_leverage == 1
     assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
-    assert result.actual_leverage == 4
-    assert db.row.desired_leverage == 4
-    assert client.updates == [{"coin": "xyz:CL", "leverage": 4, "is_cross": False}]
+    assert result.actual_leverage == 1
+    assert db.row.desired_leverage == 1
+    assert client.updates == [{"coin": "xyz:CL", "leverage": 1, "is_cross": False}]
+
+
+def test_stale_isolated_row_migrates_to_cross_market_maximum_when_meta_allows_cross() -> None:
+    row = MarketRiskSetting(
+        execution_venue="HYPERLIQUID",
+        account_address=("0x" + "5" * 40).lower(),
+        dex="",
+        canonical_coin="SOL",
+        desired_margin_mode=FALLBACK_MARGIN_MODE,
+        desired_leverage=1,
+        market_max_leverage=20,
+        effective_leverage=1,
+        actual_margin_mode=FALLBACK_MARGIN_MODE,
+        actual_leverage=1,
+        status=STATUS_CONFIRMED,
+        last_confirmed_at=datetime.now(timezone.utc),
+    )
+    db = FakeDb(row)
+    client = FakeClient(universe=[{"name": "SOL", "maxLeverage": 20}])
+
+    result = asyncio.run(
+        ensure_hyperliquid_market_risk_settings(
+            db=db,
+            client=client,
+            settings=settings(),
+            account_address="0x" + "5" * 40,
+            dex="",
+            canonical_coin_value="SOL",
+            market_max_leverage=20,
+            market_only_isolated=False,
+            desired_default_leverage=20,
+            action_type="PREPARE_OPEN",
+        )
+    )
+
+    assert result.is_ok is True
+    assert result.desired_margin_mode == DESIRED_MARGIN_MODE
+    assert result.desired_leverage == 20
+    assert result.effective_leverage == 20
+    assert result.actual_margin_mode == DESIRED_MARGIN_MODE
+    assert result.actual_leverage == 20
+    assert client.updates == [{"coin": "SOL", "leverage": 20, "is_cross": True}]
 
 
 def test_low_latency_submit_can_reuse_stale_confirmed_cache() -> None:
@@ -662,8 +996,8 @@ def test_follower_migration_seeds_risk_templates_without_reusing_old_confirmatio
     assert btc.actual_margin_mode is None
     assert btc.actual_leverage is None
     assert cl.desired_margin_mode == FALLBACK_MARGIN_MODE
-    assert cl.desired_leverage == 4
-    assert cl.effective_leverage == 4
+    assert cl.desired_leverage == 1
+    assert cl.effective_leverage == 1
     assert cl.status == STATUS_NEEDS_REFRESH
     assert cl.actual_margin_mode is None
 
@@ -723,7 +1057,7 @@ def test_follower_migration_confirms_seeded_risk_templates_for_new_account() -> 
     assert payload["blockers"] == []
     assert client.updates == [
         {"coin": "BTC", "leverage": 10, "is_cross": True},
-        {"coin": "xyz:CL", "leverage": 4, "is_cross": False},
+        {"coin": "xyz:CL", "leverage": 1, "is_cross": False},
     ]
     btc, cl = db.added
     assert btc.status == STATUS_CONFIRMED
@@ -731,4 +1065,4 @@ def test_follower_migration_confirms_seeded_risk_templates_for_new_account() -> 
     assert btc.actual_leverage == 10
     assert cl.status == STATUS_CONFIRMED
     assert cl.actual_margin_mode == FALLBACK_MARGIN_MODE
-    assert cl.actual_leverage == 4
+    assert cl.actual_leverage == 1

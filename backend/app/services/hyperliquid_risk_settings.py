@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
     LatestAccountPosition,
@@ -14,16 +16,22 @@ from app.models import (
     LeaderPositionAllocationRecord,
     LeaderPositionBaseline,
     MarketRiskSetting,
+    SignerNonceState,
 )
 from app.services.baseline import BASELINE_WAIT_UNTIL_FLAT
 from app.services.execution_router import ExecutionVenue
 from app.services.hyperliquid_dex import canonical_coin, dex_display_name, mask_address, parse_coin
-from app.services.hyperliquid_execution import build_hyperliquid_leverage_plan, resolve_asset_id_from_meta
+from app.services.hyperliquid_execution import (
+    FORCED_ONE_X_MARKETS,
+    ISOLATED_ONLY_LEVERAGE,
+    build_hyperliquid_leverage_plan,
+    resolve_asset_id_from_meta,
+)
 from app.services.leader_config import active_leaders_statement, is_coin_allowed, normalize_leader_address
 
 DESIRED_MARGIN_MODE = "CROSS"
 FALLBACK_MARGIN_MODE = "ISOLATED"
-ISOLATED_MAX_LEVERAGE = 4
+ISOLATED_MAX_LEVERAGE = ISOLATED_ONLY_LEVERAGE
 STATUS_UNKNOWN = "UNKNOWN"
 STATUS_SETTING = "SETTING"
 STATUS_CONFIRMED = "CONFIRMED"
@@ -114,11 +122,30 @@ def effective_leverage_for_market(
     return min(int(desired_default_leverage), max_leverage)
 
 
-def desired_leverage_for_margin_mode(desired_default_leverage: int, margin_mode: str | None) -> int:
+def desired_leverage_for_margin_mode(
+    desired_default_leverage: int,
+    margin_mode: str | None,
+    *,
+    canonical_coin_value: str | None = None,
+) -> int:
     desired = int(desired_default_leverage or 10)
-    if _normalize_margin_mode(margin_mode) == FALLBACK_MARGIN_MODE:
+    if one_x_leverage_required(
+        margin_mode=margin_mode,
+        canonical_coin_value=canonical_coin_value,
+    ):
         return min(desired, ISOLATED_MAX_LEVERAGE)
     return desired
+
+
+def one_x_leverage_required(
+    *,
+    margin_mode: str | None,
+    canonical_coin_value: str | None,
+) -> bool:
+    return (
+        _normalize_margin_mode(margin_mode) == FALLBACK_MARGIN_MODE
+        or str(canonical_coin_value or "").upper() in FORCED_ONE_X_MARKETS
+    )
 
 
 def effective_leverage_for_margin_mode(
@@ -126,9 +153,26 @@ def effective_leverage_for_margin_mode(
     *,
     desired_default_leverage: int = 10,
     margin_mode: str | None = None,
+    canonical_coin_value: str | None = None,
 ) -> int | None:
-    desired = desired_leverage_for_margin_mode(desired_default_leverage, margin_mode)
+    desired = desired_leverage_for_margin_mode(
+        desired_default_leverage,
+        margin_mode,
+        canonical_coin_value=canonical_coin_value,
+    )
     return effective_leverage_for_market(market_max_leverage, desired_default_leverage=desired)
+
+
+def market_requires_isolated_margin(market_meta: dict[str, Any] | None) -> bool:
+    if not isinstance(market_meta, dict):
+        return False
+    only_isolated = market_meta.get("onlyIsolated")
+    if isinstance(only_isolated, bool) and only_isolated:
+        return True
+    if str(only_isolated or "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    margin_mode = str(market_meta.get("marginMode") or "").strip().lower()
+    return margin_mode in {"nocross", "no_cross", "isolated", "isolatedonly", "isolated_only"}
 
 
 async def ensure_hyperliquid_market_risk_settings(
@@ -141,6 +185,7 @@ async def ensure_hyperliquid_market_risk_settings(
     canonical_coin_value: str,
     asset_id: int | None = None,
     market_max_leverage: int | str | None = None,
+    market_only_isolated: bool | None = None,
     desired_default_leverage: int = 10,
     action_type: str = "OPEN",
     reduce_only: bool = False,
@@ -161,25 +206,50 @@ async def ensure_hyperliquid_market_risk_settings(
         canonical_coin_value=canonical,
     )
     now = datetime.now(timezone.utc)
-    desired_default = _int_or_none(row.desired_leverage) or requested_default
+    # The caller resolves the current market policy from authoritative exchange
+    # metadata.  Do not let an old persisted target (for example, legacy
+    # isolated 1x on a market that now supports cross margin) override it.
+    desired_default = requested_default
     if not row.desired_margin_mode:
         row.desired_margin_mode = DESIRED_MARGIN_MODE
-    row.desired_leverage = desired_leverage_for_margin_mode(desired_default, row.desired_margin_mode)
     row.asset_id = asset_id if asset_id is not None else row.asset_id
     row.last_checked_at = now
 
     resolved_max = _int_or_none(market_max_leverage) or _int_or_none(row.market_max_leverage)
-    if resolved_max is None or row.asset_id is None:
-        resolved_max, resolved_asset_id = await _load_market_meta(client, dex=parsed.dex, canonical_coin_value=canonical)
-        if resolved_asset_id is not None:
+    resolved_only_isolated = market_only_isolated
+    if resolved_max is None or row.asset_id is None or resolved_only_isolated is None:
+        loaded_max, resolved_asset_id, loaded_only_isolated = await _load_market_meta(
+            client,
+            dex=parsed.dex,
+            canonical_coin_value=canonical,
+        )
+        if row.asset_id is None and resolved_asset_id is not None:
             row.asset_id = resolved_asset_id
         if resolved_max is None:
-            resolved_max = _int_or_none(market_max_leverage) or _int_or_none(row.market_max_leverage)
+            resolved_max = loaded_max or _int_or_none(market_max_leverage) or _int_or_none(row.market_max_leverage)
+        if resolved_only_isolated is None:
+            resolved_only_isolated = loaded_only_isolated
+    if resolved_only_isolated:
+        # Hyperliquid publishes this capability in market metadata. Respecting
+        # it avoids a guaranteed-failing cross-margin action on the first open
+        # and applies the global isolated-only safety rule immediately.
+        row.desired_margin_mode = FALLBACK_MARGIN_MODE
+    elif resolved_only_isolated is False:
+        # Margin capability can change over time.  An explicit current
+        # cross-capable result must retire a stale isolated fallback instead of
+        # preserving it forever.
+        row.desired_margin_mode = DESIRED_MARGIN_MODE
+    row.desired_leverage = desired_leverage_for_margin_mode(
+        desired_default,
+        row.desired_margin_mode,
+        canonical_coin_value=canonical,
+    )
     row.market_max_leverage = resolved_max
     effective = effective_leverage_for_margin_mode(
         resolved_max,
         desired_default_leverage=desired_default,
         margin_mode=row.desired_margin_mode,
+        canonical_coin_value=canonical,
     )
     row.effective_leverage = effective
 
@@ -217,11 +287,16 @@ async def ensure_hyperliquid_market_risk_settings(
     fallback_warning: str | None = None
     primary_failure: Any | None = None
     for margin_mode in _margin_mode_attempts(row.desired_margin_mode):
-        attempt_desired_leverage = desired_leverage_for_margin_mode(desired_default, margin_mode)
+        attempt_desired_leverage = desired_leverage_for_margin_mode(
+            desired_default,
+            margin_mode,
+            canonical_coin_value=canonical,
+        )
         attempt_effective = effective_leverage_for_margin_mode(
             resolved_max,
             desired_default_leverage=desired_default,
             margin_mode=margin_mode,
+            canonical_coin_value=canonical,
         )
         if attempt_effective is None:
             _mark_failed(row, REASON_MAX_LEVERAGE_UNKNOWN, "market max leverage missing or invalid", now=now)
@@ -234,12 +309,14 @@ async def ensure_hyperliquid_market_risk_settings(
                 warning=None if risk_increasing else "risk setting unknown; allowing reduce/close only",
             )
         try:
+            action_nonce = await _allocate_durable_signed_action_nonce(db, client)
             response = await _update_leverage(
                 client,
                 coin=canonical,
                 leverage=attempt_effective,
                 is_cross=_margin_mode_is_cross(margin_mode),
                 asset_id=row.asset_id,
+                nonce=action_nonce,
             )
         except Exception as exc:
             if margin_mode == DESIRED_MARGIN_MODE and _should_try_isolated_fallback(exc):
@@ -257,6 +334,98 @@ async def ensure_hyperliquid_market_risk_settings(
                 warning=None if risk_increasing else message,
             )
 
+        if (
+            not _update_response_confirmed(response)
+            and _normalize_margin_mode(margin_mode) == FALLBACK_MARGIN_MODE
+            and attempt_effective == ISOLATED_ONLY_LEVERAGE
+            and _isolated_margin_top_up_required(response)
+            and hasattr(client, "top_up_isolated_only_margin")
+        ):
+            initial_response = response
+            try:
+                action_nonce = await _allocate_durable_signed_action_nonce(db, client)
+                top_up_response = await _top_up_isolated_only_margin(
+                    client,
+                    coin=canonical,
+                    leverage=attempt_effective,
+                    asset_id=row.asset_id,
+                    nonce=action_nonce,
+                )
+            except Exception as exc:
+                message = f"failed to top up isolated-only margin to {attempt_effective}x: {exc}"
+                _mark_failed(row, REASON_RISK_SETTING_UPDATE_FAILED, message, now=now)
+                await db.flush()
+                return _result_from_row(
+                    row,
+                    is_ok=not risk_increasing,
+                    reason_code=REASON_RISK_SETTING_UPDATE_FAILED,
+                    reason=message,
+                    warning=None if risk_increasing else message,
+                )
+            if (
+                not _update_response_confirmed(top_up_response)
+                and _asset_not_strict_isolated(top_up_response)
+                and hasattr(client, "add_isolated_margin")
+            ):
+                margin_addition = await _isolated_margin_addition_for_target_leverage(
+                    client,
+                    account_address=account,
+                    dex=parsed.dex,
+                    canonical_coin_value=canonical,
+                    leverage=attempt_effective,
+                )
+                if margin_addition is not None and margin_addition > 0:
+                    try:
+                        action_nonce = await _allocate_durable_signed_action_nonce(db, client)
+                        add_margin_response = await _add_isolated_margin(
+                            client,
+                            coin=canonical,
+                            amount=margin_addition,
+                            asset_id=row.asset_id,
+                            nonce=action_nonce,
+                        )
+                        if _update_response_confirmed(add_margin_response):
+                            retry_nonce = await _allocate_durable_signed_action_nonce(db, client)
+                            retry_response = await _update_leverage(
+                                client,
+                                coin=canonical,
+                                leverage=attempt_effective,
+                                is_cross=False,
+                                asset_id=row.asset_id,
+                                nonce=retry_nonce,
+                            )
+                        else:
+                            retry_response = add_margin_response
+                        top_up_response = (
+                            {
+                                "status": "ok",
+                                "response": retry_response,
+                                "no_cross_margin_addition": add_margin_response,
+                            }
+                            if _update_response_confirmed(retry_response)
+                            else retry_response
+                        )
+                    except Exception as exc:
+                        message = f"failed to add isolated margin for {attempt_effective}x: {exc}"
+                        _mark_failed(row, REASON_RISK_SETTING_UPDATE_FAILED, message, now=now)
+                        await db.flush()
+                        return _result_from_row(
+                            row,
+                            is_ok=not risk_increasing,
+                            reason_code=REASON_RISK_SETTING_UPDATE_FAILED,
+                            reason=message,
+                            warning=None if risk_increasing else message,
+                        )
+            response = (
+                {
+                    "initial_update": initial_response,
+                    "isolated_only_margin_top_up": top_up_response,
+                    "status": "ok",
+                }
+                if _update_response_confirmed(top_up_response)
+                else top_up_response
+            )
+
         if not _update_response_confirmed(response):
             if margin_mode == DESIRED_MARGIN_MODE and _should_try_isolated_fallback(response):
                 primary_failure = _mask_response(response)
@@ -269,6 +438,35 @@ async def ensure_hyperliquid_market_risk_settings(
                 row,
                 is_ok=not risk_increasing,
                 reason_code=REASON_CONFIRMATION_UNKNOWN,
+                reason=message,
+                warning=None if risk_increasing else message,
+            )
+
+        active_position_confirmed = await _confirm_active_position_risk_setting(
+            client,
+            account_address=account,
+            dex=parsed.dex,
+            canonical_coin_value=canonical,
+            margin_mode=margin_mode,
+            leverage=attempt_effective,
+        )
+        if active_position_confirmed is False:
+            message = (
+                "exchange accepted leverage update but active position state did not confirm "
+                f"{margin_mode.lower()} {attempt_effective}x"
+            )
+            _mark_failed(
+                row,
+                REASON_LEVERAGE_NOT_CONFIRMED,
+                message,
+                now=now,
+                response=response,
+            )
+            await db.flush()
+            return _result_from_row(
+                row,
+                is_ok=not risk_increasing,
+                reason_code=REASON_LEVERAGE_NOT_CONFIRMED,
                 reason=message,
                 warning=None if risk_increasing else message,
             )
@@ -379,7 +577,9 @@ async def build_market_risk_settings_coverage(
         "leverage_setup_enabled": True,
         "desired_margin_mode": DESIRED_MARGIN_MODE,
         "target_default_leverage": desired_default,
-        "effective_leverage_rule": "min(10, market_max_leverage)",
+        "effective_leverage_rule": (
+            "cross=min(default, market_max_leverage); isolated=1x; xyz:CXMT=1x"
+        ),
         "ttl_seconds": ttl_seconds,
         "markets_confirmed_count": len(confirmed),
         "markets_failed_count": len(failed),
@@ -448,12 +648,17 @@ async def seed_market_risk_settings_for_account_migration(
         desired_margin_mode = _normalize_margin_mode(
             source.desired_margin_mode or source.actual_margin_mode or DESIRED_MARGIN_MODE
         )
-        desired_leverage = _int_or_none(source.desired_leverage) or int(desired_default_leverage or 10)
+        desired_leverage = desired_leverage_for_margin_mode(
+            _int_or_none(source.desired_leverage) or int(desired_default_leverage or 10),
+            desired_margin_mode,
+            canonical_coin_value=canonical,
+        )
         market_max = _int_or_none(source.market_max_leverage)
         effective = effective_leverage_for_margin_mode(
             market_max,
             desired_default_leverage=desired_leverage,
             margin_mode=desired_margin_mode,
+            canonical_coin_value=canonical,
         ) or _int_or_none(source.effective_leverage)
 
         target = target_by_key.get(key)
@@ -872,13 +1077,18 @@ def _risk_setting_key(row: MarketRiskSetting) -> tuple[str, str]:
     return str(parsed.dex or "").lower(), str(canonical or "").upper()
 
 
-async def _load_market_meta(client: Any, *, dex: str, canonical_coin_value: str) -> tuple[int | None, int | None]:
+async def _load_market_meta(
+    client: Any,
+    *,
+    dex: str,
+    canonical_coin_value: str,
+) -> tuple[int | None, int | None, bool | None]:
     try:
         meta = await client.meta(dex)
     except TypeError:
         meta = await client.meta()
     except Exception:
-        return None, None
+        return None, None, None
     parsed_target = parse_coin(canonical_coin_value, default_dex=dex)
     for item in meta.get("universe", []) or []:
         parsed = parse_coin(str(item.get("name", "")), default_dex=dex)
@@ -886,8 +1096,8 @@ async def _load_market_meta(client: Any, *, dex: str, canonical_coin_value: str)
             continue
         max_leverage = _int_or_none(item.get("maxLeverage"))
         asset_id = resolve_asset_id_from_meta(meta, coin=parsed.coin, dex=dex)
-        return max_leverage, asset_id
-    return None, None
+        return max_leverage, asset_id, market_requires_isolated_margin(item)
+    return None, None, None
 
 
 def _confirmed_cache_fresh(
@@ -940,15 +1150,208 @@ async def _update_leverage(
     leverage: int,
     is_cross: bool,
     asset_id: int | None,
+    nonce: int | None = None,
 ) -> Any:
-    if asset_id is None:
-        return await client.update_leverage(coin=coin, leverage=leverage, is_cross=is_cross)
+    kwargs = {"coin": coin, "leverage": leverage, "is_cross": is_cross}
+    if asset_id is not None:
+        kwargs["asset_id"] = asset_id
+    if nonce is not None:
+        kwargs["nonce"] = nonce
+    return await _call_with_optional_action_kwargs(
+        client.update_leverage,
+        kwargs,
+    )
+
+
+async def _top_up_isolated_only_margin(
+    client: Any,
+    *,
+    coin: str,
+    leverage: int,
+    asset_id: int | None,
+    nonce: int | None = None,
+) -> Any:
+    kwargs = {"coin": coin, "leverage": leverage}
+    if asset_id is not None:
+        kwargs["asset_id"] = asset_id
+    if nonce is not None:
+        kwargs["nonce"] = nonce
+    return await _call_with_optional_action_kwargs(
+        client.top_up_isolated_only_margin,
+        kwargs,
+    )
+
+
+async def _add_isolated_margin(
+    client: Any,
+    *,
+    coin: str,
+    amount: Decimal,
+    asset_id: int | None,
+    nonce: int | None = None,
+) -> Any:
+    kwargs = {"coin": coin, "amount": amount}
+    if asset_id is not None:
+        kwargs["asset_id"] = asset_id
+    if nonce is not None:
+        kwargs["nonce"] = nonce
+    return await _call_with_optional_action_kwargs(
+        client.add_isolated_margin,
+        kwargs,
+    )
+
+
+async def _call_with_optional_action_kwargs(method: Any, kwargs: dict[str, Any]) -> Any:
+    remaining = dict(kwargs)
+    for _attempt in range(3):
+        try:
+            return await method(**remaining)
+        except TypeError as exc:
+            message = str(exc)
+            removed = False
+            for key in ("nonce", "asset_id"):
+                if key in remaining and key in message:
+                    remaining.pop(key, None)
+                    removed = True
+            if not removed:
+                raise
+    return await method(**remaining)
+
+
+async def _allocate_durable_signed_action_nonce(db: Any, client: Any) -> int | None:
+    """Join non-order signed actions to the same cross-process nonce ledger.
+
+    A master API wallet can sign for both the master and its subaccounts, but
+    Hyperliquid tracks the nonce by signer.  Without this database allocation,
+    simultaneous first-market leverage setup in two watcher processes could
+    reuse one millisecond nonce even though their positions are isolated.
+    """
+    signer_scope = str(getattr(client, "signer_scope", "") or "")
+    if not signer_scope or not isinstance(db, AsyncSession):
+        return None
+    now = datetime.now(timezone.utc)
+    nonce_floor = int(now.timestamp() * 1000)
+    statement = pg_insert(SignerNonceState).values(
+        signer_scope=signer_scope,
+        last_nonce=nonce_floor,
+        updated_at=now,
+    )
+    allocated = await db.scalar(
+        statement.on_conflict_do_update(
+            index_elements=[SignerNonceState.signer_scope],
+            set_={
+                "last_nonce": func.greatest(
+                    SignerNonceState.last_nonce + 1,
+                    nonce_floor,
+                ),
+                "updated_at": now,
+            },
+        ).returning(SignerNonceState.last_nonce)
+    )
+    if allocated is None:
+        raise RuntimeError("database did not allocate a signed-action nonce")
+    nonce = int(allocated)
+    reserve = getattr(client, "reserve_action_nonce_at_least", None)
+    if callable(reserve):
+        nonce = int(reserve(nonce))
+        await db.execute(
+            update(SignerNonceState)
+            .where(SignerNonceState.signer_scope == signer_scope)
+            .values(
+                last_nonce=func.greatest(SignerNonceState.last_nonce, nonce),
+                updated_at=now,
+            )
+        )
+    return nonce
+
+
+async def _isolated_margin_addition_for_target_leverage(
+    client: Any,
+    *,
+    account_address: str,
+    dex: str,
+    canonical_coin_value: str,
+    leverage: int,
+) -> Decimal | None:
+    if not hasattr(client, "account_state") or leverage <= 0:
+        return None
     try:
-        return await client.update_leverage(coin=coin, leverage=leverage, is_cross=is_cross, asset_id=asset_id)
-    except TypeError as exc:
-        if "asset_id" not in str(exc):
-            raise
-        return await client.update_leverage(coin=coin, leverage=leverage, is_cross=is_cross)
+        try:
+            state = await client.account_state(address=account_address, dex=dex)
+        except TypeError:
+            state = await client.account_state(account_address, dex=dex)
+    except Exception:
+        return None
+    expected = parse_coin(canonical_coin_value, default_dex=dex)
+    for item in (state or {}).get("assetPositions", []) or []:
+        position = item.get("position", item)
+        parsed = parse_coin(str(position.get("coin") or ""), default_dex=dex)
+        if parsed.canonical_coin != expected.canonical_coin:
+            continue
+        size = _decimal_or_none(position.get("szi") or position.get("size"))
+        position_value = _decimal_or_none(position.get("positionValue") or position.get("notional"))
+        margin_used = _decimal_or_none(position.get("marginUsed"))
+        if (
+            size is None
+            or abs(size) <= Decimal("0.00000001")
+            or position_value is None
+            or margin_used is None
+        ):
+            return None
+        target_margin = abs(position_value) / Decimal(leverage)
+        shortfall = max(Decimal("0"), target_margin - margin_used)
+        # Protect against mark-price movement between the state read and the
+        # signed margin action. Extra isolated margin only lowers liquidation risk.
+        price_buffer = max(Decimal("1"), target_margin * Decimal("0.005"))
+        return shortfall + price_buffer
+    return None
+
+
+async def _confirm_active_position_risk_setting(
+    client: Any,
+    *,
+    account_address: str,
+    dex: str,
+    canonical_coin_value: str,
+    margin_mode: str,
+    leverage: int,
+) -> bool | None:
+    if not hasattr(client, "account_state"):
+        return None
+    expected = parse_coin(canonical_coin_value, default_dex=dex)
+    observed_active = False
+    for attempt in range(3):
+        try:
+            try:
+                state = await client.account_state(address=account_address, dex=dex)
+            except TypeError:
+                try:
+                    state = await client.account_state(account_address, dex=dex)
+                except TypeError:
+                    state = await client.account_state(dex=dex)
+        except Exception:
+            return None
+        for item in (state or {}).get("assetPositions", []) or []:
+            position = item.get("position", item)
+            parsed = parse_coin(str(position.get("coin") or ""), default_dex=dex)
+            if parsed.canonical_coin != expected.canonical_coin:
+                continue
+            size = _decimal_or_none(position.get("szi") or position.get("size"))
+            if size is None or abs(size) <= Decimal("0.00000001"):
+                continue
+            observed_active = True
+            payload = position.get("leverage") or {}
+            observed_mode = _normalize_margin_mode(
+                payload.get("type") if isinstance(payload, dict) else None
+            )
+            observed_leverage = _int_or_none(
+                payload.get("value") if isinstance(payload, dict) else None
+            )
+            if observed_mode == _normalize_margin_mode(margin_mode) and observed_leverage == leverage:
+                return True
+        if observed_active and attempt < 2:
+            await asyncio.sleep(0.05)
+    return False if observed_active else None
 
 
 def _normalize_margin_mode(value: str | None) -> str:
@@ -976,6 +1379,19 @@ def _invalid_leverage_value(value: Any) -> bool:
     if isinstance(value, dict):
         text = str(_mask_response(value)).lower()
     return "invalid leverage value" in text
+
+
+def _isolated_margin_top_up_required(value: Any) -> bool:
+    text = str(_mask_response(value) if isinstance(value, dict) else value).lower()
+    return (
+        "isolated position does not have sufficient margin available to decrease leverage" in text
+        or ("decrease leverage" in text and "add margin to the position" in text)
+    )
+
+
+def _asset_not_strict_isolated(value: Any) -> bool:
+    text = str(_mask_response(value) if isinstance(value, dict) else value).lower()
+    return "asset not strict isolated" in text
 
 
 def _should_try_isolated_fallback(value: Any) -> bool:
@@ -1046,7 +1462,6 @@ def _coverage_row(
     now = datetime.now(timezone.utc)
     status = row.status if row else STATUS_UNKNOWN
     last_confirmed_at = row.last_confirmed_at if row else None
-    cache_stale = bool(status == STATUS_CONFIRMED and (last_confirmed_at is None or last_confirmed_at < now - timedelta(seconds=ttl_seconds)))
     dex = (item or {}).get("dex") if item else row.dex
     canonical = (item or {}).get("canonical_coin") if item else row.canonical_coin
     max_leverage = (item or {}).get("market_max_leverage") if item else row.market_max_leverage
@@ -1054,7 +1469,26 @@ def _coverage_row(
         max_leverage = row.market_max_leverage
     desired_margin_mode = row.desired_margin_mode if row and row.desired_margin_mode else DESIRED_MARGIN_MODE
     raw_desired_leverage = _int_or_none(row.desired_leverage if row else None) or desired_default
-    desired_leverage = desired_leverage_for_margin_mode(raw_desired_leverage, desired_margin_mode)
+    desired_leverage = desired_leverage_for_margin_mode(
+        raw_desired_leverage,
+        desired_margin_mode,
+        canonical_coin_value=canonical,
+    )
+    policy_effective_leverage = effective_leverage_for_margin_mode(
+        max_leverage,
+        desired_default_leverage=desired_leverage,
+        margin_mode=desired_margin_mode,
+        canonical_coin_value=canonical,
+    )
+    cache_stale = bool(
+        status == STATUS_CONFIRMED
+        and (
+            last_confirmed_at is None
+            or last_confirmed_at < now - timedelta(seconds=ttl_seconds)
+            or policy_effective_leverage is None
+            or _int_or_none(row.actual_leverage if row else None) != policy_effective_leverage
+        )
+    )
     return {
         "dex": dex,
         "dex_display_name": dex_display_name(dex),
@@ -1063,12 +1497,7 @@ def _coverage_row(
         "desired_margin_mode": desired_margin_mode,
         "desired_leverage": desired_leverage,
         "market_max_leverage": max_leverage,
-        "effective_leverage": (row.effective_leverage if row else None)
-        or effective_leverage_for_margin_mode(
-            max_leverage,
-            desired_default_leverage=desired_leverage,
-            margin_mode=desired_margin_mode,
-        ),
+        "effective_leverage": policy_effective_leverage,
         "actual_margin_mode": row.actual_margin_mode if row else None,
         "actual_leverage": row.actual_leverage if row else None,
         "status": STATUS_NEEDS_REFRESH if cache_stale else status,
@@ -1111,6 +1540,13 @@ def _int_or_none(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return result if result > 0 else None
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    try:
+        return Decimal(str(value))
+    except (TypeError, ValueError, ArithmeticError):
+        return None
 
 
 def _max_leverage_from_position(position: LatestAccountPosition) -> int | None:

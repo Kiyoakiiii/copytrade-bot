@@ -5,8 +5,10 @@ import { useParams } from "next/navigation";
 import { RefreshCw } from "lucide-react";
 import { AppShell } from "@/components/AppShell";
 import { Header } from "@/components/Header";
+import { LeaderPerformanceDetailPanel, type SingleLeaderPerformance } from "@/components/LeaderPerformance";
 import { apiFetch } from "@/lib/api";
 import { copyStatusTone, effectiveCopyReason, effectiveCopyStatus, effectiveCopyable } from "@/lib/copyStatus";
+import { leaderDisplayLabel } from "@/lib/leaderIdentity";
 import { useDashboardStream, useRealtimeFallbackPolling } from "@/lib/realtime";
 import {
   formatAge as formatAgeLabel,
@@ -137,13 +139,21 @@ type SizingBreakdown = {
 export default function LeaderDetailPage() {
   const params = useParams<{ id: string }>();
   const [data, setData] = useState<LeaderDetail | null>(null);
+  const [performance, setPerformance] = useState<SingleLeaderPerformance | null>(null);
   const [error, setError] = useState("");
   const [lastRefreshedAt, setLastRefreshedAt] = useState<string | null>(null);
 
-  async function load() {
+  async function load(options?: { includePerformance?: boolean }) {
     setError("");
     try {
-      setData(await apiFetch<LeaderDetail>(`/account-states/leaders/${params.id}`));
+      const [detail, performancePayload] = await Promise.all([
+        apiFetch<LeaderDetail>(`/account-states/leaders/${params.id}`),
+        options?.includePerformance
+          ? apiFetch<SingleLeaderPerformance>(`/leaders/${params.id}/performance`).catch(() => null)
+          : Promise.resolve(undefined),
+      ]);
+      setData(detail);
+      if (performancePayload !== undefined) setPerformance(performancePayload);
       setLastRefreshedAt(new Date().toISOString());
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed");
@@ -159,14 +169,14 @@ export default function LeaderDetailPage() {
   });
 
   useEffect(() => {
-    load();
+    load({ includePerformance: true });
   }, [params.id]);
   useRealtimeFallbackPolling(realtime, load);
 
   return (
     <AppShell>
       <Header
-        title="Leader Detail"
+        title={data ? `${leaderDisplayLabel(data.leader.leader_address)} Detail` : "Leader Detail"}
         right={
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-slate-500">
@@ -175,7 +185,7 @@ export default function LeaderDetailPage() {
             <span className={realtime.connected ? "rounded-md border border-green-200 bg-green-50 px-2 py-1 text-xs text-accent" : "rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-warn"}>
               realtime mode: {realtime.mode}
             </span>
-            <button className="btn btn-muted" type="button" onClick={load}>
+            <button className="btn btn-muted" type="button" onClick={() => load({ includePerformance: true })}>
               <RefreshCw className="h-4 w-4" />
               Refresh
             </button>
@@ -187,7 +197,8 @@ export default function LeaderDetailPage() {
         <>
           <section className="panel mb-4 overflow-hidden">
             <div className="border-b border-line px-4 py-3">
-              <div className="truncate font-mono text-xs">{data.leader.leader_address}</div>
+              <div className="text-sm font-semibold">{leaderDisplayLabel(data.leader.leader_address)}</div>
+              <div className="mt-1 break-all font-mono text-xs text-slate-500">{data.leader.leader_address}</div>
               <div className="mt-1 text-xs text-slate-500">
                 {data.leader.enabled ? "enabled" : "disabled"} / {data.watcher_status} / {data.leader.preferred_venue} / {data.leader.allowed_coins_mode}
               </div>
@@ -206,6 +217,8 @@ export default function LeaderDetailPage() {
             </div>
             {data.error_message ? <div className="border-t border-line px-4 py-3 text-sm text-danger">{data.error_message}</div> : null}
           </section>
+
+          <LeaderPerformanceDetailPanel performance={performance?.leader ?? null} />
 
           <section className="panel mb-4 overflow-hidden">
             <div className="border-b border-line px-4 py-3 text-sm font-semibold">Leader Positions</div>

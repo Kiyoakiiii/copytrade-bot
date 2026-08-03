@@ -39,6 +39,7 @@ ALLOCATION_TRANSITION_TOLERANCE = Decimal("0.00000001")
 ALLOCATION_DUST_LIFECYCLE_NOTIONAL = Decimal("10")
 LEGACY_SIZE_MISSING_NOTIONAL_RATIO_FALLBACK = "LEGACY_SIZE_MISSING_NOTIONAL_RATIO_FALLBACK"
 MAX_POSITION_NOTIONAL_CAP_APPLIED = "MAX_POSITION_NOTIONAL_CAP_APPLIED"
+MAX_POSITION_NOTIONAL_CAP_EXCEEDED = "MAX_POSITION_NOTIONAL_CAP_EXCEEDED"
 DUST_LIFECYCLE_ACCOUNT_RATIO_RESET = "DUST_LIFECYCLE_ACCOUNT_RATIO_RESET"
 
 
@@ -232,15 +233,11 @@ def plan_leader_allocation_transition(
             copy_multiplier=copy_multiplier,
         )
         target_before_cap = target
-        target, cap, cap_applied = _cap_target_notional(target, max_position_notional)
+        cap = _positive_position_cap(max_position_notional)
         if cap is not None:
             formula_inputs["max_position_notional_cap"] = str(cap)
             formula_inputs["target_notional_before_cap"] = str(target_before_cap)
-        if cap_applied:
-            formula_inputs["warnings"].append(MAX_POSITION_NOTIONAL_CAP_APPLIED)
-            formula_inputs["risk_cap_formula"] = (
-                "target_notional = min(account_ratio_target_notional, max_position_notional_cap)"
-            )
+            formula_inputs["position_cap_policy"] = "REJECT_WHOLE_OPEN_OR_INCREASE"
         formula_inputs["target_notional"] = str(target)
 
     if old_side and old_side != new_side:
@@ -264,6 +261,16 @@ def plan_leader_allocation_transition(
                 new_side=new_side,
                 current_notional=current_notional,
                 reason=account_value_block_reason,
+                formula_inputs=formula_inputs,
+            )
+        if _position_cap_exceeded(target, max_position_notional):
+            return _position_cap_block_transition(
+                old_side=old_side,
+                new_side=new_side,
+                current_notional=current_notional,
+                attempted_target=target,
+                max_position_notional=max_position_notional,
+                operation="flip open",
                 formula_inputs=formula_inputs,
             )
         return _transition(
@@ -306,6 +313,16 @@ def plan_leader_allocation_transition(
             )
         delta = target - current_notional
         if delta > ALLOCATION_TRANSITION_TOLERANCE:
+            if _position_cap_exceeded(target, max_position_notional):
+                return _position_cap_block_transition(
+                    old_side=old_side,
+                    new_side=new_side,
+                    current_notional=current_notional,
+                    attempted_target=target,
+                    max_position_notional=max_position_notional,
+                    operation="dust lifecycle open/increase",
+                    formula_inputs=formula_inputs,
+                )
             return _transition(
                 AllocationTransitionAction.INCREASE if active_current else AllocationTransitionAction.OPEN,
                 old_side,
@@ -354,19 +371,13 @@ def plan_leader_allocation_transition(
             incremental_delta = max(Decimal("0"), incremental_delta - pending_reduce_offset)
             increase_qty = max(Decimal("0"), increase_qty - pending_reduce_offset_qty)
         target_before_increment_cap = current_notional + incremental_delta
-        target, cap, cap_applied = _cap_target_notional(target_before_increment_cap, max_position_notional)
+        target = target_before_increment_cap
+        cap = _positive_position_cap(max_position_notional)
         delta = target - current_notional
-        if cap_applied and target_before_increment_cap > current_notional + ALLOCATION_TRANSITION_TOLERANCE:
-            increase_qty = _q(increase_qty * max(Decimal("0"), delta / (target_before_increment_cap - current_notional)))
         if cap is not None:
             formula_inputs["max_position_notional_cap"] = str(cap)
             formula_inputs["target_notional_before_cap"] = str(target_before_increment_cap)
-        if cap_applied and MAX_POSITION_NOTIONAL_CAP_APPLIED not in formula_inputs["warnings"]:
-            formula_inputs["warnings"].append(MAX_POSITION_NOTIONAL_CAP_APPLIED)
-            formula_inputs["risk_cap_formula"] = (
-                "target_notional = min(current_allocation_notional + proportional_increase_target_notional, "
-                "max_position_notional_cap)"
-            )
+            formula_inputs["position_cap_policy"] = "REJECT_WHOLE_OPEN_OR_INCREASE"
         formula_inputs["target_notional"] = str(target)
         formula_inputs["increase_formula"] = (
             "same-side increase uses leader position-size increase ratio inside the current allocation lifecycle; "
@@ -382,6 +393,16 @@ def plan_leader_allocation_transition(
         if increment_source == "leader_position_notional":
             formula_inputs["warnings"].append(LEGACY_SIZE_MISSING_NOTIONAL_RATIO_FALLBACK)
         if delta > ALLOCATION_TRANSITION_TOLERANCE:
+            if _position_cap_exceeded(target, max_position_notional):
+                return _position_cap_block_transition(
+                    old_side=old_side,
+                    new_side=new_side,
+                    current_notional=current_notional,
+                    attempted_target=target,
+                    max_position_notional=max_position_notional,
+                    operation="same-side increase",
+                    formula_inputs=formula_inputs,
+                )
             return _transition(
                 AllocationTransitionAction.INCREASE if active_current else AllocationTransitionAction.OPEN,
                 old_side,
@@ -419,7 +440,7 @@ def plan_leader_allocation_transition(
             Decimal("0"),
             Decimal("0"),
             False,
-            "same-side leader add is at or above cap / inside tolerance",
+            "same-side leader add is inside tolerance",
             formula_inputs,
         )
 
@@ -447,6 +468,16 @@ def plan_leader_allocation_transition(
                 reason=account_value_block_reason,
                 formula_inputs=formula_inputs,
             )
+        if _position_cap_exceeded(target, max_position_notional):
+            return _position_cap_block_transition(
+                old_side=old_side,
+                new_side=new_side,
+                current_notional=current_notional,
+                attempted_target=target,
+                max_position_notional=max_position_notional,
+                operation="open",
+                formula_inputs=formula_inputs,
+            )
         return _transition(
             AllocationTransitionAction.OPEN,
             old_side,
@@ -471,17 +502,11 @@ def plan_leader_allocation_transition(
     )
     if proportional_reduce is not None:
         target, close_qty_limit, remaining_ratio, ratio_source = proportional_reduce
-        target, cap, cap_applied = _cap_target_notional(target, max_position_notional)
         delta = target - current_notional
+        cap = _positive_position_cap(max_position_notional)
         if cap is not None:
             formula_inputs["max_position_notional_cap"] = str(cap)
-        if cap_applied:
-            close_qty_limit = _close_qty_limit_for_delta(abs(delta), current_allocation)
-            if MAX_POSITION_NOTIONAL_CAP_APPLIED not in formula_inputs["warnings"]:
-                formula_inputs["warnings"].append(MAX_POSITION_NOTIONAL_CAP_APPLIED)
-            formula_inputs["risk_cap_formula"] = (
-                "target_notional = min(proportional_reduce_target_notional, max_position_notional_cap)"
-            )
+            formula_inputs["position_cap_policy"] = "OPEN_INCREASE_ONLY_REDUCE_CLOSE_EXEMPT"
         formula_inputs["target_notional"] = str(target)
         formula_inputs["reduce_formula"] = (
             "same-side reduce uses leader remaining position ratio; "
@@ -526,28 +551,7 @@ def plan_leader_allocation_transition(
             formula_inputs,
         )
 
-    cap = _decimal_or_none(max_position_notional)
     if old_side == new_side:
-        if cap is not None and cap > 0 and current_notional > _q(cap) + ALLOCATION_TRANSITION_TOLERANCE:
-            target = _q(cap)
-            formula_inputs["max_position_notional_cap"] = str(target)
-            formula_inputs["target_notional"] = str(target)
-            if MAX_POSITION_NOTIONAL_CAP_APPLIED not in formula_inputs["warnings"]:
-                formula_inputs["warnings"].append(MAX_POSITION_NOTIONAL_CAP_APPLIED)
-            close_qty_limit = _close_qty_limit_for_delta(abs(target - current_notional), current_allocation)
-            return _transition(
-                AllocationTransitionAction.REDUCE,
-                old_side,
-                new_side,
-                target,
-                current_notional,
-                target - current_notional,
-                close_qty_limit,
-                Decimal("0"),
-                True,
-                "max position cap below current allocation",
-                formula_inputs,
-            )
         return _transition(
             AllocationTransitionAction.NOOP,
             old_side,
@@ -573,6 +577,16 @@ def plan_leader_allocation_transition(
 
     delta = target - current_notional
     if delta > ALLOCATION_TRANSITION_TOLERANCE:
+        if _position_cap_exceeded(target, max_position_notional):
+            return _position_cap_block_transition(
+                old_side=old_side,
+                new_side=new_side,
+                current_notional=current_notional,
+                attempted_target=target,
+                max_position_notional=max_position_notional,
+                operation="increase",
+                formula_inputs=formula_inputs,
+            )
         return _transition(
             AllocationTransitionAction.INCREASE,
             old_side,
@@ -681,17 +695,62 @@ def _transition(
     )
 
 
-def _cap_target_notional(
-    target: Decimal,
+def _positive_position_cap(
     max_position_notional: Decimal | None,
-) -> tuple[Decimal, Decimal | None, bool]:
+) -> Decimal | None:
     cap = _decimal_or_none(max_position_notional)
     if cap is None or cap <= 0:
-        return target, None, False
-    cap = _q(cap)
-    if target > cap:
-        return cap, cap, True
-    return target, cap, False
+        return None
+    return _q(cap)
+
+
+def _position_cap_exceeded(
+    attempted_target: Decimal,
+    max_position_notional: Decimal | None,
+) -> bool:
+    cap = _positive_position_cap(max_position_notional)
+    return bool(
+        cap is not None
+        and _q(attempted_target) > cap + ALLOCATION_TRANSITION_TOLERANCE
+    )
+
+
+def _position_cap_block_transition(
+    *,
+    old_side: PositionSide | None,
+    new_side: PositionSide,
+    current_notional: Decimal,
+    attempted_target: Decimal,
+    max_position_notional: Decimal | None,
+    operation: str,
+    formula_inputs: dict[str, Any],
+) -> AllocationTransitionPlan:
+    cap = _positive_position_cap(max_position_notional)
+    if cap is None:
+        raise ValueError("position cap rejection requires a positive cap")
+    attempted = _q(attempted_target)
+    formula_inputs["max_position_notional_cap"] = str(cap)
+    formula_inputs["target_notional_before_cap"] = str(attempted)
+    formula_inputs["attempted_target_notional"] = str(attempted)
+    formula_inputs["position_cap_policy"] = "REJECT_WHOLE_OPEN_OR_INCREASE"
+    formula_inputs["position_cap_exceeded"] = True
+    formula_inputs["target_notional"] = str(attempted)
+    return _transition(
+        AllocationTransitionAction.BLOCK,
+        old_side,
+        new_side,
+        current_notional,
+        current_notional,
+        Decimal("0"),
+        Decimal("0"),
+        Decimal("0"),
+        False,
+        (
+            f"{MAX_POSITION_NOTIONAL_CAP_EXCEEDED}: {operation} projected position "
+            f"{attempted} exceeds configured cap {cap}; whole order rejected"
+        ),
+        formula_inputs,
+    )
 
 
 def _account_value_block_reason(

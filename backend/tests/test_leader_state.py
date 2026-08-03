@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from app.services.leader_state import parse_leader_state
 from app.services.target_position import PositionSide
+from app.tasks.leader_state_poller import _leader_requires_dynamic_account_abstraction
 
 
 def test_parse_leader_state_positions_and_leverage_display_only() -> None:
@@ -39,3 +40,13 @@ def test_parse_leader_state_positions_and_leverage_display_only() -> None:
     assert state.positions[0].mark_price == Decimal("40000.00000000")
     assert state.positions[0].leverage == Decimal("30")
 
+
+def test_fixed_leader_sizing_skips_redundant_dynamic_abstraction_poll() -> None:
+    class FixedLeader:
+        fixed_account_value = Decimal("50000")
+
+    class MissingFixedLeader:
+        fixed_account_value = None
+
+    assert _leader_requires_dynamic_account_abstraction(FixedLeader()) is False
+    assert _leader_requires_dynamic_account_abstraction(MissingFixedLeader()) is True

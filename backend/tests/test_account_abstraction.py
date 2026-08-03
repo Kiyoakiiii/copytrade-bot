@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from types import SimpleNamespace
 
 from app.models import ExecutionOrder
 from app.services.account_abstraction import (
+    AccountAbstractionService,
     MODE_INFERRED_UNIFIED,
     MODE_UNIFIED,
     MODE_UNKNOWN,
@@ -29,6 +31,7 @@ def cfg(**overrides):
         "allow_portfolio_margin_for_live": False,
         "unified_account_collateral_source": "spot_or_portfolio",
         "default_collateral_token": "USDC",
+        "account_value_reference_dexes": ",xyz",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -75,6 +78,72 @@ def test_unified_zero_clearinghouse_uses_spot_usdc_for_follower_account_value() 
     result = resolve_account_value_for_sizing(snap, "", cfg())
     assert result.account_value == Decimal("399.6")
     assert result.source == SOURCE_SPOT
+
+
+def test_confirmed_unified_refresh_skips_irrelevant_portfolio_and_market_calls() -> None:
+    class ProbeInfoClient:
+        def __init__(self):
+            self.post_types = []
+            self.clearing_dexes = []
+
+        async def post_info(self, payload):
+            self.post_types.append(payload["type"])
+            if payload["type"] == "userAbstraction":
+                return "unifiedAccount"
+            raise AssertionError(f"unexpected info request: {payload['type']}")
+
+        async def spot_clearinghouse_state(self, address):
+            return spot("5000")
+
+        async def clearinghouse_state(self, address, dex=""):
+            self.clearing_dexes.append(dex)
+            return clearing("0")
+
+    client = ProbeInfoClient()
+    snap = asyncio.run(
+        AccountAbstractionService(client, cfg()).fetch_snapshot(
+            role="FOLLOWER",
+            address="0x" + "5" * 40,
+            dexes=["", "xyz", "hyna", "cash"],
+        )
+    )
+
+    assert client.post_types == ["userAbstraction"]
+    assert client.clearing_dexes == ["", "xyz"]
+    result = resolve_account_value_for_sizing(snap, "hyna", cfg())
+    assert result.account_value == Decimal("5000")
+    assert result.source == SOURCE_SPOT
+
+
+def test_confirmed_unified_fast_refresh_only_reads_spot_balance() -> None:
+    class FastProbeInfoClient:
+        def __init__(self):
+            self.spot_calls = 0
+
+        async def post_info(self, payload):
+            raise AssertionError(f"unexpected info request: {payload['type']}")
+
+        async def spot_clearinghouse_state(self, address):
+            self.spot_calls += 1
+            return spot("5001.25", hold="10")
+
+        async def clearinghouse_state(self, address, dex=""):
+            raise AssertionError("fast unified refresh must not read clearinghouse state")
+
+    client = FastProbeInfoClient()
+    snap = asyncio.run(
+        AccountAbstractionService(client, cfg()).fetch_snapshot(
+            role="FOLLOWER",
+            address="0x" + "5" * 40,
+            dexes=["", "xyz", "hyna"],
+            confirmed_unified_fast=True,
+        )
+    )
+
+    assert client.spot_calls == 1
+    result = resolve_account_value_for_sizing(snap, "hyna", cfg())
+    assert result.account_value == Decimal("5001.25")
+    assert result.withdrawable_or_available == Decimal("4991.25")
 
 
 def test_unified_zero_clearinghouse_does_not_block_live_when_confirmed() -> None:

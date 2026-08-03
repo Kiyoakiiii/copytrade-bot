@@ -1,10 +1,13 @@
 import asyncio
+import json
+import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 
+from app.api.preflight import _terminal_flat_leader_allocation_residuals
 from app.models import ExecutionOrder, LeaderPositionAllocationRecord
 from app.services.allocations import (
     AllocationStatus,
@@ -25,6 +28,13 @@ from app.services.execution_router import (
 from app.services.hyperliquid_execution import (
     HyperliquidExecutionClient,
     HyperliquidRiskSettingsService,
+    WebSocketActionNotAccepted,
+    WebSocketActionNotSent,
+    WebSocketActionSubmissionUncertain,
+    _HyperliquidWebSocketActionTransport,
+    _SignedActionSlot,
+    _resolve_sdk_asset_id,
+    _websocket_url_for_exchange,
     build_hyperliquid_cloid,
     build_hyperliquid_ioc_order,
     recover_hyperliquid_unknown_order,
@@ -34,7 +44,10 @@ from app.services.order_recovery import (
     _apply_hyperliquid_allocation_delta,
     _apply_hyperliquid_order_response,
     _recovery_order_due,
+    _is_unstarted_hyperliquid_outbox_order,
     _resubmit_unstarted_hyperliquid_order,
+    _replay_persisted_hyperliquid_action,
+    _signed_action_hash,
     _should_defer_unknown_oid_recovery,
     _should_resubmit_stale_unknown_oid_order,
     _should_resubmit_unstarted_hyperliquid_order,
@@ -45,6 +58,28 @@ from app.services.venue_config import default_venue_policy, venue_live_allowed
 
 def compiled_sql(stmt) -> str:
     return str(stmt.compile(compile_kwargs={"literal_binds": True})).lower()
+
+
+def test_cancelled_signed_action_slot_wait_does_not_leak_submit_capacity() -> None:
+    semaphore = threading.BoundedSemaphore(1)
+    assert semaphore.acquire(blocking=False) is True
+
+    async def scenario() -> None:
+        slot = _SignedActionSlot(semaphore, None)
+        task = asyncio.create_task(slot.__aenter__())
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        semaphore.release()
+        # Give any cancelled waiter a chance to run. The previous to_thread
+        # implementation could acquire here after cancellation and leak it.
+        await asyncio.sleep(0.02)
+        assert semaphore.acquire(blocking=False) is True
+        semaphore.release()
+
+    asyncio.run(scenario())
 
 
 def allocation(
@@ -254,7 +289,7 @@ def test_hyperliquid_open_uses_ioc_market_equivalent_no_gtc() -> None:
         cloid="0x" + "1" * 32,
     )
     assert order["order_type"] == {"limit": {"tif": "Ioc"}}
-    assert order["limit_px"] == Decimal("95000.00000000")
+    assert order["limit_px"] == Decimal("52500.00000000")
     assert order["reduce_only"] is False
 
 
@@ -269,7 +304,7 @@ def test_hyperliquid_close_uses_reduce_only_true() -> None:
         cloid="0x" + "2" * 32,
     )
     assert order["order_type"]["limit"]["tif"] == "Ioc"
-    assert order["limit_px"] == Decimal("5000.00000000")
+    assert order["limit_px"] == Decimal("47500.00000000")
     assert order["reduce_only"] is True
 
 
@@ -284,7 +319,7 @@ def test_hyperliquid_reduce_only_false_for_open() -> None:
         cloid="0x" + "3" * 32,
     )
     assert order["reduce_only"] is False
-    assert order["limit_px"] == Decimal("300.00000000")
+    assert order["limit_px"] == Decimal("2850.00000000")
 
 
 def test_hyperliquid_ioc_order_rounds_price_and_size_to_market_precision() -> None:
@@ -301,7 +336,7 @@ def test_hyperliquid_ioc_order_rounds_price_and_size_to_market_precision() -> No
     )
 
     assert order["sz"] == Decimal("0.10")
-    assert order["limit_px"] == Decimal("50.203")
+    assert order["limit_px"] == Decimal("27.744")
 
 
 def validator(
@@ -447,10 +482,36 @@ def test_validator_aggressive_market_ignores_slippage_bps_for_copy_path() -> Non
 
     assert buy.estimated_notional == Decimal("3.69915000")
     assert sell.estimated_notional == Decimal("3.69915000")
-    assert buy.rounded_price == Decimal("50.203")
-    assert sell.rounded_price == Decimal("2.6422")
-    assert buy.raw_limit_price == Decimal("50.20275")
-    assert sell.raw_limit_price == Decimal("2.64225")
+    assert buy.rounded_price == Decimal("27.744")
+    assert sell.rounded_price == Decimal("25.102")
+    assert buy.raw_limit_price == Decimal("27.743625")
+    assert sell.raw_limit_price == Decimal("25.101375")
+
+
+def test_aggressive_ioc_price_bound_cannot_recreate_skhx_oracle_rejection() -> None:
+    result = validator(
+        side="BUY",
+        raw_size="1.210",
+        raw_price="1005.55",
+        target="1217.23753012",
+        canonical="xyz:SKHX",
+        asset_id=110022,
+        market_meta={
+            "name": "SKHX",
+            "asset_id": 110022,
+            "szDecimals": 3,
+            "maxLeverage": 10,
+        },
+        order_policy={
+            "aggressive_market": True,
+            "allow_target_notional_price_drift": True,
+            "effective_leverage": 1,
+        },
+    )
+
+    assert result.ok
+    assert result.raw_limit_price == Decimal("1055.8275")
+    assert result.raw_limit_price <= Decimal("1005.55") * Decimal("1.05")
 
 
 def test_validator_supports_default_and_hip3_markets_when_meta_exists() -> None:
@@ -559,7 +620,22 @@ def test_hyperliquid_execution_client_strips_dex_prefix_for_sdk_leverage_and_ord
 
     async def run():
         client = FakeClient()
-        leverage_response = await client.update_leverage(coin="hyna:ZEC", leverage=10, is_cross=False)
+        leverage_response = await client.update_leverage(
+            coin="hyna:ZEC",
+            leverage=10,
+            is_cross=False,
+            asset_id=47,
+        )
+        top_up_response = await client.top_up_isolated_only_margin(
+            coin="hyna:ZEC",
+            leverage=1,
+            asset_id=47,
+        )
+        add_margin_response = await client.add_isolated_margin(
+            coin="hyna:ZEC",
+            amount=Decimal("12.3456781"),
+            asset_id=47,
+        )
         payload = build_hyperliquid_ioc_order(
             coin="ZEC",
             dex="hyna",
@@ -572,19 +648,34 @@ def test_hyperliquid_execution_client_strips_dex_prefix_for_sdk_leverage_and_ord
         )
         order_response = await client.place_market_order(**payload)
         await client.close()
-        return client, leverage_response, order_response
+        return client, leverage_response, top_up_response, add_margin_response, order_response
 
     try:
-        client, leverage_response, order_response = asyncio.run(run())
+        client, leverage_response, top_up_response, add_margin_response, order_response = asyncio.run(run())
         assert leverage_response == {"status": "ok"}
+        assert top_up_response == {"status": "ok"}
+        assert add_margin_response == {"status": "ok"}
         assert order_response == {"status": "ok"}
-        assert client.dexes == ["hyna", "hyna"]
+        assert client.dexes == ["hyna", "hyna", "hyna", "hyna"]
         leverage_payload = client._client.posts[0][1]
         assert leverage_payload["action"] == {
             "type": "updateLeverage",
             "asset": 4242,
             "isCross": False,
             "leverage": 10,
+        }
+        top_up_payload = client._client.posts[1][1]
+        assert top_up_payload["action"] == {
+            "type": "topUpIsolatedOnlyMargin",
+            "asset": 4242,
+            "leverage": "1",
+        }
+        add_margin_payload = client._client.posts[2][1]
+        assert add_margin_payload["action"] == {
+            "type": "updateIsolatedMargin",
+            "asset": 4242,
+            "isBuy": True,
+            "ntli": 12345679,
         }
         assert client.exchange.info.name == "hyna:ZEC"
         assert client.exchange.orders[0]["name"] == "hyna:ZEC"
@@ -807,6 +898,618 @@ def test_hyperliquid_execution_client_direct_http_uses_sdk_signed_payload(monkey
     assert trace["sdk_http_post_done_at"]
 
 
+def test_persistable_signed_envelope_is_not_sent_until_submit_and_replays_identically(monkeypatch) -> None:
+    import hyperliquid.exchange as exchange_module
+
+    class FakeInfo:
+        def name_to_asset(self, _name):
+            return 42
+
+    class FakeExchange:
+        info = FakeInfo()
+        wallet = object()
+        vault_address = None
+        expires_after = None
+        base_url = "https://api.hyperliquid.xyz"
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"status": "ok", "response": {"data": {"statuses": [{"filled": {}}]}}}
+
+    class FakeHttpClient:
+        def __init__(self):
+            self.posts = []
+
+        async def post(self, url, json):
+            self.posts.append((url, json))
+            return FakeResponse()
+
+        async def aclose(self):
+            return None
+
+    class FakeClient(HyperliquidExecutionClient):
+        def __init__(self):
+            super().__init__(
+                info_url="http://localhost/info",
+                private_key="0x" + "8" * 64,
+                account_address="0x" + "5" * 40,
+            )
+            self.exchange = FakeExchange()
+            self._client = FakeHttpClient()
+
+        def _sdk_exchange(self, dex: str = ""):
+            return self.exchange
+
+    monkeypatch.setattr(
+        exchange_module,
+        "sign_l1_action",
+        lambda wallet, action, active_pool, nonce, expires_after, is_mainnet: {
+            "r": "0x1",
+            "s": "0x2",
+            "v": 27,
+        },
+    )
+
+    async def run():
+        client = FakeClient()
+        trace = {}
+        envelope = client.prepare_market_order_envelope(
+            nonce=1_700_000_000_123,
+            latency_trace=trace,
+            coin="BTC",
+            dex="",
+            is_buy=True,
+            sz=Decimal("0.01"),
+            limit_px=Decimal("50000"),
+            reduce_only=False,
+            cloid="0x" + "8" * 32,
+        )
+        assert client._client.posts == []
+        await client.submit_market_order_envelope(envelope)
+        await client.submit_market_order_envelope(envelope)
+        return client, envelope, trace
+
+    client, envelope, trace = asyncio.run(run())
+    assert len(client._client.posts) == 2
+    assert client._client.posts[0][1] == envelope["payload"]
+    assert client._client.posts[1][1] == envelope["payload"]
+    assert client._client.posts[0][1]["nonce"] == 1_700_000_000_123
+    assert trace["sdk_prepare_started_at"]
+    assert trace["sdk_exchange_ready_at"]
+    assert trace["sdk_prepare_done_at"]
+
+
+def test_order_transport_warmup_is_read_only_and_uses_execution_origin() -> None:
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"BTC": "50000"}
+
+    class FakeHttpClient:
+        def __init__(self):
+            self.posts = []
+
+        async def post(self, url, json):
+            self.posts.append((url, json))
+            return FakeResponse()
+
+    http_client = FakeHttpClient()
+    client = SimpleNamespace(
+        _client=http_client,
+        _sdk_exchange=lambda _dex="": SimpleNamespace(base_url="https://api.hyperliquid.xyz"),
+        _websocket_order_submit_enabled=lambda: False,
+        _warm_http_order_origin=lambda base_url, payload: HyperliquidExecutionClient._warm_http_order_origin(
+            SimpleNamespace(_client=http_client), base_url, payload
+        ),
+    )
+
+    warmed = asyncio.run(HyperliquidExecutionClient.warm_order_transport(client, "xyz"))
+
+    assert warmed is True
+    assert http_client.posts == [
+        ("https://api.hyperliquid.xyz/info", {"type": "allMids", "dex": "xyz"})
+    ]
+
+
+def test_websocket_exchange_url_uses_same_execution_origin() -> None:
+    assert _websocket_url_for_exchange("https://api.hyperliquid.xyz") == (
+        "wss://api.hyperliquid.xyz/ws"
+    )
+    assert _websocket_url_for_exchange("http://localhost:3001/") == "ws://localhost:3001/ws"
+
+
+def test_signed_envelope_websocket_success_never_posts_http() -> None:
+    class FakeTransport:
+        def __init__(self):
+            self.payloads = []
+
+        async def post_action(self, payload, *, latency_trace=None):
+            self.payloads.append(payload)
+            return {"status": "ok", "response": {"type": "order", "data": {"statuses": []}}}
+
+        async def close(self):
+            return None
+
+    class FakeHttpClient:
+        def __init__(self):
+            self.posts = []
+
+        async def post(self, url, json):
+            self.posts.append((url, json))
+            raise AssertionError("successful websocket action must not use HTTP")
+
+        async def aclose(self):
+            return None
+
+    async def run():
+        client = HyperliquidExecutionClient(
+            info_url="https://api.hyperliquid.xyz/info",
+            private_key="0x" + "1" * 64,
+            account_address="0x" + "2" * 40,
+            order_submit_transport="websocket",
+        )
+        fake_http = FakeHttpClient()
+        client._client = fake_http
+        client._sdk_exchange = lambda _dex="": SimpleNamespace(base_url="https://api.hyperliquid.xyz")
+        transport = FakeTransport()
+        client._ws_action_transports[_websocket_url_for_exchange("https://api.hyperliquid.xyz")] = transport
+        envelope = {"dex": "", "payload": {"action": {"type": "order"}, "nonce": 123}}
+        result = await client.submit_market_order_envelope(envelope, latency_trace={})
+        await client.close()
+        return result, transport, fake_http
+
+    result, transport, fake_http = asyncio.run(run())
+    assert result["status"] == "ok"
+    assert transport.payloads == [{"action": {"type": "order"}, "nonce": 123}]
+    assert fake_http.posts == []
+
+
+@pytest.mark.parametrize("failure", [WebSocketActionNotSent("connect failed"), WebSocketActionNotAccepted("429")])
+def test_signed_envelope_websocket_falls_back_http_only_when_definitely_not_sent(failure) -> None:
+    class FakeTransport:
+        async def post_action(self, payload, *, latency_trace=None):
+            raise failure
+
+        async def close(self):
+            return None
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"status": "ok", "response": {"type": "order", "data": {"statuses": []}}}
+
+    class FakeHttpClient:
+        def __init__(self):
+            self.posts = []
+
+        async def post(self, url, json):
+            self.posts.append((url, json))
+            return FakeResponse()
+
+        async def aclose(self):
+            return None
+
+    async def run():
+        client = HyperliquidExecutionClient(
+            info_url="https://api.hyperliquid.xyz/info",
+            private_key="0x" + "3" * 64,
+            account_address="0x" + "4" * 40,
+            order_submit_transport="websocket",
+        )
+        fake_http = FakeHttpClient()
+        client._client = fake_http
+        client._sdk_exchange = lambda _dex="": SimpleNamespace(base_url="https://api.hyperliquid.xyz")
+        client._ws_action_transports[_websocket_url_for_exchange("https://api.hyperliquid.xyz")] = FakeTransport()
+        envelope = {"dex": "", "payload": {"action": {"type": "order"}, "nonce": 456}}
+        trace = {}
+        result = await client.submit_market_order_envelope(envelope, latency_trace=trace)
+        await client.close()
+        return result, fake_http, trace
+
+    result, fake_http, trace = asyncio.run(run())
+    assert result["status"] == "ok"
+    assert fake_http.posts == [
+        ("https://api.hyperliquid.xyz/exchange", {"action": {"type": "order"}, "nonce": 456})
+    ]
+    assert trace["websocket_http_fallback"] is True
+    assert trace["effective_order_submit_transport"] == "http_fallback"
+    assert trace["websocket_http_fallback_reason"] == type(failure).__name__
+
+
+def test_explicit_websocket_rejection_opens_short_http_circuit_breaker() -> None:
+    class RejectingTransport:
+        def __init__(self):
+            self.calls = 0
+
+        async def post_action(self, payload, *, latency_trace=None):
+            self.calls += 1
+            raise WebSocketActionNotAccepted("429 Too Many Requests")
+
+        async def close(self):
+            return None
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"status": "ok", "response": {"type": "order", "data": {"statuses": []}}}
+
+    class FakeHttpClient:
+        def __init__(self):
+            self.posts = []
+
+        async def post(self, url, json):
+            self.posts.append((url, json))
+            return FakeResponse()
+
+        async def aclose(self):
+            return None
+
+    async def run():
+        client = HyperliquidExecutionClient(
+            info_url="https://api.hyperliquid.xyz/info",
+            private_key="0x" + "3" * 64,
+            account_address="0x" + "4" * 40,
+            order_submit_transport="websocket",
+        )
+        fake_http = FakeHttpClient()
+        client._client = fake_http
+        client._sdk_exchange = lambda _dex="": SimpleNamespace(base_url="https://api.hyperliquid.xyz")
+        transport = RejectingTransport()
+        client._ws_action_transports[_websocket_url_for_exchange("https://api.hyperliquid.xyz")] = transport
+        first_trace = {}
+        second_trace = {}
+        await client.submit_market_order_envelope(
+            {"dex": "", "payload": {"action": {"type": "order"}, "nonce": 456}},
+            latency_trace=first_trace,
+        )
+        await client.submit_market_order_envelope(
+            {"dex": "", "payload": {"action": {"type": "order"}, "nonce": 457}},
+            latency_trace=second_trace,
+        )
+        await client.close()
+        return transport, fake_http, first_trace, second_trace
+
+    transport, fake_http, first_trace, second_trace = asyncio.run(run())
+    assert transport.calls == 1
+    assert len(fake_http.posts) == 2
+    assert first_trace["effective_order_submit_transport"] == "http_fallback"
+    assert first_trace["websocket_http_fallback_message"] == "429 Too Many Requests"
+    assert second_trace["effective_order_submit_transport"] == "http_circuit_breaker"
+    assert second_trace["websocket_bypass_remaining_ms"] > 0
+
+
+def test_signed_envelope_websocket_unknown_never_falls_back_or_resubmits() -> None:
+    class FakeTransport:
+        async def post_action(self, payload, *, latency_trace=None):
+            raise WebSocketActionSubmissionUncertain("ack lost")
+
+        async def close(self):
+            return None
+
+    class FakeHttpClient:
+        def __init__(self):
+            self.posts = []
+
+        async def post(self, url, json):
+            self.posts.append((url, json))
+            raise AssertionError("ambiguous websocket action must not fall back to HTTP")
+
+        async def aclose(self):
+            return None
+
+    async def run():
+        client = HyperliquidExecutionClient(
+            info_url="https://api.hyperliquid.xyz/info",
+            private_key="0x" + "5" * 64,
+            account_address="0x" + "6" * 40,
+            order_submit_transport="websocket",
+        )
+        fake_http = FakeHttpClient()
+        client._client = fake_http
+        client._sdk_exchange = lambda _dex="": SimpleNamespace(base_url="https://api.hyperliquid.xyz")
+        client._ws_action_transports[_websocket_url_for_exchange("https://api.hyperliquid.xyz")] = FakeTransport()
+        envelope = {"dex": "", "payload": {"action": {"type": "order"}, "nonce": 789}}
+        with pytest.raises(WebSocketActionSubmissionUncertain, match="ack lost"):
+            await client.submit_market_order_envelope(envelope, latency_trace={})
+        await client.close()
+        return fake_http
+
+    fake_http = asyncio.run(run())
+    assert fake_http.posts == []
+
+
+def test_leverage_update_uses_warm_websocket_action_transport(monkeypatch) -> None:
+    import hyperliquid.exchange as exchange_module
+
+    class FakeInfo:
+        def name_to_asset(self, name):
+            assert name == "BTC"
+            return 42
+
+    exchange = SimpleNamespace(
+        info=FakeInfo(),
+        wallet=object(),
+        vault_address=None,
+        expires_after=None,
+        base_url="https://api.hyperliquid.xyz",
+    )
+
+    class FakeTransport:
+        def __init__(self):
+            self.payloads = []
+
+        async def post_action(self, payload, *, latency_trace=None):
+            self.payloads.append(payload)
+            return {"status": "ok", "response": {"type": "default"}}
+
+        async def close(self):
+            return None
+
+    class NoHttp:
+        async def post(self, url, json):
+            raise AssertionError("successful leverage websocket action must not use HTTP")
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(exchange_module, "get_timestamp_ms", lambda: 1_700_000_000_000)
+    monkeypatch.setattr(
+        exchange_module,
+        "sign_l1_action",
+        lambda wallet, action, active_pool, nonce, expires_after, is_mainnet: {
+            "r": "0x1",
+            "s": "0x2",
+            "v": 27,
+        },
+    )
+
+    async def run():
+        client = HyperliquidExecutionClient(
+            info_url="https://api.hyperliquid.xyz/info",
+            private_key="0x" + "7" * 64,
+            account_address="0x" + "8" * 40,
+            order_submit_transport="websocket",
+        )
+        client._client = NoHttp()
+        client._sdk_exchange = lambda _dex="": exchange
+        transport = FakeTransport()
+        client._ws_action_transports[
+            _websocket_url_for_exchange(exchange.base_url)
+        ] = transport
+        response = await client.update_leverage(
+            coin="BTC",
+            leverage=10,
+            is_cross=True,
+        )
+        await client.close()
+        return response, transport
+
+    response, transport = asyncio.run(run())
+    assert response["status"] == "ok"
+    assert len(transport.payloads) == 1
+    assert transport.payloads[0]["action"] == {
+        "type": "updateLeverage",
+        "asset": 42,
+        "isCross": True,
+        "leverage": 10,
+    }
+
+
+def test_ambiguous_leverage_websocket_action_never_blindly_falls_back_http(
+    monkeypatch,
+) -> None:
+    import hyperliquid.exchange as exchange_module
+
+    class FakeInfo:
+        def name_to_asset(self, name):
+            return 42
+
+    exchange = SimpleNamespace(
+        info=FakeInfo(),
+        wallet=object(),
+        vault_address=None,
+        expires_after=None,
+        base_url="https://api.hyperliquid.xyz",
+    )
+
+    class UncertainTransport:
+        async def post_action(self, payload, *, latency_trace=None):
+            raise WebSocketActionSubmissionUncertain("leverage acknowledgement lost")
+
+        async def close(self):
+            return None
+
+    class NoHttp:
+        def __init__(self):
+            self.posts = []
+
+        async def post(self, url, json):
+            self.posts.append((url, json))
+            raise AssertionError("ambiguous leverage action must fail closed")
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(exchange_module, "get_timestamp_ms", lambda: 1_700_000_000_100)
+    monkeypatch.setattr(
+        exchange_module,
+        "sign_l1_action",
+        lambda wallet, action, active_pool, nonce, expires_after, is_mainnet: {
+            "r": "0x1",
+            "s": "0x2",
+            "v": 27,
+        },
+    )
+
+    async def run():
+        client = HyperliquidExecutionClient(
+            info_url="https://api.hyperliquid.xyz/info",
+            private_key="0x" + "c" * 64,
+            account_address="0x" + "a" * 40,
+            order_submit_transport="websocket",
+        )
+        no_http = NoHttp()
+        client._client = no_http
+        client._sdk_exchange = lambda _dex="": exchange
+        client._ws_action_transports[
+            _websocket_url_for_exchange(exchange.base_url)
+        ] = UncertainTransport()
+        with pytest.raises(
+            WebSocketActionSubmissionUncertain,
+            match="acknowledgement lost",
+        ):
+            await client.update_leverage(
+                coin="BTC",
+                leverage=10,
+                is_cross=True,
+            )
+        await client.close()
+        return no_http
+
+    assert asyncio.run(run()).posts == []
+
+
+def test_websocket_action_transport_matches_concurrent_responses_by_request_id(monkeypatch) -> None:
+    import app.services.hyperliquid_execution as execution_module
+
+    class FakeConnection:
+        def __init__(self):
+            self.sent = []
+            self.incoming = asyncio.Queue()
+            self.closed = False
+
+        async def send(self, message):
+            self.sent.append(json.loads(message))
+
+        async def close(self):
+            if not self.closed:
+                self.closed = True
+                await self.incoming.put(None)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            message = await self.incoming.get()
+            if message is None:
+                raise StopAsyncIteration
+            return message
+
+    async def run():
+        connection = FakeConnection()
+
+        async def fake_connect(*args, **kwargs):
+            return connection
+
+        monkeypatch.setattr(execution_module.websockets, "connect", fake_connect)
+        transport = _HyperliquidWebSocketActionTransport(
+            "wss://api.hyperliquid.xyz/ws",
+            response_timeout=1,
+        )
+        first = asyncio.create_task(transport.post_action({"nonce": 1}))
+        second = asyncio.create_task(transport.post_action({"nonce": 2}))
+        for _ in range(100):
+            if len(connection.sent) == 2:
+                break
+            await asyncio.sleep(0)
+        assert len(connection.sent) == 2
+        first_id = connection.sent[0]["id"]
+        second_id = connection.sent[1]["id"]
+        await connection.incoming.put(json.dumps({
+            "channel": "post",
+            "data": {"id": second_id, "response": {"type": "action", "payload": {"nonce": 2}}},
+        }))
+        await connection.incoming.put(json.dumps({
+            "channel": "post",
+            "data": {"id": first_id, "response": {"type": "action", "payload": {"nonce": 1}}},
+        }))
+        results = await asyncio.gather(first, second)
+        await transport.close()
+        return results
+
+    assert asyncio.run(run()) == [{"nonce": 1}, {"nonce": 2}]
+
+
+def test_warmed_websocket_action_transport_reconnects_before_next_order(monkeypatch) -> None:
+    import app.services.hyperliquid_execution as execution_module
+
+    class FakeConnection:
+        def __init__(self):
+            self.incoming = asyncio.Queue()
+            self.closed = False
+
+        async def send(self, message):
+            return None
+
+        async def close(self):
+            if not self.closed:
+                self.closed = True
+                await self.incoming.put(None)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            message = await self.incoming.get()
+            if message is None:
+                raise StopAsyncIteration
+            return message
+
+    async def run():
+        connections = [FakeConnection(), FakeConnection()]
+        connect_count = 0
+
+        async def fake_connect(*args, **kwargs):
+            nonlocal connect_count
+            connection = connections[min(connect_count, len(connections) - 1)]
+            connect_count += 1
+            return connection
+
+        monkeypatch.setattr(execution_module.websockets, "connect", fake_connect)
+        transport = _HyperliquidWebSocketActionTransport("wss://api.hyperliquid.xyz/ws")
+        await transport.warm()
+        assert connect_count == 1
+        await connections[0].close()
+        for _ in range(200):
+            if connect_count >= 2 and transport._connection is connections[1]:
+                break
+            await asyncio.sleep(0)
+        assert connect_count >= 2
+        assert transport._connection is connections[1]
+        await transport.close()
+
+    asyncio.run(run())
+
+
+def test_recovery_rejects_modified_persisted_signed_envelope() -> None:
+    envelope = {"dex": "", "payload": {"action": {"type": "order"}, "nonce": 123}}
+    order = ExecutionOrder(
+        signed_action_envelope=envelope,
+        signed_action_hash=_signed_action_hash(envelope),
+        submit_nonce=123,
+        submit_signer_scope="testnet:signer",
+    )
+    order.signed_action_envelope["payload"]["nonce"] = 124
+
+    class FakeClient:
+        signer_scope = "testnet:signer"
+
+        async def submit_market_order_envelope(self, _envelope):
+            raise AssertionError("tampered envelope must never reach the exchange")
+
+    with pytest.raises(RuntimeError, match="integrity"):
+        asyncio.run(_replay_persisted_hyperliquid_action(FakeClient(), order))
+
+
 def test_hyperliquid_execution_client_direct_http_does_not_serialize_posts(monkeypatch) -> None:
     import hyperliquid.exchange as exchange_module
 
@@ -1005,6 +1708,67 @@ def test_hyperliquid_execution_client_nonce_is_shared_across_clients(monkeypatch
         client_two._client.posts[0][1]["nonce"],
     ]
     assert sorted(nonces) == [3333333333, 3333333334]
+
+
+def test_hyperliquid_durable_nonce_reservation_joins_shared_signer_counter() -> None:
+    client_one = HyperliquidExecutionClient(
+        info_url="https://api.hyperliquid.xyz/info",
+        private_key="0x" + "1" * 64,
+        account_address="0x" + "2" * 40,
+        network="mainnet",
+    )
+    client_two = HyperliquidExecutionClient(
+        info_url="https://api.hyperliquid.xyz/info",
+        private_key="0x" + "1" * 64,
+        account_address="0x" + "2" * 40,
+        network="mainnet",
+    )
+    try:
+        with client_one._nonce_state.lock:
+            client_one._nonce_state.last_nonce = 5_000
+
+        first = client_one.reserve_action_nonce_at_least(5_000)
+        second = client_two.reserve_action_nonce_at_least(4_999)
+
+        assert first == 5_001
+        assert second == 5_002
+        assert client_one._nonce_state is client_two._nonce_state
+    finally:
+        asyncio.run(client_one.close())
+        asyncio.run(client_two.close())
+
+
+def test_primed_sdk_market_metadata_builds_hip3_exchange_without_info_requests(monkeypatch) -> None:
+    from hyperliquid.info import Info
+
+    def unexpected_info_request(*_args, **_kwargs):
+        raise AssertionError("primed SDK exchange must not pull market metadata")
+
+    monkeypatch.setattr(Info, "post", unexpected_info_request)
+    client = HyperliquidExecutionClient(
+        info_url="https://api.hyperliquid.xyz/info",
+        private_key="0x" + "1" * 64,
+        account_address="0x" + "2" * 40,
+        network="mainnet",
+    )
+    client.prime_sdk_market_metadata(
+        dex="xyz",
+        meta={
+            "universe": [
+                {"name": "xyz:ONE", "szDecimals": 2, "maxLeverage": 10},
+                {"name": "xyz:TWO", "szDecimals": 3, "maxLeverage": 5},
+            ]
+        },
+        asset_offset=750000,
+    )
+    try:
+        exchange = client._sdk_exchange("xyz")
+        assert exchange is not None
+        assert _resolve_sdk_asset_id(exchange, "xyz:ONE") == 750000
+        assert _resolve_sdk_asset_id(exchange, "xyz:TWO") == 750001
+        assert exchange.info.asset_to_sz_decimals[750001] == 3
+    finally:
+        asyncio.run(client.close())
 
 
 def test_hyperliquid_execution_client_submit_slot_is_shared_across_clients(monkeypatch) -> None:
@@ -1315,6 +2079,21 @@ def test_hyperliquid_unstarted_pending_submit_recovery_does_not_resubmit() -> No
     )
 
     assert _should_resubmit_unstarted_hyperliquid_order(order) is False
+    assert _is_unstarted_hyperliquid_outbox_order(order) is True
+
+
+def test_hyperliquid_started_order_is_not_treated_as_safe_outbox_replay() -> None:
+    order = ExecutionOrder(
+        execution_venue=ExecutionVenue.HYPERLIQUID.value,
+        leader_address="0x" + "1" * 40,
+        source_coin="HYPE",
+        side="BUY",
+        cloid="0x" + "6" * 32,
+        status="SUBMITTING",
+        order_submit_started_at=datetime.now(timezone.utc),
+    )
+
+    assert _is_unstarted_hyperliquid_outbox_order(order) is False
 
 
 def test_hyperliquid_recovery_resubmit_is_disabled() -> None:
@@ -1780,6 +2559,46 @@ def test_preflight_model_has_separate_hyperliquid_and_binance_ready_flags() -> N
     )
     assert result["ready_for_live_hyperliquid"] is True
     assert result["ready_for_live_binance"] is False
+
+
+def test_preflight_detects_shaz_style_residual_even_when_follower_matches_ledger() -> None:
+    row = LeaderPositionAllocationRecord(
+        id=494,
+        leader_id=1,
+        leader_address="0x" + "1" * 40,
+        hyperliquid_coin="SHAZ",
+        dex="xyz",
+        canonical_coin="xyz:SHAZ",
+        execution_venue="HYPERLIQUID",
+        venue_symbol="xyz:SHAZ",
+        position_side="LONG",
+        target_notional=Decimal("0"),
+        allocated_notional=Decimal("2.007516"),
+        allocated_qty=Decimal("0.03"),
+        avg_entry_price=Decimal("66.9172"),
+        copy_multiplier=Decimal("1"),
+        status="REDUCING",
+        last_leader_position_size=Decimal("0"),
+        last_leader_position_notional=Decimal("0"),
+        pending_reduce_qty=Decimal("0.03"),
+    )
+
+    residuals = _terminal_flat_leader_allocation_residuals([row])
+
+    assert residuals == [
+        {
+            "allocation_id": 494,
+            "leader_id": 1,
+            "symbol": "xyz:SHAZ",
+            "dex": "xyz",
+            "position_side": "LONG",
+            "status": "REDUCING",
+            "allocated_qty": "0.03",
+            "allocated_notional": "2.007516",
+            "pending_reduce_qty": "0.03",
+            "message": "leader is flat but the follower allocation remains nonzero",
+        }
+    ]
 
 
 def test_global_kill_switch_blocks_both_venues() -> None:

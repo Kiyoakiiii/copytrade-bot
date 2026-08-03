@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
+import itertools
+import json
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -9,6 +12,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from typing import Any
 
 import httpx
+import websockets
 
 from app.services.account_abstraction import (
     AccountAbstractionService,
@@ -17,9 +21,339 @@ from app.services.account_abstraction import (
 )
 from app.services.hyperliquid_dex import canonical_coin, parse_coin
 
-AGGRESSIVE_IOC_BUY_PRICE_MULTIPLIER = Decimal("1.9")
-AGGRESSIVE_IOC_SELL_PRICE_MULTIPLIER = Decimal("0.1")
+# A market order on Hyperliquid is an IOC limit order.  Keep its protection
+# price aligned with the official SDK's market_open/market_close default (5%).
+# The previous 1.9/0.1 bounds did not improve execution—the IOC still consumes
+# the best available book—but could make the exchange reject the entire order
+# as too far from oracle, which turns an otherwise valid leader fill into a
+# missed lifecycle.
+AGGRESSIVE_IOC_BUY_PRICE_MULTIPLIER = Decimal("1.05")
+AGGRESSIVE_IOC_SELL_PRICE_MULTIPLIER = Decimal("0.95")
 DIRECT_HTTP_MAX_IN_FLIGHT = 64
+DIRECT_HTTP_MAX_CONNECTIONS = 100
+DIRECT_HTTP_MAX_KEEPALIVE_CONNECTIONS = 64
+# nginx advertises HTTP/1.1 keep-alive without an explicit timeout.  Thirty
+# seconds captures dense leader bursts while staying conservative about an
+# upstream proxy closing a much older idle socket.
+DIRECT_HTTP_KEEPALIVE_EXPIRY_SECONDS = 30.0
+WS_ACTION_OPEN_TIMEOUT_SECONDS = 3.0
+WS_ACTION_RESPONSE_TIMEOUT_SECONDS = 5.0
+WS_ACTION_HEARTBEAT_SECONDS = 30.0
+WS_ACTION_REJECTION_COOLDOWN_SECONDS = 30.0
+WS_ACTION_NOT_SENT_COOLDOWN_SECONDS = 2.0
+ISOLATED_ONLY_LEVERAGE = 1
+FORCED_ONE_X_MARKETS = frozenset({"XYZ:CXMT"})
+
+
+class WebSocketActionNotSent(RuntimeError):
+    """The websocket action was provably not written to a connection."""
+
+
+class WebSocketActionNotAccepted(RuntimeError):
+    """The websocket server explicitly rejected the post before an action result."""
+
+
+class WebSocketActionSubmissionUncertain(RuntimeError):
+    """The action may have been sent; callers must reconcile by cloid, never retry blindly."""
+
+
+@dataclass
+class _PendingWebSocketAction:
+    future: asyncio.Future[dict[str, Any]]
+    connection: Any
+    sent_or_ambiguous: bool = False
+
+
+class _HyperliquidWebSocketActionTransport:
+    """Concurrent request/response transport for signed Hyperliquid actions.
+
+    The transport deliberately distinguishes a connection failure before any
+    send attempt from a failure after ``send`` starts.  Only the former may use
+    the HTTP fallback; the latter must flow into the normal cloid recovery path
+    so a lost acknowledgement can never create a duplicate order.
+    """
+
+    def __init__(
+        self,
+        ws_url: str,
+        *,
+        open_timeout: float = WS_ACTION_OPEN_TIMEOUT_SECONDS,
+        response_timeout: float = WS_ACTION_RESPONSE_TIMEOUT_SECONDS,
+        heartbeat_seconds: float = WS_ACTION_HEARTBEAT_SECONDS,
+    ) -> None:
+        self.ws_url = ws_url
+        self.open_timeout = max(float(open_timeout), 0.1)
+        self.response_timeout = max(float(response_timeout), 0.1)
+        self.heartbeat_seconds = max(float(heartbeat_seconds), 5.0)
+        self._connection: Any | None = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._supervisor_task: asyncio.Task[None] | None = None
+        self._connect_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
+        self._reconnect_event = asyncio.Event()
+        self._request_ids = itertools.count(1)
+        self._pending: dict[int, _PendingWebSocketAction] = {}
+        self._keep_warm = False
+        self._closed = False
+
+    async def warm(self) -> bool:
+        self._keep_warm = True
+        if self._supervisor_task is None or self._supervisor_task.done():
+            self._supervisor_task = asyncio.create_task(self._supervisor_loop())
+        await self._ensure_connection()
+        return True
+
+    async def close(self) -> None:
+        self._closed = True
+        connection = self._connection
+        self._connection = None
+        tasks = [
+            task
+            for task in (self._supervisor_task, self._heartbeat_task, self._reader_task)
+            if task is not None
+        ]
+        self._supervisor_task = None
+        self._heartbeat_task = None
+        self._reader_task = None
+        for task in tasks:
+            task.cancel()
+        if connection is not None:
+            with contextlib.suppress(Exception):
+                await connection.close()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._fail_pending(ConnectionError("websocket action transport closed"))
+
+    async def post_action(
+        self,
+        payload: dict[str, Any],
+        *,
+        latency_trace: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            connection = await self._ensure_connection()
+        except Exception as exc:
+            raise WebSocketActionNotSent(f"websocket connect failed before send: {exc}") from exc
+
+        request_id = next(self._request_ids)
+        loop = asyncio.get_running_loop()
+        pending = _PendingWebSocketAction(future=loop.create_future(), connection=connection)
+        message = json.dumps(
+            {
+                "method": "post",
+                "id": request_id,
+                "request": {"type": "action", "payload": payload},
+            },
+            separators=(",", ":"),
+        )
+
+        async with self._send_lock:
+            if not self._connection_is_usable(connection):
+                raise WebSocketActionNotSent("websocket disconnected before send")
+            self._pending[request_id] = pending
+            # From this point onward a disconnect is ambiguous.  Mark it before
+            # awaiting send because the coroutine may partially write before it
+            # raises, and a blind HTTP fallback would then duplicate the order.
+            pending.sent_or_ambiguous = True
+            _trace_timestamp(latency_trace, "ws_action_send_started_at")
+            _trace_timestamp(latency_trace, "sdk_http_post_started_at")
+            try:
+                await connection.send(message)
+            except Exception as exc:
+                self._pending.pop(request_id, None)
+                _trace_timestamp(latency_trace, "sdk_http_post_done_at")
+                raise WebSocketActionSubmissionUncertain(
+                    f"websocket action send result unknown: {exc}"
+                ) from exc
+            _trace_timestamp(latency_trace, "ws_action_send_done_at")
+
+        try:
+            response = await asyncio.wait_for(
+                asyncio.shield(pending.future),
+                timeout=self.response_timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            self._pending.pop(request_id, None)
+            if not pending.future.done():
+                pending.future.cancel()
+            _trace_timestamp(latency_trace, "sdk_http_post_done_at")
+            raise WebSocketActionSubmissionUncertain(
+                "websocket action response timed out after send"
+            ) from exc
+        except WebSocketActionSubmissionUncertain:
+            _trace_timestamp(latency_trace, "sdk_http_post_done_at")
+            raise
+        except Exception as exc:
+            _trace_timestamp(latency_trace, "sdk_http_post_done_at")
+            raise WebSocketActionSubmissionUncertain(
+                f"websocket action response lost after send: {exc}"
+            ) from exc
+        finally:
+            self._pending.pop(request_id, None)
+        _trace_timestamp(latency_trace, "ws_action_response_at")
+        _trace_timestamp(latency_trace, "sdk_http_post_done_at")
+        return self._unwrap_action_response(response)
+
+    async def _ensure_connection(self) -> Any:
+        if self._closed:
+            raise ConnectionError("websocket action transport is closed")
+        connection = self._connection
+        if self._connection_is_usable(connection):
+            return connection
+        async with self._connect_lock:
+            connection = self._connection
+            if self._connection_is_usable(connection):
+                return connection
+            await self._discard_connection(connection)
+            connection = await websockets.connect(
+                self.ws_url,
+                open_timeout=self.open_timeout,
+                close_timeout=2,
+                ping_interval=20,
+                ping_timeout=10,
+                max_queue=256,
+            )
+            self._connection = connection
+            self._reader_task = asyncio.create_task(self._reader_loop(connection))
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(connection))
+            return connection
+
+    def _connection_is_usable(self, connection: Any | None) -> bool:
+        return bool(
+            not self._closed
+            and connection is not None
+            and connection is self._connection
+            and self._reader_task is not None
+            and not self._reader_task.done()
+        )
+
+    async def _discard_connection(self, connection: Any | None) -> None:
+        if connection is None:
+            return
+        if connection is self._connection:
+            self._connection = None
+        with contextlib.suppress(Exception):
+            await connection.close()
+
+    async def _reader_loop(self, connection: Any) -> None:
+        failure: Exception | None = None
+        try:
+            async for raw_message in connection:
+                try:
+                    message = json.loads(raw_message)
+                except (TypeError, ValueError):
+                    continue
+                if message.get("channel") != "post":
+                    continue
+                data = message.get("data") or {}
+                try:
+                    request_id = int(data.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                pending = self._pending.pop(request_id, None)
+                if pending is None or pending.future.done():
+                    continue
+                response = data.get("response")
+                if not isinstance(response, dict):
+                    pending.future.set_exception(
+                        WebSocketActionSubmissionUncertain(
+                            "websocket action response was malformed after send"
+                        )
+                    )
+                else:
+                    pending.future.set_result(response)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failure = exc
+        finally:
+            if connection is self._connection:
+                self._connection = None
+            self._fail_pending(
+                failure or ConnectionError("websocket action connection closed"),
+                connection=connection,
+            )
+            self._reconnect_event.set()
+
+    async def _supervisor_loop(self) -> None:
+        retry_delay = 0.1
+        while not self._closed and self._keep_warm:
+            self._reconnect_event.clear()
+            if not self._connection_is_usable(self._connection):
+                try:
+                    await self._ensure_connection()
+                    retry_delay = 0.1
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 2.0)
+                    continue
+            # Clear happened before the usability check, so a disconnect after
+            # that point cannot be lost. The reader sets this event and the
+            # supervisor reconnects without waiting for the next leader fill.
+            if self._connection_is_usable(self._connection):
+                await self._reconnect_event.wait()
+
+    async def _heartbeat_loop(self, connection: Any) -> None:
+        try:
+            while connection is self._connection and not self._closed:
+                await asyncio.sleep(self.heartbeat_seconds)
+                async with self._send_lock:
+                    if not self._connection_is_usable(connection):
+                        return
+                    await connection.send('{"method":"ping"}')
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The reader loop owns connection invalidation and pending-request
+            # failure. Closing here wakes it immediately on a heartbeat error.
+            with contextlib.suppress(Exception):
+                await connection.close()
+
+    def _fail_pending(self, exc: Exception, *, connection: Any | None = None) -> None:
+        pending_items = [
+            (request_id, pending)
+            for request_id, pending in self._pending.items()
+            if connection is None or pending.connection is connection
+        ]
+        for request_id, pending in pending_items:
+            self._pending.pop(request_id, None)
+            if pending.future.done():
+                continue
+            if pending.sent_or_ambiguous:
+                pending.future.set_exception(
+                    WebSocketActionSubmissionUncertain(
+                        f"websocket disconnected after action send: {exc}"
+                    )
+                )
+            else:
+                pending.future.set_exception(
+                    WebSocketActionNotSent(f"websocket disconnected before action send: {exc}")
+                )
+
+    @staticmethod
+    def _unwrap_action_response(response: dict[str, Any]) -> dict[str, Any]:
+        response_type = str(response.get("type") or "").lower()
+        payload = response.get("payload")
+        if response_type == "action" and isinstance(payload, dict):
+            return payload
+        if response_type == "error":
+            raise WebSocketActionNotAccepted(str(payload or "websocket action was rejected"))
+        raise WebSocketActionSubmissionUncertain(
+            "websocket returned an unrecognized response after action send"
+        )
+
+
+def _websocket_url_for_exchange(base_url: str) -> str:
+    value = str(base_url or "").rstrip("/")
+    if value.startswith("https://"):
+        return f"wss://{value[len('https://'):]}/ws"
+    if value.startswith("http://"):
+        return f"ws://{value[len('http://'):]}/ws"
+    raise ValueError("Hyperliquid exchange base URL must use http or https")
 
 
 @dataclass
@@ -42,9 +376,14 @@ class _SignedActionSlot:
     async def __aenter__(self) -> None:
         _trace_timestamp(self._latency_trace, "direct_http_submit_slot_wait_started_at")
         self._acquired = self._semaphore.acquire(blocking=False)
-        if not self._acquired:
-            await asyncio.to_thread(self._semaphore.acquire)
-            self._acquired = True
+        while not self._acquired:
+            # A cancelled ``to_thread(semaphore.acquire)`` keeps running in the
+            # worker thread and can consume a permit after the coroutine has
+            # exited, permanently leaking submit capacity.  Non-blocking
+            # acquisition keeps cancellation safe: no permit can be acquired
+            # across an await boundary without being recorded and released.
+            await asyncio.sleep(0.001)
+            self._acquired = self._semaphore.acquire(blocking=False)
         _trace_timestamp(self._latency_trace, "direct_http_submit_slot_acquired_at")
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -54,10 +393,7 @@ class _SignedActionSlot:
 
 
 def _signer_nonce_state(*, private_key: str | None, network: str) -> _SignerNonceState:
-    key_material = str(private_key or "").strip().lower()
-    network_key = str(network or "").strip().lower()
-    fingerprint = hashlib.blake2s(key_material.encode(), digest_size=16).hexdigest()
-    key = f"{network_key}:{fingerprint}"
+    key = _signer_scope(private_key=private_key, network=network)
     with _SIGNER_NONCE_STATES_LOCK:
         state = _SIGNER_NONCE_STATES.get(key)
         if state is None:
@@ -67,6 +403,13 @@ def _signer_nonce_state(*, private_key: str | None, network: str) -> _SignerNonc
             )
             _SIGNER_NONCE_STATES[key] = state
         return state
+
+
+def _signer_scope(*, private_key: str | None, network: str) -> str:
+    key_material = str(private_key or "").strip().lower()
+    network_key = str(network or "").strip().lower()
+    fingerprint = hashlib.blake2s(key_material.encode(), digest_size=16).hexdigest()
+    return f"{network_key}:{fingerprint}"
 
 
 @dataclass(frozen=True)
@@ -365,6 +708,15 @@ def validate_hyperliquid_order_params(
         slip = Decimal(str(order_policy.get("slippage_bps", 0))) / Decimal("10000")
         raw_limit_price = raw_price_d * (Decimal("1") + slip) if is_buy else raw_price_d * (Decimal("1") - slip)
     rounded_price = round_hyperliquid_limit_price(raw_limit_price, is_buy=is_buy, sz_decimals=sz_decimals)
+    if aggressive_market and not is_buy and sz_decimals is not None:
+        aggressive_places = hyperliquid_price_decimals(
+            raw_limit_price,
+            sz_decimals=sz_decimals,
+        )
+        rounded_price = raw_limit_price.quantize(
+            Decimal("1").scaleb(-aggressive_places),
+            rounding=ROUND_UP,
+        )
     price_decimals = hyperliquid_price_decimals(raw_limit_price, sz_decimals=sz_decimals) if sz_decimals is not None else None
     tick_size = Decimal("1").scaleb(-price_decimals) if price_decimals is not None else None
     reference_notional = (rounded_size * raw_price_d).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
@@ -573,9 +925,13 @@ async def recover_hyperliquid_unknown_order(
 class HyperliquidRiskSettingsService:
     def __init__(self, client: Any, *, expected_leverage: int = 10, settings: Any | None = None) -> None:
         self._client = client
-        self.expected_leverage = expected_leverage
         self._settings = settings
         self.expected_margin_mode = _expected_margin_mode(settings)
+        self.expected_leverage = (
+            ISOLATED_ONLY_LEVERAGE
+            if self.expected_margin_mode == "ISOLATED"
+            else expected_leverage
+        )
 
     async def ensure_symbol_risk_settings(
         self,
@@ -585,8 +941,12 @@ class HyperliquidRiskSettingsService:
         target_notional: Decimal | None = None,
     ) -> HyperliquidRiskSettingsResult:
         parsed = parse_coin(coin)
-        coin_u = parsed.coin
         venue_coin = parsed.canonical_coin
+        expected_leverage = (
+            ISOLATED_ONLY_LEVERAGE
+            if venue_coin.upper() in FORCED_ONE_X_MARKETS
+            else self.expected_leverage
+        )
         try:
             try:
                 meta = await self._client.meta(parsed.dex)
@@ -610,7 +970,7 @@ class HyperliquidRiskSettingsService:
                 hyperliquid_coin_exists=False,
             )
         plan = build_hyperliquid_leverage_plan(
-            default_leverage=self.expected_leverage,
+            default_leverage=expected_leverage,
             coin_max_leverage=item.get("maxLeverage"),
         )
         if not plan.ok_for_open and not reduce_only:
@@ -778,23 +1138,77 @@ class HyperliquidExecutionClient:
         self._vault_address = _clean_address(vault_address)
         self._network = network
         self._order_submit_transport = str(order_submit_transport or "sdk").strip().lower()
-        self._client = httpx.AsyncClient(timeout=timeout)
+        # Auto-copy orders are often separated by more than httpx's five-second
+        # default keepalive window.  Retaining the already-authenticated TLS
+        # connection removes avoidable DNS/TCP/TLS setup from the next order,
+        # while the bounded pool still caps resources during dense bursts.
+        self._client = httpx.AsyncClient(
+            timeout=timeout,
+            limits=httpx.Limits(
+                max_connections=DIRECT_HTTP_MAX_CONNECTIONS,
+                max_keepalive_connections=DIRECT_HTTP_MAX_KEEPALIVE_CONNECTIONS,
+                keepalive_expiry=DIRECT_HTTP_KEEPALIVE_EXPIRY_SECONDS,
+            ),
+        )
         self._exchange_cache: dict[str, Any] = {}
+        # Static market metadata is supplied by the watcher's shared,
+        # database-backed cache. Each execution account keeps its own signer
+        # and account state, while coin ids/precision are reused without
+        # repeating synchronous SDK /info requests in a fill path.
+        self._sdk_market_metadata: dict[str, tuple[dict[str, Any], int]] = {}
+        self._ws_action_transports: dict[str, _HyperliquidWebSocketActionTransport] = {}
+        self._ws_action_bypass_until: dict[str, float] = {}
         self._exchange_order_locks: dict[str, asyncio.Lock] = {}
         self._sdk_coin_name_cache: dict[tuple[str, str], str] = {}
         self._nonce_state = _signer_nonce_state(private_key=self._private_key, network=self._network)
+        self._signer_scope = _signer_scope(private_key=self._private_key, network=self._network)
 
     @property
     def is_configured(self) -> bool:
         return bool(self._private_key and (self._account_address or self._vault_address))
 
+    @property
+    def signer_scope(self) -> str:
+        return self._signer_scope
+
+    def reserve_action_nonce_at_least(self, floor: int) -> int:
+        """Atomically join durable and in-process nonce allocation.
+
+        Auto-copy orders reserve their nonce in Postgres so the exact signed
+        action can survive a crash.  Leverage updates, cancels, and recovery
+        calls share the in-process signer state.  Advancing both through this
+        lock prevents those two allocators from choosing the same millisecond
+        nonce when different markets submit concurrently.
+        """
+        floor_value = int(floor)
+        with self._nonce_state.lock:
+            nonce = max(floor_value, self._nonce_state.last_nonce + 1)
+            self._nonce_state.last_nonce = nonce
+        return nonce
+
     async def close(self) -> None:
+        transports = list(self._ws_action_transports.values())
+        self._ws_action_transports.clear()
+        for transport in transports:
+            await transport.close()
         await self._client.aclose()
 
     async def post_info(self, payload: dict[str, Any]) -> Any:
-        response = await self._client.post(self._info_url, json=payload)
-        response.raise_for_status()
-        return response.json()
+        response: httpx.Response | None = None
+        for attempt in range(4):
+            response = await self._client.post(self._info_url, json=payload)
+            if response.status_code != 429 and response.status_code < 500:
+                response.raise_for_status()
+                return response.json()
+            if attempt >= 3:
+                response.raise_for_status()
+            retry_after = response.headers.get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after else 0.1 * (2**attempt)
+            except (TypeError, ValueError):
+                delay = 0.1 * (2**attempt)
+            await asyncio.sleep(min(max(delay, 0.05), 2.0))
+        raise RuntimeError("Hyperliquid info request retry loop exited unexpectedly")
 
     async def meta(self, dex: str = "") -> dict[str, Any]:
         payload: dict[str, Any] = {"type": "meta"}
@@ -808,6 +1222,53 @@ class HyperliquidExecutionClient:
             payload["dex"] = dex
         data = await self.post_info(payload)
         return dict(data or {})
+
+    async def warm_order_transport(self, dex: str = "") -> bool:
+        """Prime the configured signed-action transport without trading.
+
+        WebSocket mode establishes its persistent connection. HTTP mode sends a
+        read-only request to the exact execution origin so the TLS connection is
+        available for the first order. Failure remains non-fatal at the caller.
+        """
+        exchange = self._sdk_exchange(dex)
+        if exchange is None:
+            return False
+        payload: dict[str, Any] = {"type": "allMids"}
+        if dex:
+            payload["dex"] = str(dex).lower()
+        if self._websocket_order_submit_enabled():
+            ws_result, http_result = await asyncio.gather(
+                self._ws_action_transport(exchange.base_url).warm(),
+                self._warm_http_order_origin(exchange.base_url, payload),
+                return_exceptions=True,
+            )
+            if ws_result is True or http_result is True:
+                return True
+            if isinstance(ws_result, Exception):
+                raise ws_result
+            if isinstance(http_result, Exception):
+                raise http_result
+            return False
+        return await self._warm_http_order_origin(exchange.base_url, payload)
+
+    async def _warm_http_order_origin(self, base_url: str, payload: dict[str, Any]) -> bool:
+        response = await self._client.post(f"{base_url}/info", json=payload)
+        response.raise_for_status()
+        # Consume and validate the response now so the connection is returned
+        # to the keepalive pool before this warmup task completes.
+        response.json()
+        return True
+
+    def _websocket_order_submit_enabled(self) -> bool:
+        return self._order_submit_transport in {"ws", "websocket", "ws_first", "websocket_first"}
+
+    def _ws_action_transport(self, base_url: str) -> _HyperliquidWebSocketActionTransport:
+        ws_url = _websocket_url_for_exchange(base_url)
+        transport = self._ws_action_transports.get(ws_url)
+        if transport is None:
+            transport = _HyperliquidWebSocketActionTransport(ws_url)
+            self._ws_action_transports[ws_url] = transport
+        return transport
 
     async def meta_and_asset_ctxs(self, dex: str = "") -> Any:
         payload: dict[str, Any] = {"type": "metaAndAssetCtxs"}
@@ -831,19 +1292,90 @@ class HyperliquidExecutionClient:
         leverage: int,
         is_cross: bool,
         asset_id: int | None = None,
+        nonce: int | None = None,
     ) -> dict[str, Any]:
         parsed = parse_coin(coin)
         exchange = self._sdk_exchange(parsed.dex)
         if exchange is None:
             raise RuntimeError("Hyperliquid official SDK is not installed/configured")
         sdk_coin = self._resolve_sdk_coin_name(exchange, parsed)
-        resolved_asset_id = int(asset_id) if asset_id is not None else _resolve_sdk_asset_id(exchange, sdk_coin)
+        try:
+            # Meta indexes are local to each HIP-3 dex and are not valid L1
+            # action asset ids.  Resolve the global id from the official SDK's
+            # coin map even when the caller has a cached local index.
+            resolved_asset_id = _resolve_sdk_asset_id(exchange, sdk_coin)
+        except Exception:
+            if asset_id is None:
+                raise
+            resolved_asset_id = int(asset_id)
         return await self._update_leverage_by_asset_id(
             exchange,
             asset_id=resolved_asset_id,
             leverage=leverage,
             is_cross=is_cross,
+            nonce=nonce,
         )
+
+    async def top_up_isolated_only_margin(
+        self,
+        *,
+        coin: str,
+        leverage: int,
+        asset_id: int | None = None,
+        nonce: int | None = None,
+    ) -> dict[str, Any]:
+        """Add collateral to an active isolated-only position to reach a target leverage."""
+        parsed = parse_coin(coin)
+        exchange = self._sdk_exchange(parsed.dex)
+        if exchange is None:
+            raise RuntimeError("Hyperliquid official SDK is not installed/configured")
+        sdk_coin = self._resolve_sdk_coin_name(exchange, parsed)
+        try:
+            # HIP-3 meta indexes are DEX-local; L1 actions require the SDK's
+            # global asset id, exactly as updateLeverage does.
+            resolved_asset_id = _resolve_sdk_asset_id(exchange, sdk_coin)
+        except Exception:
+            if asset_id is None:
+                raise
+            resolved_asset_id = int(asset_id)
+        action = {
+            "type": "topUpIsolatedOnlyMargin",
+            "asset": int(resolved_asset_id),
+            "leverage": str(int(leverage)),
+        }
+        return await self._post_signed_l1_action(exchange, action=action, nonce=nonce)
+
+    async def add_isolated_margin(
+        self,
+        *,
+        coin: str,
+        amount: Decimal,
+        asset_id: int | None = None,
+        nonce: int | None = None,
+    ) -> dict[str, Any]:
+        """Add an exact positive USDC amount to an active isolated position."""
+        amount_decimal = Decimal(str(amount))
+        ntli = int((amount_decimal * Decimal("1000000")).to_integral_value(rounding=ROUND_UP))
+        if ntli <= 0:
+            raise ValueError("isolated margin addition must be positive")
+        parsed = parse_coin(coin)
+        exchange = self._sdk_exchange(parsed.dex)
+        if exchange is None:
+            raise RuntimeError("Hyperliquid official SDK is not installed/configured")
+        sdk_coin = self._resolve_sdk_coin_name(exchange, parsed)
+        try:
+            resolved_asset_id = _resolve_sdk_asset_id(exchange, sdk_coin)
+        except Exception:
+            if asset_id is None:
+                raise
+            resolved_asset_id = int(asset_id)
+        action = {
+            "type": "updateIsolatedMargin",
+            "asset": int(resolved_asset_id),
+            "isBuy": True,
+            "ntli": ntli,
+        }
+        return await self._post_signed_l1_action(exchange, action=action, nonce=nonce)
 
     async def _update_leverage_by_asset_id(
         self,
@@ -852,6 +1384,22 @@ class HyperliquidExecutionClient:
         asset_id: int,
         leverage: int,
         is_cross: bool,
+        nonce: int | None = None,
+    ) -> dict[str, Any]:
+        action = {
+            "type": "updateLeverage",
+            "asset": int(asset_id),
+            "isCross": bool(is_cross),
+            "leverage": int(leverage),
+        }
+        return await self._post_signed_l1_action(exchange, action=action, nonce=nonce)
+
+    async def _post_signed_l1_action(
+        self,
+        exchange: Any,
+        *,
+        action: dict[str, Any],
+        nonce: int | None = None,
     ) -> dict[str, Any]:
         try:
             from hyperliquid.exchange import MAINNET_API_URL, get_timestamp_ms, sign_l1_action
@@ -859,13 +1407,15 @@ class HyperliquidExecutionClient:
             raise RuntimeError("Hyperliquid official SDK signing helpers are unavailable") from exc
 
         async with self._signed_action_slot(None):
-            timestamp = await self._next_action_nonce(get_timestamp_ms, None)
-            action = {
-                "type": "updateLeverage",
-                "asset": int(asset_id),
-                "isCross": bool(is_cross),
-                "leverage": int(leverage),
-            }
+            if nonce is None:
+                timestamp = await self._next_action_nonce(get_timestamp_ms, None)
+            else:
+                timestamp = int(nonce)
+                with self._nonce_state.lock:
+                    self._nonce_state.last_nonce = max(
+                        self._nonce_state.last_nonce,
+                        timestamp,
+                    )
             signature = sign_l1_action(
                 exchange.wallet,
                 action,
@@ -884,7 +1434,34 @@ class HyperliquidExecutionClient:
             )
             if exchange.expires_after is not None:
                 payload["expiresAfter"] = exchange.expires_after
-            response = await self._client.post(f"{exchange.base_url}/exchange", json=payload)
+            if self._websocket_order_submit_enabled():
+                bypass_until = self._ws_action_bypass_until.get(exchange.base_url, 0.0)
+                loop_time = asyncio.get_running_loop().time()
+                if loop_time >= bypass_until:
+                    try:
+                        response = await self._ws_action_transport(
+                            exchange.base_url
+                        ).post_action(payload)
+                        self._ws_action_bypass_until.pop(exchange.base_url, None)
+                        return response
+                    except (WebSocketActionNotSent, WebSocketActionNotAccepted) as exc:
+                        # Reusing the exact signed payload over HTTP is safe only
+                        # when the websocket provably did not send it or explicitly
+                        # rejected the post. An ambiguous send must fail closed so
+                        # risk-setting confirmation/replay can reconcile it before
+                        # any follower order is allowed through.
+                        cooldown = (
+                            WS_ACTION_REJECTION_COOLDOWN_SECONDS
+                            if isinstance(exc, WebSocketActionNotAccepted)
+                            else WS_ACTION_NOT_SENT_COOLDOWN_SECONDS
+                        )
+                        self._ws_action_bypass_until[exchange.base_url] = (
+                            loop_time + cooldown
+                        )
+            response = await self._client.post(
+                f"{exchange.base_url}/exchange",
+                json=payload,
+            )
             response.raise_for_status()
             return response.json()
 
@@ -929,6 +1506,164 @@ class HyperliquidExecutionClient:
             )
         finally:
             _trace_timestamp(latency_trace, "sdk_order_call_done_at")
+
+    def prepare_market_order_envelope(
+        self,
+        *,
+        nonce: int,
+        latency_trace: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Build one replay-safe signed action without sending it."""
+        _trace_timestamp(latency_trace, "sdk_prepare_started_at")
+        try:
+            from hyperliquid.exchange import (
+                MAINNET_API_URL,
+                order_request_to_order_wire,
+                order_wires_to_order_action,
+                sign_l1_action,
+            )
+        except Exception as exc:
+            raise RuntimeError("Hyperliquid official SDK signing helpers are unavailable") from exc
+
+        parsed = parse_coin(str(kwargs["coin"]), default_dex=str(kwargs.get("dex", "")))
+        exchange = self._sdk_exchange(parsed.dex)
+        if exchange is None:
+            raise RuntimeError("Hyperliquid official SDK is not installed/configured")
+        _trace_timestamp(latency_trace, "sdk_exchange_ready_at")
+        sdk_coin = self._resolve_sdk_coin_name(exchange, parsed)
+        size = kwargs.get("sz", kwargs.get("quantity"))
+        if size is None:
+            raise ValueError("Hyperliquid order size is missing")
+        order_request = {
+            "coin": sdk_coin,
+            "is_buy": bool(kwargs["is_buy"]),
+            "sz": float(size),
+            "limit_px": float(kwargs["limit_px"]),
+            "order_type": {"limit": {"tif": "Ioc"}},
+            "reduce_only": bool(kwargs.get("reduce_only", False)),
+        }
+        cloid = _sdk_cloid(kwargs.get("cloid"))
+        if cloid:
+            order_request["cloid"] = cloid
+        order_wire = order_request_to_order_wire(
+            order_request,
+            _resolve_sdk_asset_id(exchange, order_request["coin"]),
+        )
+        order_action = order_wires_to_order_action([order_wire], None, "na")
+        nonce_value = int(nonce)
+        with self._nonce_state.lock:
+            self._nonce_state.last_nonce = max(self._nonce_state.last_nonce, nonce_value)
+        signature = sign_l1_action(
+            exchange.wallet,
+            order_action,
+            exchange.vault_address,
+            nonce_value,
+            exchange.expires_after,
+            exchange.base_url == MAINNET_API_URL,
+        )
+        payload: dict[str, Any] = {
+            "action": order_action,
+            "nonce": nonce_value,
+            "signature": signature,
+            "vaultAddress": (
+                exchange.vault_address
+                if order_action["type"] not in {"usdClassTransfer", "sendAsset"}
+                else None
+            ),
+        }
+        if exchange.expires_after is not None:
+            payload["expiresAfter"] = exchange.expires_after
+        _trace_timestamp(latency_trace, "sdk_http_payload_built_at")
+        _trace_timestamp(latency_trace, "sdk_prepare_done_at")
+        return {"dex": str(parsed.dex or "").lower(), "payload": payload}
+
+    async def submit_market_order_envelope(
+        self,
+        envelope: dict[str, Any],
+        *,
+        latency_trace: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        dex = str(envelope.get("dex") or "").lower()
+        payload = envelope.get("payload")
+        if not isinstance(payload, dict) or not payload.get("action") or payload.get("nonce") is None:
+            raise ValueError("invalid persisted Hyperliquid signed action envelope")
+        exchange = self._sdk_exchange(dex)
+        if exchange is None:
+            raise RuntimeError("Hyperliquid official SDK is not installed/configured")
+        async with self._signed_action_slot(latency_trace):
+            if self._websocket_order_submit_enabled():
+                bypass_until = self._ws_action_bypass_until.get(exchange.base_url, 0.0)
+                loop_time = asyncio.get_running_loop().time()
+                if loop_time >= bypass_until:
+                    _trace_detail(latency_trace, "order_submit_transport", "websocket")
+                    try:
+                        response = await self._ws_action_transport(exchange.base_url).post_action(
+                            payload,
+                            latency_trace=latency_trace,
+                        )
+                        self._ws_action_bypass_until.pop(exchange.base_url, None)
+                        _trace_detail(latency_trace, "effective_order_submit_transport", "websocket")
+                        return response
+                    except (WebSocketActionNotSent, WebSocketActionNotAccepted) as exc:
+                        # Safe fallback only: either no websocket send was attempted,
+                        # or the websocket server explicitly returned an error rather
+                        # than an action result. Any timeout/disconnect after sending
+                        # is intentionally allowed to escape into cloid recovery.
+                        cooldown = (
+                            WS_ACTION_REJECTION_COOLDOWN_SECONDS
+                            if isinstance(exc, WebSocketActionNotAccepted)
+                            else WS_ACTION_NOT_SENT_COOLDOWN_SECONDS
+                        )
+                        self._ws_action_bypass_until[exchange.base_url] = loop_time + cooldown
+                        _trace_detail(latency_trace, "websocket_http_fallback", True)
+                        _trace_detail(latency_trace, "websocket_http_fallback_reason", type(exc).__name__)
+                        _trace_detail(latency_trace, "websocket_http_fallback_message", str(exc)[:240])
+                        _trace_detail(latency_trace, "websocket_bypass_seconds", cooldown)
+                        _trace_detail(latency_trace, "effective_order_submit_transport", "http_fallback")
+                        _trace_timestamp(latency_trace, "websocket_http_fallback_at")
+                        return await self._submit_market_order_envelope_http(
+                            exchange.base_url,
+                            payload,
+                            latency_trace=latency_trace,
+                        )
+                _trace_detail(latency_trace, "order_submit_transport", "http_circuit_breaker")
+                _trace_detail(latency_trace, "effective_order_submit_transport", "http_circuit_breaker")
+                _trace_detail(
+                    latency_trace,
+                    "websocket_bypass_remaining_ms",
+                    max(0, int((bypass_until - loop_time) * 1000)),
+                )
+                _trace_timestamp(latency_trace, "websocket_circuit_breaker_bypassed_at")
+                return await self._submit_market_order_envelope_http(
+                    exchange.base_url,
+                    payload,
+                    latency_trace=latency_trace,
+                )
+            _trace_detail(latency_trace, "order_submit_transport", "http")
+            _trace_detail(latency_trace, "effective_order_submit_transport", "http")
+            return await self._submit_market_order_envelope_http(
+                exchange.base_url,
+                payload,
+                latency_trace=latency_trace,
+            )
+
+    async def _submit_market_order_envelope_http(
+        self,
+        base_url: str,
+        payload: dict[str, Any],
+        *,
+        latency_trace: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        _trace_timestamp(latency_trace, "sdk_http_post_started_at")
+        try:
+            response = await self._client.post(f"{base_url}/exchange", json=payload)
+            _trace_timestamp(latency_trace, "sdk_http_post_done_at")
+            response.raise_for_status()
+            return response.json()
+        except Exception:
+            _trace_timestamp(latency_trace, "sdk_http_post_done_at")
+            raise
 
     async def _place_market_order_sdk_locked(
         self,
@@ -1118,6 +1853,18 @@ class HyperliquidExecutionClient:
                 warmed.append(dex_name)
         return warmed
 
+    def prime_sdk_market_metadata(
+        self,
+        *,
+        dex: str,
+        meta: dict[str, Any],
+        asset_offset: int,
+    ) -> None:
+        dex_name = str(dex or "").lower()
+        if not isinstance(meta, dict) or not isinstance(meta.get("universe"), list):
+            return
+        self._sdk_market_metadata[dex_name] = (dict(meta), max(0, int(asset_offset)))
+
     @staticmethod
     def manual_order_record(*, coin: str, side: str, source_type: str, dex: str = "") -> dict[str, str]:
         parsed = parse_coin(coin, default_dex=dex)
@@ -1148,13 +1895,35 @@ class HyperliquidExecutionClient:
             else constants.MAINNET_API_URL
         )
         wallet = eth_account.Account.from_key(self._private_key)
-        exchange = Exchange(
-            wallet,
-            base_url,
-            account_address=self._account_address,
-            vault_address=self._vault_address,
-            perp_dexs=[dex_name],
-        )
+        prepared = self._sdk_market_metadata.get(dex_name)
+        if prepared is None:
+            exchange = Exchange(
+                wallet,
+                base_url,
+                account_address=self._account_address,
+                vault_address=self._vault_address,
+                perp_dexs=[dex_name],
+            )
+        else:
+            meta, asset_offset = prepared
+            # Passing both snapshots prevents the SDK constructor from making
+            # synchronous spotMeta/meta requests. ``perp_dexs=None`` installs
+            # the supplied universe as the default map; for HIP-3 we then
+            # replace its local ids with the authoritative global offset.
+            exchange = Exchange(
+                wallet,
+                base_url,
+                account_address=self._account_address,
+                vault_address=self._vault_address,
+                meta=meta,
+                spot_meta={"tokens": [], "universe": []},
+                perp_dexs=None,
+            )
+            _apply_sdk_market_asset_offset(
+                exchange,
+                meta=meta,
+                asset_offset=asset_offset,
+            )
         exchange._post_action = _post_action_without_null_fields(exchange)  # type: ignore[method-assign]
         self._exchange_cache[dex_name] = exchange
         self._prime_sdk_coin_name_cache(exchange, dex_name)
@@ -1193,6 +1962,33 @@ class HyperliquidExecutionClient:
 
 def _sdk_coin_name(parsed: Any) -> str:
     return parsed.canonical_coin if parsed.dex else parsed.coin
+
+
+def _apply_sdk_market_asset_offset(
+    exchange: Any,
+    *,
+    meta: dict[str, Any],
+    asset_offset: int,
+) -> None:
+    info = getattr(exchange, "info", None)
+    coin_to_asset = getattr(info, "coin_to_asset", None)
+    name_to_coin = getattr(info, "name_to_coin", None)
+    asset_to_sz_decimals = getattr(info, "asset_to_sz_decimals", None)
+    if not isinstance(coin_to_asset, dict):
+        raise RuntimeError("Hyperliquid SDK coin map is unavailable")
+    offset = max(0, int(asset_offset))
+    for index, item in enumerate(meta.get("universe") or []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        if not name:
+            continue
+        asset = offset + index
+        coin_to_asset[name] = asset
+        if isinstance(name_to_coin, dict):
+            name_to_coin[name] = name
+        if isinstance(asset_to_sz_decimals, dict) and item.get("szDecimals") is not None:
+            asset_to_sz_decimals[asset] = int(item["szDecimals"])
 
 
 def _resolve_sdk_asset_id(exchange: Any, sdk_coin: str) -> int:

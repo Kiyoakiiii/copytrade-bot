@@ -158,12 +158,34 @@ async def save_account_state(db: Any, state: AccountState) -> LatestAccountState
             .where(LatestAccountState.role == state.role)
             .where(LatestAccountState.address == state.address)
             .where(LatestAccountState.dex == state.dex)
+            .with_for_update()
         )
     ).scalar_one_or_none()
     if row is None:
         row = LatestAccountState(role=state.role, address=state.address, dex=state.dex)
         db.add(row)
         await db.flush()
+
+    incoming_at = _datetime_from_any(state.updated_at)
+    stored_at = _datetime_from_any(row.last_update_at)
+    if incoming_at is not None and stored_at is not None and incoming_at <= stored_at:
+        db.add(
+            RiskEvent(
+                severity="warning",
+                event_type="ACCOUNT_STATE_OUT_OF_ORDER_SNAPSHOT_IGNORED",
+                symbol=None,
+                leader_address=None,
+                message="ignored an account-state snapshot that was not newer than the stored state",
+                metadata_json={
+                    "role": state.role,
+                    "dex": state.dex,
+                    "incoming_source": state.source,
+                    "incoming_at": incoming_at.isoformat(),
+                    "stored_at": stored_at.isoformat(),
+                },
+            )
+        )
+        return row
 
     row.dex = state.dex
     row.dex_display_name = state.dex_display_name

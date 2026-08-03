@@ -464,6 +464,60 @@ def test_save_account_state_closes_duplicate_active_position_rows() -> None:
     assert [event.event_type for event in events] == ["ACCOUNT_POSITION_DUPLICATE_ACTIVE_ROW_CLOSED"]
 
 
+def test_save_account_state_ignores_out_of_order_snapshot() -> None:
+    stored_at = datetime(2026, 7, 9, 8, 30, 2, tzinfo=timezone.utc)
+    state_row = LatestAccountState(
+        id=1,
+        role=FOLLOWER,
+        address=("0x" + "1" * 40).lower(),
+        dex="xyz",
+        account_value=Decimal("1000"),
+        source="newer",
+        last_update_at=stored_at,
+    )
+    active_position = LatestAccountPosition(
+        id=10,
+        account_state_id=1,
+        role=FOLLOWER,
+        address=("0x" + "1" * 40).lower(),
+        dex="xyz",
+        coin="SKHX",
+        canonical_coin="xyz:SKHX",
+        side="SHORT",
+        size=Decimal("2.041"),
+        active=True,
+        status="OPEN",
+        last_update_at=stored_at,
+    )
+    stale_snapshot = AccountState(
+        role=FOLLOWER,
+        address=("0x" + "1" * 40).lower(),
+        dex="xyz",
+        dex_display_name="XYZ",
+        account_label="follower",
+        account_value=Decimal("900"),
+        withdrawable=Decimal("800"),
+        total_ntl_pos=Decimal("0"),
+        total_raw_usd=Decimal("900"),
+        total_margin_used=Decimal("0"),
+        positions=[],
+        raw_payload_masked={},
+        source="older",
+        updated_at=stored_at - timedelta(seconds=1),
+    )
+    db = SaveAccountStateDb(state_row, [active_position])
+
+    saved = asyncio.run(save_account_state(db, stale_snapshot))
+
+    assert saved is state_row
+    assert state_row.account_value == Decimal("1000")
+    assert state_row.source == "newer"
+    assert active_position.active is True
+    assert len(db.rows_sequence) == 1
+    events = [item for item in db.added if isinstance(item, RiskEvent)]
+    assert [event.event_type for event in events] == ["ACCOUNT_STATE_OUT_OF_ORDER_SNAPSHOT_IGNORED"]
+
+
 def test_pretrade_checklist_blocks_open_when_follower_state_stale() -> None:
     decision = check_risk(
         RiskConfig(follower_account_state_fresh=False),

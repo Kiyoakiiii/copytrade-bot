@@ -6,7 +6,16 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from app.api.leaders import _leader_payload, _normalized_payload, _replacement_data, _validate_leader_address, _validate_patch
+from app.api.leaders import (
+    _baseline_relevant_patch,
+    _ensure_execution_route_change_safe,
+    _leader_payload,
+    _normalized_payload,
+    _replacement_data,
+    _validate_leader_address,
+    _validate_execution_account_route,
+    _validate_patch,
+)
 from app.core.config import Settings
 from app.services.leader_config import (
     ALL_COINS,
@@ -29,6 +38,7 @@ def leader(**overrides):
         "enabled": True,
         "deleted_at": None,
         "delete_reason": None,
+        "performance_started_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
         "leader_address": "0x" + "1" * 40,
         "copy_multiplier": Decimal("0.1"),
         "fixed_account_value": Decimal("1000"),
@@ -116,10 +126,19 @@ def test_soft_delete_preserves_object_and_marks_disabled() -> None:
 
 def test_enable_leader_clears_soft_delete_fields() -> None:
     item = leader(enabled=False, deleted_at=datetime.now(timezone.utc), delete_reason="old")
-    enable_leader(item)
+    activated_at = datetime(2026, 7, 21, tzinfo=timezone.utc)
+    enable_leader(item, now=activated_at)
     assert item.enabled is True
     assert item.deleted_at is None
     assert item.delete_reason is None
+    assert item.performance_started_at == activated_at
+
+
+def test_redundant_enable_does_not_reset_performance_epoch() -> None:
+    original = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    item = leader(enabled=True, deleted_at=None, performance_started_at=original)
+    enable_leader(item, now=datetime(2026, 7, 21, tzinfo=timezone.utc))
+    assert item.performance_started_at == original
 
 
 def test_watcher_consistency_reports_missing_and_stale_subscriptions() -> None:
@@ -141,6 +160,25 @@ def test_normalized_payload_empty_allowlist_does_not_default_btc_eth_sol() -> No
     assert data["blocked_symbols"] == []
 
 
+def test_blocked_list_only_patch_does_not_require_slow_baseline_capture() -> None:
+    assert not _baseline_relevant_patch(
+        {"blocked_symbols": ["BTC", "ETH"]},
+        old_allowed=None,
+        old_preferred="HYPERLIQUID",
+        old_enabled_venues=["HYPERLIQUID"],
+    )
+
+
+def test_route_or_allowlist_patch_still_requires_baseline_capture() -> None:
+    common = {
+        "old_allowed": None,
+        "old_preferred": "HYPERLIQUID",
+        "old_enabled_venues": ["HYPERLIQUID"],
+    }
+    assert _baseline_relevant_patch({"allowed_symbols": ["BTC"]}, **common)
+    assert _baseline_relevant_patch({"preferred_venue": "AUTO"}, **common)
+
+
 def test_clear_api_error_for_invalid_leader_address() -> None:
     with pytest.raises(HTTPException) as exc:
         _validate_leader_address("not-an-address")
@@ -153,6 +191,75 @@ def test_clear_api_error_for_invalid_copy_multiplier() -> None:
         _validate_patch({"copy_multiplier": Decimal("0")})
     assert exc.value.status_code == 400
     assert "copy_multiplier" in exc.value.detail
+
+
+def test_execution_route_accepts_only_configured_subaccounts() -> None:
+    subaccount = "0x" + "8" * 40
+    settings = Settings(
+        _env_file=None,
+        hyperliquid_account_address="0x" + "7" * 40,
+        hyperliquid_execution_subaccount_addresses=subaccount,
+    )
+
+    _validate_execution_account_route(
+        {"hyperliquid_vault_address": subaccount},
+        settings=settings,
+    )
+    _validate_execution_account_route(
+        {"hyperliquid_vault_address": None},
+        settings=settings,
+    )
+
+    with pytest.raises(HTTPException, match="verified subaccount"):
+        _validate_execution_account_route(
+            {"hyperliquid_vault_address": "0x" + "9" * 40},
+            settings=settings,
+        )
+
+
+def test_execution_route_rejects_main_address_as_explicit_subaccount() -> None:
+    main = "0x" + "7" * 40
+    settings = Settings(
+        _env_file=None,
+        hyperliquid_account_address=main,
+        hyperliquid_execution_subaccount_addresses=main,
+    )
+
+    with pytest.raises(HTTPException, match="select Main account"):
+        _validate_execution_account_route(
+            {"hyperliquid_vault_address": main},
+            settings=settings,
+        )
+
+
+def test_active_leader_cannot_move_between_execution_accounts() -> None:
+    class FakeDb:
+        async def scalar(self, _statement):
+            raise AssertionError("active-route rejection must happen before allocation query")
+
+    with pytest.raises(HTTPException, match="disable the leader"):
+        asyncio.run(
+            _ensure_execution_route_change_safe(
+                FakeDb(),
+                leader=leader(enabled=True),
+                new_route="0x" + "8" * 40,
+            )
+        )
+
+
+def test_disabled_leader_with_open_allocation_cannot_move_execution_account() -> None:
+    class FakeDb:
+        async def scalar(self, _statement):
+            return 1
+
+    with pytest.raises(HTTPException, match="allocations are open"):
+        asyncio.run(
+            _ensure_execution_route_change_safe(
+                FakeDb(),
+                leader=leader(enabled=False),
+                new_route="0x" + "8" * 40,
+            )
+        )
 
 
 @pytest.mark.parametrize("value", [None, Decimal("0"), Decimal("-1")])
@@ -171,7 +278,10 @@ def test_leader_payload_does_not_expose_private_key_or_secret_value() -> None:
         watcher_active=set(),
     )
     assert "hyperliquid_private_key" not in payload
-    assert "hyperliquid_vault_address" not in payload
+    # Execution-account addresses are public routing identifiers. The API must
+    # expose the full value so an operator can verify that a leader is not
+    # accidentally assigned to the wrong subaccount.
+    assert payload["hyperliquid_vault_address"] == "0x" + "9" * 40
     assert payload["hyperliquid_vault_address_configured"] is True
     assert payload["fixed_account_value"] == "1000"
 

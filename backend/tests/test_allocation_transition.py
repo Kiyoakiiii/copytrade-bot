@@ -8,7 +8,7 @@ from app.services.allocations import (
     AllocationTransitionAction,
     DUST_LIFECYCLE_ACCOUNT_RATIO_RESET,
     LEGACY_SIZE_MISSING_NOTIONAL_RATIO_FALLBACK,
-    MAX_POSITION_NOTIONAL_CAP_APPLIED,
+    MAX_POSITION_NOTIONAL_CAP_EXCEEDED,
     assert_allocation_scope,
     plan_leader_allocation_transition,
 )
@@ -77,32 +77,41 @@ def test_flat_to_long_opens() -> None:
     assert item.reduce_only is False
 
 
-def test_open_target_is_capped_by_max_position_notional() -> None:
+def test_open_above_max_position_notional_is_rejected_in_full() -> None:
     item = plan(max_position_notional=Decimal("25"))
 
-    assert item.action == AllocationTransitionAction.OPEN
-    assert item.target_notional == Decimal("25.00000000")
-    assert item.delta_notional == Decimal("25.00000000")
+    assert item.action == AllocationTransitionAction.BLOCK
+    assert item.target_notional == Decimal("0E-8")
+    assert item.delta_notional == Decimal("0E-8")
     assert item.formula_inputs["target_notional_before_cap"] == "100.00000000"
     assert item.formula_inputs["max_position_notional_cap"] == "25.00000000"
-    assert MAX_POSITION_NOTIONAL_CAP_APPLIED in item.formula_inputs["warnings"]
+    assert item.formula_inputs["position_cap_exceeded"] is True
+    assert item.reason.startswith(MAX_POSITION_NOTIONAL_CAP_EXCEEDED)
 
 
-def test_increase_above_max_position_notional_noops_at_cap() -> None:
-    current = allocation(notional="25", qty="0.25", side="LONG")
+def test_increase_above_max_position_notional_is_rejected_in_full() -> None:
+    current = allocation(
+        notional="25",
+        qty="0.25",
+        side="LONG",
+        last_leader_position_size="100",
+    )
 
     item = plan(
         current_allocation=current,
         leader_position_notional=Decimal("50000"),
+        leader_position_size=Decimal("110"),
         max_position_notional=Decimal("25"),
     )
 
-    assert item.action == AllocationTransitionAction.NOOP
+    assert item.action == AllocationTransitionAction.BLOCK
     assert item.target_notional == Decimal("25.00000000")
     assert item.delta_notional == Decimal("0E-8")
+    assert item.formula_inputs["attempted_target_notional"] == "27.50000000"
+    assert item.reason.startswith(MAX_POSITION_NOTIONAL_CAP_EXCEEDED)
 
 
-def test_lowering_max_position_notional_reduces_existing_allocation_to_cap() -> None:
+def test_lowering_max_position_notional_does_not_force_an_unprompted_reduce() -> None:
     current = allocation(notional="80", qty="0.8", side="LONG", last_leader_position_size="100")
 
     item = plan(
@@ -112,10 +121,10 @@ def test_lowering_max_position_notional_reduces_existing_allocation_to_cap() -> 
         max_position_notional=Decimal("50"),
     )
 
-    assert item.action == AllocationTransitionAction.REDUCE
-    assert item.target_notional == Decimal("50.00000000")
-    assert item.delta_notional == Decimal("-30.00000000")
-    assert item.close_qty_limit == Decimal("0.30000000")
+    assert item.action == AllocationTransitionAction.NOOP
+    assert item.target_notional == Decimal("80.00000000")
+    assert item.delta_notional == Decimal("0E-8")
+    assert item.close_qty_limit == Decimal("0E-8")
 
 
 def test_same_side_reduce_still_follows_percentage_under_max_position_cap() -> None:
@@ -148,6 +157,76 @@ def test_cap_allows_reincrease_after_leader_reduces_below_cap() -> None:
     assert item.target_notional == Decimal("20.00000000")
     assert item.delta_notional == Decimal("4.00000000")
     assert item.reduce_only is False
+
+
+def test_position_cap_allows_open_exactly_at_limit() -> None:
+    item = plan(max_position_notional=Decimal("100"))
+
+    assert item.action == AllocationTransitionAction.OPEN
+    assert item.target_notional == Decimal("100.00000000")
+
+
+def test_each_later_increase_is_rejected_again_when_projected_position_still_exceeds_cap() -> None:
+    current = allocation(
+        notional="19",
+        qty="0.19",
+        side="LONG",
+        last_leader_position_size="110",
+    )
+
+    item = plan(
+        current_allocation=current,
+        leader_position_notional=Decimal("12000"),
+        leader_position_size=Decimal("120"),
+        leader_previous_position_size=Decimal("110"),
+        max_position_notional=Decimal("20"),
+    )
+
+    assert item.action == AllocationTransitionAction.BLOCK
+    assert item.target_notional == Decimal("19.00000000")
+    assert item.delta_notional == Decimal("0E-8")
+    assert Decimal(item.formula_inputs["attempted_target_notional"]) > Decimal("20")
+
+
+def test_reduce_from_above_cap_follows_leader_percentage_and_is_not_forced_to_cap() -> None:
+    current = allocation(
+        notional="30",
+        qty="0.30",
+        side="LONG",
+        last_leader_position_size="100",
+    )
+
+    item = plan(
+        current_allocation=current,
+        leader_position_notional=Decimal("9000"),
+        leader_position_size=Decimal("90"),
+        leader_previous_position_size=Decimal("100"),
+        leader_fill_is_reduce_or_close=True,
+        max_position_notional=Decimal("20"),
+    )
+
+    assert item.action == AllocationTransitionAction.REDUCE
+    assert item.target_notional == Decimal("27.00000000")
+    assert item.delta_notional == Decimal("-3.00000000")
+    assert item.close_qty_limit == Decimal("0.03000000")
+
+
+def test_close_from_above_cap_is_always_allowed() -> None:
+    current = allocation(notional="30", qty="0.30", side="LONG")
+
+    item = plan(
+        current_allocation=current,
+        leader_side=PositionSide.FLAT,
+        leader_position_notional=Decimal("0"),
+        leader_position_size=Decimal("0"),
+        leader_fill_is_reduce_or_close=True,
+        max_position_notional=Decimal("20"),
+    )
+
+    assert item.action == AllocationTransitionAction.CLOSE
+    assert item.target_notional == Decimal("0E-8")
+    assert item.delta_notional == Decimal("-30.00000000")
+    assert item.reduce_only is True
 
 
 def test_long_increase_reduce_close_and_noop() -> None:

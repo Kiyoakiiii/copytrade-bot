@@ -9,6 +9,7 @@ from app.models import AppSetting, AuditLog
 from app.schemas.api import RiskPatch
 from app.services.calculator import SIZING_MODE_ACCOUNT_RATIO
 from app.services.order_policy import AUTO_COPY_ORDER_POLICY
+from app.services.runtime_control import acquire_copy_trading_control_lock
 
 router = APIRouter(tags=["risk"])
 
@@ -72,6 +73,7 @@ async def read_risk(_: CurrentUser, db: DbSession, settings: AppSettings):
 
 @router.patch("/risk")
 async def patch_risk(user: CurrentUser, payload: RiskPatch, db: DbSession, settings: AppSettings):
+    await acquire_copy_trading_control_lock(db)
     previous = _stored_risk_value(await get_risk_setting(db))
     current = dict(previous)
     current.update(payload.model_dump(exclude_unset=True))
@@ -98,6 +100,7 @@ async def patch_risk(user: CurrentUser, payload: RiskPatch, db: DbSession, setti
 
 @router.post("/kill-switch")
 async def kill_switch(user: CurrentUser, db: DbSession, settings: AppSettings):
+    await acquire_copy_trading_control_lock(db)
     previous = _stored_risk_value(await get_risk_setting(db))
     current = dict(previous)
     current["kill_switch"] = True

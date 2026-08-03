@@ -447,31 +447,40 @@ async def poll_once(
                         dex=dex.dex_name,
                         error=str(exc),
                     )
-            try:
-                abstraction = await AccountAbstractionService(client, settings).fetch_snapshot(
-                    role=LEADER,
-                    address=leader.leader_address,
-                    dexes=[dex.dex_name for dex in enabled_dexes],
-                )
-                await save_account_abstraction_state(
-                    db,
-                    snapshot=abstraction,
-                    resolved_by_dex={
-                        dex.dex_name: resolve_account_value_for_sizing(
-                            abstraction,
-                            dex.dex_name,
-                            settings,
-                        )
-                        for dex in enabled_dexes
-                    },
-                )
-            except Exception as exc:
-                log.warning(
-                    "leader_account_abstraction_poll_failed",
-                    leader_address=leader.leader_address,
-                    error=str(exc),
-                )
+            if _leader_requires_dynamic_account_abstraction(leader):
+                try:
+                    abstraction = await AccountAbstractionService(client, settings).fetch_snapshot(
+                        role=LEADER,
+                        address=leader.leader_address,
+                        dexes=[dex.dex_name for dex in enabled_dexes],
+                    )
+                    await save_account_abstraction_state(
+                        db,
+                        snapshot=abstraction,
+                        resolved_by_dex={
+                            dex.dex_name: resolve_account_value_for_sizing(
+                                abstraction,
+                                dex.dex_name,
+                                settings,
+                            )
+                            for dex in enabled_dexes
+                        },
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "leader_account_abstraction_poll_failed",
+                        leader_address=leader.leader_address,
+                        error=str(exc),
+                    )
         await db.commit()
+
+
+def _leader_requires_dynamic_account_abstraction(leader: Any) -> bool:
+    """Live sizing uses the configured leader balance when it is valid."""
+    try:
+        return Decimal(leader.fixed_account_value or 0) <= 0
+    except Exception:
+        return True
 
 
 def _spot_balance(spot_state: dict, coin: str) -> str | None:

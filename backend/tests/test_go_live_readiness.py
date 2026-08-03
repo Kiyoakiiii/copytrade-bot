@@ -3,7 +3,9 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from app.core.config import Settings
-from app.core.logging import mask_event
+from app.core.logging import REDACTED, mask_event, redact_text
+from app.api.orders import _order_payload
+from app.models import ExecutionOrder
 from app.services.allocations import (
     AllocationStatus,
     LeaderPositionAllocation,
@@ -114,6 +116,64 @@ def test_unconfirmed_cross_effective_leverage_blocks_open() -> None:
     assert "failed to set cross" in (result.reason or "")
 
 
+def test_manual_risk_service_forces_isolated_markets_to_one_x() -> None:
+    class FakeClient:
+        def __init__(self):
+            self.updates = []
+
+        async def meta(self, dex=""):
+            return {"universe": [{"name": "BTC", "maxLeverage": 50}]}
+
+        async def account_state(self, dex=""):
+            return {"withdrawable": "1000", "assetPositions": []}
+
+        async def update_leverage(self, *, coin: str, leverage: int, is_cross: bool):
+            self.updates.append((coin, leverage, is_cross))
+            return {"status": "ok"}
+
+    client = FakeClient()
+    result = asyncio.run(
+        HyperliquidRiskSettingsService(
+            client,
+            expected_leverage=10,
+            settings=Settings(_env_file=None, hyperliquid_default_margin_mode="ISOLATED"),
+        ).ensure_symbol_risk_settings("BTC", target_notional=Decimal("100"))
+    )
+
+    assert result.is_ok is True
+    assert result.effective_leverage == 1
+    assert client.updates == [("BTC", 1, False)]
+
+
+def test_manual_risk_service_forces_cxmt_to_one_x_even_in_cross_mode() -> None:
+    class FakeClient:
+        def __init__(self):
+            self.updates = []
+
+        async def meta(self, dex=""):
+            return {"universe": [{"name": "CXMT", "maxLeverage": 5}]}
+
+        async def account_state(self, dex=""):
+            return {"withdrawable": "1000", "assetPositions": []}
+
+        async def update_leverage(self, *, coin: str, leverage: int, is_cross: bool):
+            self.updates.append((coin, leverage, is_cross))
+            return {"status": "ok"}
+
+    client = FakeClient()
+    result = asyncio.run(
+        HyperliquidRiskSettingsService(
+            client,
+            expected_leverage=10,
+            settings=Settings(_env_file=None, hyperliquid_default_margin_mode="CROSS"),
+        ).ensure_symbol_risk_settings("xyz:CXMT", target_notional=Decimal("100"))
+    )
+
+    assert result.is_ok is True
+    assert result.effective_leverage == 1
+    assert client.updates == [("xyz:CXMT", 1, True)]
+
+
 def test_global_trading_disabled_prevents_live_order() -> None:
     assert venue_live_allowed(
         global_trading_enabled=False,
@@ -161,8 +221,25 @@ def test_kill_switch_allows_close_reduce_intent() -> None:
 def test_private_key_is_masked_from_logs() -> None:
     event = mask_event(None, "", {"hyperliquid_private_key": "0x" + "a" * 64})
 
-    assert event["hyperliquid_private_key"] != "0x" + "a" * 64
-    assert "***" in event["hyperliquid_private_key"] or "..." in event["hyperliquid_private_key"]
+    assert event["hyperliquid_private_key"] == REDACTED
+
+
+def test_private_key_embedded_in_error_text_is_fully_redacted() -> None:
+    secret = "0x" + "a" * 64
+
+    redacted = redact_text(f"signing failed for {secret}")
+
+    assert redacted == f"signing failed for {REDACTED}"
+    assert "a" * 4 not in redacted
+
+
+def test_telegram_bot_token_embedded_in_url_is_fully_redacted() -> None:
+    token = "<REDACTED_TELEGRAM_TOKEN>"
+
+    redacted = redact_text(f"POST https://api.telegram.org/bot{token}/getUpdates failed")
+
+    assert token not in redacted
+    assert redacted == f"POST https://api.telegram.org/bot{REDACTED}/getUpdates failed"
 
 
 def test_api_style_response_does_not_include_private_key() -> None:
@@ -184,6 +261,28 @@ def test_execution_order_masked_payload_does_not_include_private_key() -> None:
     )
 
     assert "private_key" not in payload
+
+
+def test_order_api_never_exposes_persisted_signed_action() -> None:
+    order = ExecutionOrder(
+        leader_address="0x" + "1" * 40,
+        source_coin="BTC",
+        side="BUY",
+        order_type="MARKET",
+        quantity=Decimal("0.01"),
+        status="SUBMITTING",
+        signed_action_envelope={"payload": {"signature": {"r": "sensitive"}}},
+        signed_action_hash="hash",
+        submit_signer_scope="scope",
+        submit_nonce=123,
+    )
+
+    payload = _order_payload(order)
+
+    assert "signed_action_envelope" not in payload
+    assert "signed_action_hash" not in payload
+    assert "submit_signer_scope" not in payload
+    assert "submit_nonce" not in payload
 
 
 def test_startup_validator_missing_hyperliquid_key_marks_not_ready() -> None:

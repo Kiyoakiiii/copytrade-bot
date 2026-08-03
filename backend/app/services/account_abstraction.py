@@ -205,34 +205,79 @@ class AccountAbstractionService:
         address: str,
         dexes: list[str],
         collateral_token: str | None = None,
+        confirmed_unified_fast: bool = False,
     ) -> AccountAbstractionSnapshot:
         errors: list[str] = []
+        if confirmed_unified_fast:
+            # The full refresh periodically reconfirms userAbstraction. Between
+            # those checks, a confirmed unified execution account only needs
+            # one lightweight spot balance request for sizing freshness.
+            spot_state = await self._safe_spot(address, errors)
+            spot_meta_and_asset_ctxs = None
+            all_mids = None
+            if spot_state is not None and _spot_state_requires_market_prices(spot_state):
+                spot_meta_and_asset_ctxs = await self._safe_post(
+                    {"type": "spotMetaAndAssetCtxs"},
+                    errors,
+                    "spotMetaAndAssetCtxs",
+                )
+                all_mids = await self._safe_post(
+                    {"type": "allMids"},
+                    errors,
+                    "allMids",
+                )
+            return build_account_abstraction_snapshot(
+                role=role,
+                address=address,
+                user_abstraction="unifiedAccount",
+                portfolio_state=None,
+                spot_state=spot_state,
+                clearinghouse_by_dex={},
+                settings=self._settings,
+                error_message="; ".join(errors) if errors else None,
+                collateral_token=collateral_token
+                or _settings_str(self._settings, "default_collateral_token", "USDC"),
+                spot_account_value=spot_account_value_from_response(
+                    spot_state,
+                    spot_meta_and_asset_ctxs=spot_meta_and_asset_ctxs,
+                    all_mids=all_mids,
+                ),
+            )
         user_abstraction = await self._safe_post(
             {"type": "userAbstraction", "user": address},
             errors,
             "userAbstraction",
         )
-        portfolio_state = await self._safe_post(
-            {"type": "portfolioState", "user": address},
-            errors,
-            "portfolioState",
-        )
-        if portfolio_state is None:
+        confirmed_mode = _confirmed_mode_from_user_abstraction(user_abstraction)
+        # A confirmed unified account is sized from its spot collateral.  Do
+        # not repeatedly probe portfolio endpoints that are irrelevant (and
+        # may return 422) on every background balance refresh.
+        portfolio_state = None
+        if confirmed_mode in {None, MODE_PORTFOLIO}:
             portfolio_state = await self._safe_post(
-                {"type": "portfolio", "user": address},
+                {"type": "portfolioState", "user": address},
                 errors,
-                "portfolio",
+                "portfolioState",
             )
-        if portfolio_state is None:
-            portfolio_state = await self._safe_post(
-                {"type": "batchPortfolioStates", "users": [address]},
-                errors,
-                "batchPortfolioStates",
-            )
+            if portfolio_state is None:
+                portfolio_state = await self._safe_post(
+                    {"type": "portfolio", "user": address},
+                    errors,
+                    "portfolio",
+                )
+            if portfolio_state is None:
+                portfolio_state = await self._safe_post(
+                    {"type": "batchPortfolioStates", "users": [address]},
+                    errors,
+                    "batchPortfolioStates",
+                )
         spot_state = await self._safe_spot(address, errors)
         spot_meta_and_asset_ctxs = None
         all_mids = None
-        if spot_state is not None:
+        # USDC and the other supported stable collateral tokens have a local
+        # 1 USD fallback.  Market metadata is only needed when a non-stable
+        # spot balance actually contributes to the account value.
+        if spot_state is not None and _spot_state_requires_market_prices(spot_state):
             spot_meta_and_asset_ctxs = await self._safe_post(
                 {"type": "spotMetaAndAssetCtxs"},
                 errors,
@@ -249,7 +294,17 @@ class AccountAbstractionService:
             all_mids=all_mids,
         )
         clearinghouse_by_dex: dict[str, dict[str, Any] | None] = {}
-        for dex in dexes:
+        clearinghouse_dexes = list(dexes)
+        if confirmed_mode == MODE_UNIFIED:
+            requested = {str(dex or "").lower() for dex in dexes}
+            clearinghouse_dexes = [
+                dex
+                for dex in _account_value_reference_dexes(self._settings)
+                if dex in requested
+            ]
+            if not clearinghouse_dexes:
+                clearinghouse_dexes = [""]
+        for dex in clearinghouse_dexes:
             clearinghouse_by_dex[str(dex or "").lower()] = await self._safe_clearinghouse(
                 address,
                 dex=str(dex or "").lower(),
@@ -796,6 +851,17 @@ def _spot_fallback_price(coin: str) -> Decimal | None:
     if coin in {"USDC", "USDT", "USDT0", "USDE", "USDH", "USDL", "USDXL", "USDHL"}:
         return Decimal("1")
     return None
+
+
+def _spot_state_requires_market_prices(spot_state: dict[str, Any] | None) -> bool:
+    for row in (spot_state or {}).get("balances") or []:
+        quantity = _decimal_or_none(row.get("total"))
+        if quantity is None or quantity == 0:
+            continue
+        coin = str(row.get("coin") or row.get("token") or "").upper()
+        if _spot_fallback_price(coin) is None:
+            return True
+    return False
 
 
 def _stable_spot_account_value_from_balances(

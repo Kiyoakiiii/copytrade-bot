@@ -137,8 +137,9 @@ def test_stream_endpoint_does_not_hold_auth_db_session_for_sse_lifetime() -> Non
         return
     text = (root / "backend/app/api/stream.py").read_text()
     assert "CurrentUser" not in text
-    assert "await current_user(request, db, settings)" in text
-    assert text.index("await current_user(request, db, settings)") < text.index("StreamingResponse(")
+    assert "await current_user(" in text
+    assert "request.cookies.get(settings.session_cookie_name)" in text
+    assert text.index("await current_user(") < text.index("StreamingResponse(")
 
 
 def test_key_background_tasks_write_task_status() -> None:

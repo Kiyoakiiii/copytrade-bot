@@ -11,10 +11,11 @@ from sqlalchemy.dialects.postgresql import insert
 
 from app.api import account_states, auth, dashboard, leaders, manual_orders, orders, positions, preflight, risk, stream, symbol_mappings, venues
 from app.core.config import get_settings
-from app.core.logging import configure_logging
+from app.core.logging import configure_logging, redact_text
 from app.db.session import SessionLocal
 from app.models import AppSetting
 from app.services.follower_migration import prepare_follower_runtime_identity
+from app.services.leader_performance import run_leader_performance_refresher
 from app.services.order_recovery import recover_unresolved_orders
 from app.services.startup_config_validator import (
     bootstrap_leaders_from_settings,
@@ -23,6 +24,13 @@ from app.services.startup_config_validator import (
     validate_startup_config,
 )
 from app.services.task_status import store_task_status
+from app.services.telegram_control_bot import (
+    TELEGRAM_CONTROL_TASK_NAME,
+    TELEGRAM_EXECUTION_ALERT_TASK_NAME,
+    run_telegram_control_bot,
+    run_telegram_execution_alerts,
+    telegram_control_config_error,
+)
 from app.tasks.leader_state_poller import run_leader_state_poller
 from app.tasks.low_latency_watcher import run_low_latency_watcher
 
@@ -45,9 +53,10 @@ async def _supervised_background_task(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.exception("background_task_failed", task_name=name, error=str(exc))
+            safe_error = redact_text(exc)
+            log.exception("background_task_failed", task_name=name, error=safe_error)
             async with SessionLocal() as db:
-                await store_task_status(db, task_name=name, status="failed_restarting", last_error=str(exc)[:500])
+                await store_task_status(db, task_name=name, status="failed_restarting", last_error=safe_error[:500])
                 await db.commit()
             await asyncio.sleep(restart_delay_seconds)
 
@@ -76,13 +85,14 @@ async def _order_recovery_loop() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.exception("order_recovery_loop_failed", error=str(exc))
+            safe_error = redact_text(exc)
+            log.exception("order_recovery_loop_failed", error=safe_error)
             async with SessionLocal() as db:
                 await store_task_status(
                     db,
                     task_name="order_recovery",
                     status="failed_restarting",
-                    last_error=str(exc)[:500],
+                    last_error=safe_error[:500],
                 )
                 await db.commit()
         await asyncio.sleep(max(0.5, float(settings.order_recovery_interval_seconds)))
@@ -122,6 +132,36 @@ async def startup() -> None:
         startup_validation = await validate_startup_config(settings=settings, db=db)
         await store_startup_validation(db, startup_validation)
         await _prepare_startup_hyperliquid_risk_settings(db)
+    telegram_config_error = telegram_control_config_error(settings)
+    if settings.telegram_control_enabled and telegram_config_error is None:
+        app.state.telegram_control_task = asyncio.create_task(
+            _supervised_background_task(
+                TELEGRAM_CONTROL_TASK_NAME,
+                lambda: run_telegram_control_bot(settings),
+            )
+        )
+        app.state.telegram_execution_alert_task = asyncio.create_task(
+            _supervised_background_task(
+                TELEGRAM_EXECUTION_ALERT_TASK_NAME,
+                lambda: run_telegram_execution_alerts(settings),
+            )
+        )
+    else:
+        async with SessionLocal() as db:
+            for task_name in (
+                TELEGRAM_CONTROL_TASK_NAME,
+                TELEGRAM_EXECUTION_ALERT_TASK_NAME,
+            ):
+                await store_task_status(
+                    db,
+                    task_name=task_name,
+                    status="blocked_config" if settings.telegram_control_enabled else "disabled",
+                    last_error=telegram_config_error,
+                    metadata={"enabled": bool(settings.telegram_control_enabled)},
+                )
+            await db.commit()
+        if telegram_config_error:
+            log.error("telegram_control_config_blocked", error=telegram_config_error)
     if not follower_migration.ready:
         async with SessionLocal() as db:
             for task_name in ("order_recovery", "leader_state_poller", "low_latency_watcher"):
@@ -156,10 +196,25 @@ async def startup() -> None:
     app.state.leader_state_task = asyncio.create_task(
         _supervised_background_task("leader_state_poller", lambda: run_leader_state_poller(settings))
     )
-    app.state.low_latency_watcher_task = asyncio.create_task(
-        _supervised_background_task("low_latency_watcher", lambda: run_low_latency_watcher(settings))
-    )
+    if settings.embedded_low_latency_watcher_enabled:
+        app.state.low_latency_watcher_task = asyncio.create_task(
+            _supervised_background_task("low_latency_watcher", lambda: run_low_latency_watcher(settings))
+        )
+    else:
+        log.info("embedded_low_latency_watcher_disabled", execution_mode="dedicated_process")
     app.state.order_recovery_task = asyncio.create_task(_order_recovery_loop())
+    if settings.leader_performance_refresh_enabled:
+        app.state.leader_performance_task = asyncio.create_task(
+            _supervised_background_task(
+                "leader_performance",
+                lambda: run_leader_performance_refresher(settings),
+            )
+        )
+    else:
+        log.info(
+            "leader_performance_refresher_disabled",
+            reason="historical analytics are isolated from the live trading host",
+        )
 
 
 @app.on_event("shutdown")
@@ -177,6 +232,18 @@ async def shutdown() -> None:
     if order_recovery_task:
         order_recovery_task.cancel()
         tasks.append(order_recovery_task)
+    telegram_control_task = getattr(app.state, "telegram_control_task", None)
+    if telegram_control_task:
+        telegram_control_task.cancel()
+        tasks.append(telegram_control_task)
+    telegram_execution_alert_task = getattr(app.state, "telegram_execution_alert_task", None)
+    if telegram_execution_alert_task:
+        telegram_execution_alert_task.cancel()
+        tasks.append(telegram_execution_alert_task)
+    leader_performance_task = getattr(app.state, "leader_performance_task", None)
+    if leader_performance_task:
+        leader_performance_task.cancel()
+        tasks.append(leader_performance_task)
     if tasks:
         with suppress(Exception):
             await asyncio.gather(*tasks, return_exceptions=True)

@@ -604,6 +604,7 @@ async def preflight(_: CurrentUser, db: DbSession, settings: AppSettings):
         "xyz_price_cache_fresh": bool(watcher_status.get("xyz_price_cache_fresh")),
         "last_ws_event_at": watcher_status.get("last_ws_event_at"),
         "last_ws_event_age_ms": watcher_status.get("last_ws_event_age_ms"),
+        "recent_submit_latency": watcher_status.get("recent_submit_latency") or {},
         "LOW_LATENCY_REQUIRED_FOR_LIVE": settings.low_latency_required_for_live,
         "ALLOW_POLL_FALLBACK_LIVE": settings.allow_poll_fallback_live,
         "ready_for_low_latency_live": bool(watcher_status.get("ready_for_low_latency_live")),
@@ -1925,6 +1926,7 @@ async def _build_hyperliquid_readiness(
             continue
         allocations_by_coin.setdefault(coin, {"LONG": Decimal("0"), "SHORT": Decimal("0")})
         allocations_by_coin[coin][side] += allocation.allocated_qty
+    terminal_flat_leader_residuals = _terminal_flat_leader_allocation_residuals(allocations)
 
     aggregate_positions = []
     allocation_mismatches = []
@@ -1993,6 +1995,10 @@ async def _build_hyperliquid_readiness(
         if item["enabled"] and item["status"] == "BLOCKED"
     )
     blocking.extend(f"allocation {item['symbol']} mismatch" for item in allocation_mismatches)
+    blocking.extend(
+        f"allocation {item['symbol']} remains nonzero after leader flat"
+        for item in terminal_flat_leader_residuals
+    )
     if pending_hyperliquid:
         blocking.append(f"{len(pending_hyperliquid)} unresolved Hyperliquid auto orders require recovery")
 
@@ -2036,6 +2042,8 @@ async def _build_hyperliquid_readiness(
         "symbols": symbol_items,
         "aggregate_positions": aggregate_positions,
         "allocation_mismatches": allocation_mismatches,
+        "terminal_flat_leader_residuals": terminal_flat_leader_residuals,
+        "terminal_flat_leader_residual_count": len(terminal_flat_leader_residuals),
         "unknown_orders_count": len(pending_hyperliquid),
         "rate_limit_warning": None,
         "ready_for_live_hyperliquid": ready,
@@ -2047,3 +2055,46 @@ async def _build_hyperliquid_readiness(
         "blocking_reasons": blocking,
         "message": "OK" if not blocking else "; ".join(blocking),
     }
+
+
+def _terminal_flat_leader_allocation_residuals(
+    allocations: list[LeaderPositionAllocationRecord],
+) -> list[dict[str, Any]]:
+    """Expose lifecycle errors that an allocation-vs-follower equality check misses."""
+    residuals: list[dict[str, Any]] = []
+    for allocation in allocations:
+        if (
+            allocation.execution_venue != ExecutionVenue.HYPERLIQUID.value
+            or str(allocation.status or "").upper() == "CLOSED"
+        ):
+            continue
+        leader_size = allocation.last_leader_position_size
+        if leader_size is None or abs(Decimal(leader_size or 0)) > Decimal("0.00000001"):
+            continue
+        allocated_qty = abs(Decimal(allocation.allocated_qty or 0))
+        target_notional = abs(Decimal(allocation.target_notional or 0))
+        if allocated_qty <= Decimal("0.00000001") or target_notional > Decimal("0.00000001"):
+            continue
+        coin = allocation.canonical_coin or canonical_coin(
+            dex=allocation.dex,
+            coin=allocation.hyperliquid_coin,
+        )
+        residuals.append(
+            {
+                "allocation_id": allocation.id,
+                "leader_id": allocation.leader_id,
+                "symbol": coin,
+                "dex": allocation.dex,
+                "position_side": allocation.position_side,
+                "status": allocation.status,
+                "allocated_qty": str(allocated_qty),
+                "allocated_notional": str(abs(Decimal(allocation.allocated_notional or 0))),
+                "pending_reduce_qty": (
+                    str(abs(Decimal(allocation.pending_reduce_qty or 0)))
+                    if allocation.pending_reduce_qty is not None
+                    else None
+                ),
+                "message": "leader is flat but the follower allocation remains nonzero",
+            }
+        )
+    return residuals

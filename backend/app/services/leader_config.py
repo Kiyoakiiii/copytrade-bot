@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.models import LeaderConfig
 from app.services.hyperliquid_dex import canonical_coin as dex_canonical_coin
@@ -145,13 +145,26 @@ def allowed_coin_match_status(
     }
 
 
-def active_leaders_statement():
-    return (
+def active_leaders_statement(
+    *,
+    execution_scope: str = "",
+    explicit_route: bool | None = None,
+):
+    statement = (
         select(LeaderConfig)
         .where(LeaderConfig.enabled.is_(True))
         .where(LeaderConfig.deleted_at.is_(None))
-        .order_by(LeaderConfig.created_at.desc())
     )
+    if explicit_route is True:
+        statement = statement.where(
+            func.lower(func.coalesce(LeaderConfig.hyperliquid_vault_address, ""))
+            == str(execution_scope or "").lower()
+        )
+    elif explicit_route is False:
+        statement = statement.where(
+            func.coalesce(LeaderConfig.hyperliquid_vault_address, "") == ""
+        )
+    return statement.order_by(LeaderConfig.created_at.desc())
 
 
 def soft_delete_leader(
@@ -169,10 +182,15 @@ def disable_leader(leader_config: Any) -> None:
     leader_config.enabled = False
 
 
-def enable_leader(leader_config: Any) -> None:
+def enable_leader(leader_config: Any, *, now: datetime | None = None) -> None:
+    was_active = bool(getattr(leader_config, "enabled", False)) and not is_leader_deleted(
+        leader_config
+    )
     leader_config.enabled = True
     leader_config.deleted_at = None
     leader_config.delete_reason = None
+    if not was_active:
+        leader_config.performance_started_at = now or datetime.now(timezone.utc)
 
 
 def active_leader_addresses(leaders: Iterable[Any]) -> set[str]:

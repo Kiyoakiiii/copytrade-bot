@@ -452,7 +452,7 @@ function LeaderCard({ leader }: { leader: LeaderAccount }) {
               <StatusPill>{leader.leader.allowed_coins_mode === "ALL_COINS" ? "All coins" : "Custom coins"}</StatusPill>
               <StatusPill>{leader.leader.preferred_venue}</StatusPill>
             </div>
-            <div className="mt-1 truncate font-mono text-xs text-slate-500">{leader.leader.leader_address}</div>
+            <div className="mt-1 break-all font-mono text-xs text-slate-500">{leader.leader.leader_address}</div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <div className="rounded-md border border-line bg-slate-50 px-3 py-2">

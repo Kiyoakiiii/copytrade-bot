@@ -33,7 +33,18 @@ VERSION_POLL_SECONDS = 1.0
 @router.get("/stream/dashboard")
 async def stream_dashboard(request: Request, settings: AppSettings):
     async with SessionLocal() as db:
-        await current_user(request, db, settings)
+        # ``current_user`` is normally called by FastAPI's dependency injector,
+        # which resolves its ``Cookie(...)`` default to a string.  This endpoint
+        # calls it directly so that the authentication session can be closed
+        # before the long-lived SSE response starts.  Pass the concrete cookie
+        # value explicitly; otherwise the unresolved FastAPI Cookie descriptor
+        # reaches the session-token verifier and raises TypeError.
+        await current_user(
+            request,
+            db,
+            settings,
+            request.cookies.get(settings.session_cookie_name),
+        )
     return StreamingResponse(
         _dashboard_event_generator(request, settings),
         media_type="text/event-stream",

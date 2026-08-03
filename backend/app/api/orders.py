@@ -60,6 +60,15 @@ async def list_orders(
 
 def _order_payload(row: ExecutionOrder) -> dict:
     payload = jsonable_encoder(row)
+    # A persisted signed action is an internal recovery artifact. Never expose
+    # its signature/envelope or signer fingerprint through the operator API.
+    for internal_field in (
+        "signed_action_envelope",
+        "signed_action_hash",
+        "submit_signer_scope",
+        "submit_nonce",
+    ):
+        payload.pop(internal_field, None)
     checklist = row.pre_trade_checklist or {}
     validator = checklist.get("order_validator") or {}
     payload["order_validator"] = validator
