@@ -160,7 +160,7 @@ export function LeaderPerformanceOverviewPanel({ data }: { data: LeaderPerforman
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-3">
         <div>
           <div className="text-sm font-semibold text-ink">Leader 绩效 · 自加入以来</div>
-          <div className="mt-1 text-xs text-slate-500">后台每日更新一次，页面仅读取缓存，不会因实时持仓事件请求交易所历史接口</div>
+          <div className="mt-1 text-xs text-slate-500">后台每 6 小时增量更新，页面仅读取缓存，不会因实时持仓事件请求交易所历史接口</div>
         </div>
         <div className="text-xs text-slate-500">统计生成 {formatDateTime(data.generated_at)}</div>
       </div>

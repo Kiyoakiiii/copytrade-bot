@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from statistics import median
@@ -34,8 +35,12 @@ from app.services.task_status import store_task_status
 log = structlog.get_logger(__name__)
 
 LEADER_PERFORMANCE_CACHE_KEY = "leader_performance:v1"
+LEADER_PERFORMANCE_EXCHANGE_CACHE_KEY = "leader_performance:exchange_cache:v1"
 LEADER_PERFORMANCE_TASK_NAME = "leader_performance"
 PERFORMANCE_SCHEMA_VERSION = 1
+PERFORMANCE_EXCHANGE_CACHE_SCHEMA_VERSION = 1
+PERFORMANCE_INCREMENTAL_OVERLAP_MS = 60_000
+MAIN_EXECUTION_SCOPE_CACHE_KEY = "__main__"
 USER_FILLS_PAGE_SIZE = 2000
 USER_FUNDING_PAGE_SIZE = 500
 ZERO = Decimal("0")
@@ -151,6 +156,7 @@ async def refresh_leader_performance(settings: Any) -> dict[str, Any]:
         unmatched_fills = (
             await db.execute(select(UnmatchedFollowerFill))
         ).scalars().all()
+        exchange_cache = await _load_performance_exchange_cache(db)
 
     fills_by_address: dict[str, list[SourceFill]] = defaultdict(list)
     for row in source_fills:
@@ -168,7 +174,14 @@ async def refresh_leader_performance(settings: Any) -> dict[str, Any]:
     states_by_id = {row.id: row for row in account_states}
     leader_positions_by_address: dict[str, list[LatestAccountPosition]] = defaultdict(list)
     follower_positions_by_account: dict[str, list[LatestAccountPosition]] = defaultdict(list)
-    default_follower_address = str(settings.hyperliquid_follower_account_address() or "").lower()
+    # Analytics spans every execution account.  The historical empty scope is
+    # always the main account even if another process is configured with an
+    # explicit subaccount route.
+    default_follower_address = str(
+        settings.hyperliquid_account_address
+        or settings.hyperliquid_follower_account_address()
+        or ""
+    ).lower()
     for position in account_positions:
         state = states_by_id.get(position.account_state_id)
         if state is None:
@@ -178,14 +191,23 @@ async def refresh_leader_performance(settings: Any) -> dict[str, Any]:
         elif state.role == FOLLOWER:
             follower_positions_by_account[str(state.address).lower()].append(position)
 
-    execution_accounts = {
-        str(row.venue_account or "").lower()
-        for row in [*orders, *active_allocations]
-    }
+    execution_accounts = _performance_execution_scopes(
+        leaders=leaders,
+        orders=orders,
+        active_allocations=active_allocations,
+    )
     follower_address_by_scope = {
         scope: (scope if scope else default_follower_address)
         for scope in execution_accounts | {""}
     }
+    joined_ms_by_scope: dict[str, int] = {}
+    for leader in leaders:
+        scope = str(leader.hyperliquid_vault_address or "").strip().lower()
+        leader_joined_ms = joined_ms[int(leader.id)]
+        joined_ms_by_scope[scope] = min(
+            joined_ms_by_scope.get(scope, leader_joined_ms),
+            leader_joined_ms,
+        )
     follower_open_by_leader: dict[int, dict[str, Any]] = defaultdict(_empty_open_attribution)
     for execution_scope, follower_address in follower_address_by_scope.items():
         if not follower_address:
@@ -209,40 +231,178 @@ async def refresh_leader_performance(settings: Any) -> dict[str, Any]:
             target["notional"] += values["notional"]
             target["manual_sync"] = target["manual_sync"] or values["manual_sync"]
 
+    updated_exchange_cache = deepcopy(exchange_cache)
+    updated_exchange_cache["schema_version"] = PERFORMANCE_EXCHANGE_CACHE_SCHEMA_VERSION
+    follower_cache_by_scope = updated_exchange_cache.setdefault("follower_scopes", {})
+    funding_cache_by_leader = updated_exchange_cache.setdefault("leader_funding", {})
+    portfolio_cache_by_leader = updated_exchange_cache.setdefault("leader_portfolios", {})
+    cache_stats = {
+        "follower_fill_api_rows": 0,
+        "follower_fill_cached_rows": 0,
+        "funding_api_rows": 0,
+        "funding_cached_rows": 0,
+        "portfolio_api_requests": 0,
+        "portfolio_cache_fallbacks": 0,
+    }
+
     info = HyperliquidInfoClient(settings.hyperliquid_info_url)
     try:
         end_ms = int(now.timestamp() * 1000)
-        follower_fills: list[dict[str, Any]] = []
+        actual_fills_by_order: dict[int, list[dict[str, Any]]] = {}
         for execution_scope, follower_address in follower_address_by_scope.items():
             if not follower_address:
                 continue
+            scope_cache_key = _performance_scope_cache_key(execution_scope)
+            required_start_ms = joined_ms_by_scope.get(execution_scope, earliest_join_ms)
+            cached_scope = follower_cache_by_scope.get(scope_cache_key)
+            if not _valid_incremental_cache_entry(
+                cached_scope,
+                identity=follower_address,
+                required_start_ms=required_start_ms,
+            ):
+                cached_scope = {
+                    "identity": follower_address,
+                    "coverage_start_ms": required_start_ms,
+                    "cursor_ms": None,
+                    "fills_by_order": {},
+                }
+            scope_orders = [
+                order
+                for order in orders
+                if str(order.venue_account or "").lower() == execution_scope
+            ]
+            valid_order_ids = {
+                int(order.id)
+                for order in scope_orders
+                if order.id is not None
+            }
+            cached_fills_by_order = _cached_order_fills(
+                cached_scope.get("fills_by_order"),
+                valid_order_ids=valid_order_ids,
+            )
+            incremental_start_ms = _performance_incremental_start_ms(
+                cached_scope.get("cursor_ms"),
+                required_start_ms=required_start_ms,
+                end_ms=end_ms,
+            )
             account_fills = await _fetch_user_fills_complete(
                 info,
                 follower_address,
-                earliest_join_ms,
+                incremental_start_ms,
                 end_ms,
             )
-            follower_fills.extend(
-                {**fill, "_copytrade_execution_scope": execution_scope}
-                for fill in account_fills
+            cache_stats["follower_fill_api_rows"] += len(account_fills)
+            new_fills_by_order = _actual_follower_fills_by_order(
+                scope_orders,
+                [
+                    {**fill, "_copytrade_execution_scope": execution_scope}
+                    for fill in account_fills
+                ],
             )
+            merged_fills_by_order = _merge_order_fill_cache(
+                cached_fills_by_order,
+                new_fills_by_order,
+            )
+            for order_id, fills in merged_fills_by_order.items():
+                actual_fills_by_order[order_id] = fills
+            cache_stats["follower_fill_cached_rows"] += sum(
+                len(fills) for fills in merged_fills_by_order.values()
+            )
+            follower_cache_by_scope[scope_cache_key] = {
+                "identity": follower_address,
+                "execution_scope": execution_scope,
+                "coverage_start_ms": min(
+                    int(cached_scope.get("coverage_start_ms") or required_start_ms),
+                    required_start_ms,
+                ),
+                "cursor_ms": end_ms,
+                "fills_by_order": {
+                    str(order_id): [
+                        _compact_follower_fill(fill) for fill in fills
+                    ]
+                    for order_id, fills in merged_fills_by_order.items()
+                },
+            }
         portfolio_by_leader: dict[int, Any] = {}
         funding_by_leader: dict[int, list[dict[str, Any]]] = {}
         for leader in leaders:
             leader_id = int(leader.id)
-            portfolio_by_leader[leader_id] = await info.post_info(
-                {"type": "portfolio", "user": leader.leader_address}
+            leader_address = str(leader.leader_address).lower()
+            portfolio_cache_key = str(leader_id)
+            cached_portfolio = portfolio_cache_by_leader.get(portfolio_cache_key)
+            cache_stats["portfolio_api_requests"] += 1
+            try:
+                portfolio = await info.post_info(
+                    {"type": "portfolio", "user": leader.leader_address}
+                )
+                portfolio_cache_by_leader[portfolio_cache_key] = {
+                    "identity": leader_address,
+                    "fetched_at_ms": end_ms,
+                    "payload": portfolio,
+                }
+            except Exception:
+                if not (
+                    isinstance(cached_portfolio, dict)
+                    and str(cached_portfolio.get("identity") or "").lower()
+                    == leader_address
+                    and cached_portfolio.get("payload") is not None
+                ):
+                    raise
+                portfolio = cached_portfolio.get("payload")
+                cache_stats["portfolio_cache_fallbacks"] += 1
+                log.warning(
+                    "leader_performance_portfolio_cache_fallback",
+                    leader_id=leader_id,
+                    leader_address=str(leader.leader_address)[-4:],
+                )
+            portfolio_by_leader[leader_id] = portfolio
+
+            funding_cache_key = str(leader_id)
+            cached_funding = funding_cache_by_leader.get(funding_cache_key)
+            if not _valid_incremental_cache_entry(
+                cached_funding,
+                identity=leader_address,
+                required_start_ms=joined_ms[leader_id],
+            ):
+                cached_funding = {
+                    "identity": leader_address,
+                    "coverage_start_ms": joined_ms[leader_id],
+                    "cursor_ms": None,
+                    "items": [],
+                }
+            incremental_funding_start_ms = _performance_incremental_start_ms(
+                cached_funding.get("cursor_ms"),
+                required_start_ms=joined_ms[leader_id],
+                end_ms=end_ms,
             )
-            funding_by_leader[leader_id] = await _fetch_user_funding_complete(
+            new_funding = await _fetch_user_funding_complete(
                 info,
                 str(leader.leader_address),
-                joined_ms[leader_id],
+                incremental_funding_start_ms,
                 end_ms,
             )
+            cache_stats["funding_api_rows"] += len(new_funding)
+            funding = _merge_funding_cache(
+                cached_funding.get("items"),
+                new_funding,
+                required_start_ms=joined_ms[leader_id],
+            )
+            funding_by_leader[leader_id] = funding
+            cache_stats["funding_cached_rows"] += len(funding)
+            funding_cache_by_leader[funding_cache_key] = {
+                "identity": leader_address,
+                "coverage_start_ms": min(
+                    int(cached_funding.get("coverage_start_ms") or joined_ms[leader_id]),
+                    joined_ms[leader_id],
+                ),
+                "cursor_ms": end_ms,
+                "items": [_compact_funding_item(item) for item in funding],
+            }
     finally:
         await info.close()
 
-    actual_fills_by_order = _actual_follower_fills_by_order(orders, follower_fills)
+    updated_exchange_cache["updated_at"] = now.isoformat()
+    updated_exchange_cache["last_refresh_stats"] = cache_stats
     leaders_payload: list[dict[str, Any]] = []
     for leader in leaders:
         leader_id = int(leader.id)
@@ -293,6 +453,7 @@ async def refresh_leader_performance(settings: Any) -> dict[str, Any]:
         "methodology": _methodology_payload(),
     }
     async with SessionLocal() as db:
+        await _store_performance_exchange_cache(db, updated_exchange_cache)
         await _store_performance_payload(db, payload)
         await store_task_status(
             db,
@@ -302,6 +463,11 @@ async def refresh_leader_performance(settings: Any) -> dict[str, Any]:
                 "generated_at": now.isoformat(),
                 "leader_count": len(leaders_payload),
                 "window": "SINCE_JOINED",
+                "refresh_seconds": float(
+                    getattr(settings, "leader_performance_refresh_seconds", 21600.0)
+                    or 21600.0
+                ),
+                "exchange_cache": cache_stats,
             },
         )
         await db.commit()
@@ -311,7 +477,7 @@ async def refresh_leader_performance(settings: Any) -> dict[str, Any]:
 async def run_leader_performance_refresher(settings: Any) -> None:
     interval = max(
         60.0,
-        float(getattr(settings, "leader_performance_refresh_seconds", 86400.0) or 86400.0),
+        float(getattr(settings, "leader_performance_refresh_seconds", 21600.0) or 21600.0),
     )
     while True:
         async with SessionLocal() as db:
@@ -379,6 +545,216 @@ async def _store_performance_payload(db: Any, payload: dict[str, Any]) -> None:
             set_={"value": payload, "updated_at": now},
         )
     )
+
+
+async def _load_performance_exchange_cache(db: Any) -> dict[str, Any]:
+    row = await db.get(AppSetting, LEADER_PERFORMANCE_EXCHANGE_CACHE_KEY)
+    if row is None or not isinstance(row.value, dict):
+        return _empty_performance_exchange_cache()
+    payload = dict(row.value)
+    if int(payload.get("schema_version") or 0) != PERFORMANCE_EXCHANGE_CACHE_SCHEMA_VERSION:
+        return _empty_performance_exchange_cache()
+    return payload
+
+
+async def _store_performance_exchange_cache(
+    db: Any,
+    payload: dict[str, Any],
+) -> None:
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        insert(AppSetting)
+        .values(
+            key=LEADER_PERFORMANCE_EXCHANGE_CACHE_KEY,
+            value=payload,
+            updated_at=now,
+        )
+        .on_conflict_do_update(
+            index_elements=[AppSetting.key],
+            set_={"value": payload, "updated_at": now},
+        )
+    )
+
+
+def _empty_performance_exchange_cache() -> dict[str, Any]:
+    return {
+        "schema_version": PERFORMANCE_EXCHANGE_CACHE_SCHEMA_VERSION,
+        "updated_at": None,
+        "follower_scopes": {},
+        "leader_funding": {},
+        "leader_portfolios": {},
+    }
+
+
+def _performance_scope_cache_key(execution_scope: str | None) -> str:
+    return str(execution_scope or "").strip().lower() or MAIN_EXECUTION_SCOPE_CACHE_KEY
+
+
+def _performance_execution_scopes(
+    *,
+    leaders: Iterable[Any],
+    orders: Iterable[Any],
+    active_allocations: Iterable[Any],
+) -> set[str]:
+    scopes = {
+        str(getattr(leader, "hyperliquid_vault_address", "") or "")
+        .strip()
+        .lower()
+        for leader in leaders
+    }
+    scopes.update(
+        str(getattr(row, "venue_account", "") or "").strip().lower()
+        for row in [*orders, *active_allocations]
+    )
+    scopes.add("")
+    return scopes
+
+
+def _valid_incremental_cache_entry(
+    entry: Any,
+    *,
+    identity: str,
+    required_start_ms: int,
+) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    if str(entry.get("identity") or "").strip().lower() != str(identity or "").strip().lower():
+        return False
+    try:
+        coverage_start_ms = int(entry.get("coverage_start_ms"))
+    except (TypeError, ValueError):
+        return False
+    return coverage_start_ms <= int(required_start_ms)
+
+
+def _performance_incremental_start_ms(
+    cursor_ms: Any,
+    *,
+    required_start_ms: int,
+    end_ms: int,
+) -> int:
+    try:
+        cursor = int(cursor_ms)
+    except (TypeError, ValueError):
+        return int(required_start_ms)
+    if cursor <= 0:
+        return int(required_start_ms)
+    return max(
+        int(required_start_ms),
+        min(cursor, int(end_ms)) - PERFORMANCE_INCREMENTAL_OVERLAP_MS,
+    )
+
+
+def _cached_order_fills(
+    value: Any,
+    *,
+    valid_order_ids: set[int],
+) -> dict[int, list[dict[str, Any]]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, list[dict[str, Any]]] = {}
+    for raw_order_id, raw_fills in value.items():
+        try:
+            order_id = int(raw_order_id)
+        except (TypeError, ValueError):
+            continue
+        if order_id not in valid_order_ids or not isinstance(raw_fills, list):
+            continue
+        unique = {
+            _exchange_fill_key(fill): dict(fill)
+            for fill in raw_fills
+            if isinstance(fill, dict)
+        }
+        result[order_id] = sorted(
+            unique.values(),
+            key=lambda fill: (int(fill.get("time") or 0), _exchange_fill_key(fill)),
+        )
+    return result
+
+
+def _merge_order_fill_cache(
+    cached: dict[int, list[dict[str, Any]]],
+    fresh: dict[int, list[dict[str, Any]]],
+) -> dict[int, list[dict[str, Any]]]:
+    result: dict[int, list[dict[str, Any]]] = {}
+    for order_id in sorted(set(cached) | set(fresh)):
+        unique = {
+            _exchange_fill_key(fill): dict(fill)
+            for fill in [*cached.get(order_id, []), *fresh.get(order_id, [])]
+            if isinstance(fill, dict)
+        }
+        if unique:
+            result[order_id] = sorted(
+                unique.values(),
+                key=lambda fill: (
+                    int(fill.get("time") or 0),
+                    _exchange_fill_key(fill),
+                ),
+            )
+    return result
+
+
+def _compact_follower_fill(fill: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: fill.get(key)
+        for key in (
+            "cloid",
+            "oid",
+            "time",
+            "px",
+            "sz",
+            "closedPnl",
+            "fee",
+            "hash",
+            "tid",
+            "coin",
+        )
+        if fill.get(key) is not None
+    }
+
+
+def _funding_key(item: dict[str, Any]) -> str:
+    delta = item.get("delta") if isinstance(item.get("delta"), dict) else {}
+    return "|".join(
+        str(value or "")
+        for value in (
+            item.get("hash"),
+            item.get("time"),
+            delta.get("coin"),
+            delta.get("usdc"),
+        )
+    )
+
+
+def _merge_funding_cache(
+    cached: Any,
+    fresh: list[dict[str, Any]],
+    *,
+    required_start_ms: int,
+) -> list[dict[str, Any]]:
+    cached_items = cached if isinstance(cached, list) else []
+    unique = {
+        _funding_key(item): dict(item)
+        for item in [*cached_items, *fresh]
+        if isinstance(item, dict)
+        and int(item.get("time") or 0) >= int(required_start_ms)
+    }
+    return sorted(
+        unique.values(),
+        key=lambda item: (int(item.get("time") or 0), _funding_key(item)),
+    )
+
+
+def _compact_funding_item(item: dict[str, Any]) -> dict[str, Any]:
+    delta = item.get("delta") if isinstance(item.get("delta"), dict) else {}
+    return {
+        "hash": item.get("hash"),
+        "time": item.get("time"),
+        "delta": {
+            "coin": delta.get("coin"),
+            "usdc": delta.get("usdc"),
+        },
+    }
 
 
 async def _fetch_user_fills_complete(
@@ -450,10 +826,7 @@ async def _fetch_user_funding_complete(
     right = await _fetch_user_funding_complete(
         info, user, midpoint + 1, end_ms, depth=depth + 1
     )
-    unique = {
-        f"{item.get('hash')}|{item.get('time')}|{(item.get('delta') or {}).get('coin')}": item
-        for item in [*left, *right]
-    }
+    unique = {_funding_key(item): item for item in [*left, *right]}
     return list(unique.values())
 
 

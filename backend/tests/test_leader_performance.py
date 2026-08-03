@@ -6,13 +6,20 @@ from decimal import Decimal
 
 from app.models import ExecutionOrder, LeaderConfig, SourceFill
 from app.services.leader_performance import (
+    PERFORMANCE_INCREMENTAL_OVERLAP_MS,
     _actual_follower_fills_by_order,
     _build_leader_payload,
+    _cached_order_fills,
     _copyability_metrics,
     _follower_contribution,
     _leader_behavior,
     _logical_leader_events,
+    _merge_funding_cache,
+    _merge_order_fill_cache,
+    _performance_execution_scopes,
+    _performance_incremental_start_ms,
     _portfolio_metrics_since_join,
+    _valid_incremental_cache_entry,
     performance_refresh_delay_seconds,
 )
 
@@ -52,6 +59,126 @@ def test_stale_performance_cache_is_due_for_daily_refresh() -> None:
     )
 
     assert delay == 0
+
+
+def test_six_hour_performance_refresh_cadence() -> None:
+    delay = performance_refresh_delay_seconds(
+        {"generated_at": (NOW - timedelta(hours=2)).isoformat()},
+        now=NOW,
+        interval_seconds=6 * 60 * 60,
+    )
+
+    assert delay == 4 * 60 * 60
+
+
+def test_performance_execution_scopes_include_subaccount_without_any_orders() -> None:
+    subaccount = "0x" + "a" * 40
+    leader = LeaderConfig(
+        id=12,
+        leader_address="0x" + "4" * 40,
+        enabled=True,
+        hyperliquid_vault_address=subaccount,
+    )
+
+    scopes = _performance_execution_scopes(
+        leaders=[leader],
+        orders=[],
+        active_allocations=[],
+    )
+
+    assert scopes == {"", subaccount}
+
+
+def test_incremental_exchange_cache_uses_overlap_and_resets_for_earlier_join() -> None:
+    required_start = 1_000_000
+    cursor = 2_000_000
+    end = 3_000_000
+
+    assert _valid_incremental_cache_entry(
+        {
+            "identity": "0xabc",
+            "coverage_start_ms": required_start,
+        },
+        identity="0xAbC",
+        required_start_ms=required_start + 1,
+    )
+    assert not _valid_incremental_cache_entry(
+        {
+            "identity": "0xabc",
+            "coverage_start_ms": required_start + 1,
+        },
+        identity="0xabc",
+        required_start_ms=required_start,
+    )
+    assert _performance_incremental_start_ms(
+        cursor,
+        required_start_ms=required_start,
+        end_ms=end,
+    ) == cursor - PERFORMANCE_INCREMENTAL_OVERLAP_MS
+    assert _performance_incremental_start_ms(
+        None,
+        required_start_ms=required_start,
+        end_ms=end,
+    ) == required_start
+
+
+def test_incremental_follower_fill_cache_deduplicates_overlap_by_exchange_fill() -> None:
+    old = {
+        "cloid": "0xaaa",
+        "oid": 7,
+        "time": 2_000_000,
+        "px": "100",
+        "sz": "1",
+        "closedPnl": "0",
+        "fee": "0.1",
+        "hash": "0xfill",
+        "tid": 11,
+        "coin": "BTC",
+    }
+    new = {
+        "cloid": "0xaaa",
+        "oid": 8,
+        "time": 2_000_100,
+        "px": "101",
+        "sz": "1",
+        "closedPnl": "1",
+        "fee": "0.1",
+        "hash": "0xfill2",
+        "tid": 12,
+        "coin": "BTC",
+    }
+
+    cached = _cached_order_fills({"42": [old, old]}, valid_order_ids={42})
+    merged = _merge_order_fill_cache(cached, {42: [old, new]})
+
+    assert list(merged) == [42]
+    assert [fill["tid"] for fill in merged[42]] == [11, 12]
+
+
+def test_incremental_funding_cache_deduplicates_overlap_and_prunes_old_epoch() -> None:
+    old_epoch = {
+        "hash": "0xold",
+        "time": 900,
+        "delta": {"coin": "BTC", "usdc": "1"},
+    }
+    current = {
+        "hash": "0xcurrent",
+        "time": 1_100,
+        "delta": {"coin": "BTC", "usdc": "2"},
+    }
+    added = {
+        "hash": "0xnew",
+        "time": 1_200,
+        "delta": {"coin": "ETH", "usdc": "3"},
+    }
+
+    merged = _merge_funding_cache(
+        [old_epoch, current],
+        [current, added],
+        required_start_ms=1_000,
+    )
+
+    assert [item["hash"] for item in merged] == ["0xcurrent", "0xnew"]
 
 
 def _source_fill(

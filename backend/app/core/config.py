@@ -129,11 +129,11 @@ class Settings(BaseSettings):
     account_value_refresh_seconds: float = 5.0
     account_value_max_stale_seconds: float = 30.0
     account_value_full_refresh_seconds: float = 300.0
-    # Full-history performance analytics stay disabled inside the API process.
+    # Performance analytics stay disabled inside the API process.
     # Production runs them from the isolated analytics worker, which writes a
-    # database cache at a deliberately slow cadence.
+    # database cache and advances exchange cursors every six hours.
     leader_performance_refresh_enabled: bool = False
-    leader_performance_refresh_seconds: float = 86400.0
+    leader_performance_refresh_seconds: float = 21600.0
     bootstrap_leader_addresses: str | None = None
 
     app_secret_key: SecretStr = Field(default=SecretStr("change-me"))
