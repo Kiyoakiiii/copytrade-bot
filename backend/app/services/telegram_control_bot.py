@@ -13,8 +13,8 @@ from app.core.logging import redact_text
 from app.db.session import SessionLocal
 from app.models import AppSetting, AuditLog, RiskEvent
 from app.services.execution_alerts import (
-    HYPERLIQUID_NETWORK_UPGRADE_POST_ONLY_REJECTION,
-    format_hyperliquid_network_upgrade_alert,
+    EXECUTION_ALERT_EVENT_TYPES,
+    format_execution_alert,
 )
 from app.services.runtime_control import acquire_copy_trading_control_lock
 from app.services.task_status import store_task_status
@@ -405,7 +405,7 @@ class TelegramExecutionAlertWorker(TelegramControlBot):
         event_id = int(event.id)
         await self._ensure_pending_alert(event_id, delivered_chat_ids)
         timeout = httpx.Timeout(10.0, connect=5.0)
-        text = format_hyperliquid_network_upgrade_alert(event)
+        text = format_execution_alert(event)
         async with self.http_client_factory(base_url=self._base_url, timeout=timeout) as client:
             for chat_id in sorted(self.allowed_user_ids):
                 if chat_id in delivered_chat_ids:
@@ -443,7 +443,7 @@ class TelegramExecutionAlertWorker(TelegramControlBot):
                     return pending, delivered_chat_ids
             result = await db.execute(
                 select(RiskEvent)
-                .where(RiskEvent.event_type == HYPERLIQUID_NETWORK_UPGRADE_POST_ONLY_REJECTION)
+                .where(RiskEvent.event_type.in_(EXECUTION_ALERT_EVENT_TYPES))
                 .where(RiskEvent.id > last_event_id)
                 .order_by(RiskEvent.id.asc())
                 .limit(1)

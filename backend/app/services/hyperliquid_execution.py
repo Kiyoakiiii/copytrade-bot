@@ -41,8 +41,8 @@ WS_ACTION_RESPONSE_TIMEOUT_SECONDS = 5.0
 WS_ACTION_HEARTBEAT_SECONDS = 30.0
 WS_ACTION_REJECTION_COOLDOWN_SECONDS = 30.0
 WS_ACTION_NOT_SENT_COOLDOWN_SECONDS = 2.0
-ISOLATED_ONLY_LEVERAGE = 1
-FORCED_ONE_X_MARKETS = frozenset({"XYZ:CXMT"})
+ISOLATED_TARGET_LEVERAGE = 2
+FORCED_ISOLATED_LEVERAGE_MARKETS = frozenset({"XYZ:CXMT"})
 
 
 class WebSocketActionNotSent(RuntimeError):
@@ -928,7 +928,7 @@ class HyperliquidRiskSettingsService:
         self._settings = settings
         self.expected_margin_mode = _expected_margin_mode(settings)
         self.expected_leverage = (
-            ISOLATED_ONLY_LEVERAGE
+            ISOLATED_TARGET_LEVERAGE
             if self.expected_margin_mode == "ISOLATED"
             else expected_leverage
         )
@@ -943,8 +943,8 @@ class HyperliquidRiskSettingsService:
         parsed = parse_coin(coin)
         venue_coin = parsed.canonical_coin
         expected_leverage = (
-            ISOLATED_ONLY_LEVERAGE
-            if venue_coin.upper() in FORCED_ONE_X_MARKETS
+            ISOLATED_TARGET_LEVERAGE
+            if venue_coin.upper() in FORCED_ISOLATED_LEVERAGE_MARKETS
             else self.expected_leverage
         )
         try:
@@ -1374,6 +1374,44 @@ class HyperliquidExecutionClient:
             "asset": int(resolved_asset_id),
             "isBuy": True,
             "ntli": ntli,
+        }
+        return await self._post_signed_l1_action(exchange, action=action, nonce=nonce)
+
+    async def remove_isolated_margin(
+        self,
+        *,
+        coin: str,
+        amount: Decimal,
+        asset_id: int | None = None,
+        nonce: int | None = None,
+    ) -> dict[str, Any]:
+        """Remove a positive USDC amount from an active isolated position."""
+        amount_decimal = Decimal(str(amount))
+        # Truncate toward zero so precision conversion can never withdraw more
+        # margin than the safety calculation authorized.
+        ntli_magnitude = int(
+            (amount_decimal * Decimal("1000000")).to_integral_value(
+                rounding=ROUND_DOWN
+            )
+        )
+        if ntli_magnitude <= 0:
+            raise ValueError("isolated margin removal must be positive")
+        parsed = parse_coin(coin)
+        exchange = self._sdk_exchange(parsed.dex)
+        if exchange is None:
+            raise RuntimeError("Hyperliquid official SDK is not installed/configured")
+        sdk_coin = self._resolve_sdk_coin_name(exchange, parsed)
+        try:
+            resolved_asset_id = _resolve_sdk_asset_id(exchange, sdk_coin)
+        except Exception:
+            if asset_id is None:
+                raise
+            resolved_asset_id = int(asset_id)
+        action = {
+            "type": "updateIsolatedMargin",
+            "asset": int(resolved_asset_id),
+            "isBuy": True,
+            "ntli": -ntli_magnitude,
         }
         return await self._post_signed_l1_action(exchange, action=action, nonce=nonce)
 

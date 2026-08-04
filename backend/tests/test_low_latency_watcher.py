@@ -9477,7 +9477,7 @@ def test_unresolved_new_market_metadata_remains_retryable() -> None:
     assert info.calls == 2
 
 
-def test_market_leverage_plan_clamps_legacy_isolated_override_to_one_x() -> None:
+def test_market_leverage_plan_clamps_legacy_isolated_override_to_two_x() -> None:
     engine = FillDrivenExecutionEngine(
         settings=settings(),
         info_client=NoopInfoClient(),
@@ -9508,7 +9508,7 @@ def test_market_leverage_plan_clamps_legacy_isolated_override_to_one_x() -> None
     )
 
     engine.market_leverage_plan_cache[("xyz", "XYZ:CL")] = build_hyperliquid_leverage_plan(
-        default_leverage=1,
+        default_leverage=2,
         coin_max_leverage=20,
         sz_decimals=3,
         asset_id=29,
@@ -9525,7 +9525,7 @@ def test_market_leverage_plan_clamps_legacy_isolated_override_to_one_x() -> None
 
     plan = asyncio.run(engine._load_market_leverage_plan(SequenceScalarSession([row]), market, position))
 
-    assert plan.effective_leverage == 1
+    assert plan.effective_leverage == 2
     assert plan.max_leverage == 20
     assert plan.sz_decimals == 3
 
@@ -9541,7 +9541,7 @@ def test_market_policy_uses_cross_market_maximum_without_network_io() -> None:
     )
 
 
-def test_market_policy_uses_one_x_for_isolated_only_market() -> None:
+def test_market_policy_uses_two_x_for_isolated_only_market() -> None:
     assert (
         _market_policy_effective_leverage(
             {
@@ -9553,7 +9553,7 @@ def test_market_policy_uses_one_x_for_isolated_only_market() -> None:
             canonical_coin_value="xyz:AMD",
             configured_default_leverage=50,
         )
-        == 1
+        == 2
     )
 
 
@@ -9574,7 +9574,7 @@ def test_margin_check_uses_confirmed_market_target_not_global_or_market_maximum(
     )
 
 
-def test_margin_check_still_forces_isolated_market_to_one_x() -> None:
+def test_margin_check_still_forces_isolated_market_to_two_x() -> None:
     plan = SimpleNamespace(
         effective_leverage=20,
         max_leverage=20,
@@ -9587,7 +9587,7 @@ def test_margin_check_still_forces_isolated_market_to_one_x() -> None:
             required_margin_mode="ISOLATED",
             canonical_coin_value="xyz:AMD",
         )
-        == 1
+        == 2
     )
 
 
@@ -10549,7 +10549,7 @@ def test_stale_warmed_risk_cache_is_migrated_to_cross_market_maximum() -> None:
     assert order.pre_trade_checklist["follower_risk_setting_source"] == "exchange_update"
 
 
-def test_warm_risk_cache_rejects_legacy_isolated_and_cxmt_above_one_x() -> None:
+def test_warm_risk_cache_rejects_legacy_isolated_and_cxmt_above_two_x() -> None:
     engine = FillDrivenExecutionEngine(
         settings=settings(),
         info_client=NoopInfoClient(),
@@ -11465,7 +11465,7 @@ def test_submit_retry_does_not_reset_after_exchange_submit_started() -> None:
     assert order.status == "SUBMITTING"
 
 
-def test_submit_risk_settings_reconfirms_legacy_isolated_override_at_one_x() -> None:
+def test_submit_risk_settings_reconfirms_legacy_isolated_override_at_two_x() -> None:
     client = TimeoutExecutionClient()
     engine = FillDrivenExecutionEngine(
         settings=settings(),
@@ -11512,9 +11512,9 @@ def test_submit_risk_settings_reconfirms_legacy_isolated_override_at_one_x() -> 
 
     assert result.is_ok
     assert source == "exchange_update"
-    assert result.effective_leverage == 1
+    assert result.effective_leverage == 2
     assert result.actual_margin_mode == "ISOLATED"
-    assert client.leverage_updates == [{"coin": "xyz:CL", "leverage": 1, "is_cross": False}]
+    assert client.leverage_updates == [{"coin": "xyz:CL", "leverage": 2, "is_cross": False}]
 
 
 def test_submit_risk_settings_uses_planned_leverage_process_cache_without_db_read() -> None:

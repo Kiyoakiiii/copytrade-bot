@@ -8,7 +8,9 @@ import pytest
 from app.core.config import Settings
 from app.models import AppSetting, AuditLog, RiskEvent
 from app.services.execution_alerts import (
+    COPY_ORDER_INSUFFICIENT_COLLATERAL,
     HYPERLIQUID_NETWORK_UPGRADE_POST_ONLY_REJECTION,
+    format_copy_order_insufficient_collateral_alert,
     format_hyperliquid_network_upgrade_alert,
     is_hyperliquid_network_upgrade_post_only_error,
 )
@@ -289,6 +291,40 @@ def test_network_upgrade_alert_is_narrow_and_contains_manual_action_details() ->
     assert "不会自动重试或补单" in text
     assert "private" not in text.casefold()
     assert "signature" not in text.casefold()
+
+
+def test_insufficient_collateral_alert_contains_actionable_values_and_masks_addresses() -> None:
+    event = RiskEvent(
+        id=79,
+        severity="critical",
+        event_type=COPY_ORDER_INSUFFICIENT_COLLATERAL,
+        symbol="xyz:DELL",
+        leader_address="<REDACTED_EVM_ADDRESS>",
+        message="insufficient available collateral for target delta",
+        metadata_json={
+            "order_id": 9134,
+            "execution_account_suffix": "8b8e",
+            "order_action": "INCREASE",
+            "position_side": "SHORT",
+            "quantity": "1.78",
+            "target_notional": "878.87",
+            "delta_notional": "845.67",
+            "required_initial_margin": "845.67",
+            "available_collateral": "20.09",
+        },
+        created_at=datetime(2026, 8, 4, 17, 1, 33, tzinfo=timezone.utc),
+    )
+
+    text = format_copy_order_insufficient_collateral_alert(event)
+
+    assert "xyz:DELL" in text
+    assert "加仓" in text
+    assert "8b8e" in text
+    assert "845.67" in text
+    assert "20.09" in text
+    assert "4a80" in text
+    assert event.leader_address not in text
+    assert "不会自动补单" in text
 
 
 def test_execution_alert_dispatch_resumes_recipients_without_resending_completed_one() -> None:

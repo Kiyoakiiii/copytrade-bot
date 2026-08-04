@@ -14,7 +14,9 @@ from app.services.hyperliquid_risk_settings import (
     STATUS_NEEDS_REFRESH,
     effective_leverage_for_market,
     ensure_hyperliquid_market_risk_settings,
+    isolated_margin_excess_for_target_leverage,
     prepare_migrated_hyperliquid_risk_settings,
+    remove_excess_isolated_margin_for_target_leverage,
     seed_market_risk_settings_for_account_migration,
     _merge_existing_risk_rows_as_prepare_candidates,
     _merge_common_market_prewarm_candidates,
@@ -156,7 +158,7 @@ def test_ensure_sets_cross_effective_leverage_before_open() -> None:
     assert db.row.status == STATUS_CONFIRMED
 
 
-def test_only_isolated_market_metadata_skips_cross_and_sets_one_x_before_open() -> None:
+def test_only_isolated_market_metadata_skips_cross_and_sets_two_x_before_open() -> None:
     db = FakeDb()
     client = FakeClient(
         universe=[
@@ -183,10 +185,10 @@ def test_only_isolated_market_metadata_skips_cross_and_sets_one_x_before_open() 
 
     assert result.is_ok is True
     assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
-    assert result.effective_leverage == 1
-    assert client.updates == [{"coin": "xyz:GIGADEV", "leverage": 1, "is_cross": False}]
+    assert result.effective_leverage == 2
+    assert client.updates == [{"coin": "xyz:GIGADEV", "leverage": 2, "is_cross": False}]
     assert db.row.desired_margin_mode == FALLBACK_MARGIN_MODE
-    assert db.row.desired_leverage == 1
+    assert db.row.desired_leverage == 2
 
 
 def test_ensure_hydrates_missing_asset_id_even_when_max_leverage_cached() -> None:
@@ -252,13 +254,13 @@ def test_cross_unsupported_falls_back_to_isolated_before_open() -> None:
     assert result.status == STATUS_CONFIRMED
     assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
     assert result.desired_margin_mode == FALLBACK_MARGIN_MODE
-    assert result.desired_leverage == 1
-    assert result.effective_leverage == 1
-    assert result.actual_leverage == 1
+    assert result.desired_leverage == 2
+    assert result.effective_leverage == 2
+    assert result.actual_leverage == 2
     assert result.warning == "cross margin unsupported; using isolated margin for this market"
     assert client.updates == [
         {"coin": "xyz:CL", "leverage": 10, "is_cross": True},
-        {"coin": "xyz:CL", "leverage": 1, "is_cross": False},
+        {"coin": "xyz:CL", "leverage": 2, "is_cross": False},
     ]
     assert db.row.status == STATUS_CONFIRMED
 
@@ -289,16 +291,16 @@ def test_invalid_cross_leverage_falls_back_to_isolated_before_open() -> None:
     assert result.status == STATUS_CONFIRMED
     assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
     assert result.desired_margin_mode == FALLBACK_MARGIN_MODE
-    assert result.desired_leverage == 1
-    assert result.effective_leverage == 1
+    assert result.desired_leverage == 2
+    assert result.effective_leverage == 2
     assert result.warning == "cross leverage rejected; using isolated margin for this market"
     assert client.updates == [
         {"coin": "xyz:SKHY", "leverage": 10, "is_cross": True},
-        {"coin": "xyz:SKHY", "leverage": 1, "is_cross": False},
+        {"coin": "xyz:SKHY", "leverage": 2, "is_cross": False},
     ]
 
 
-def test_isolated_fallback_is_one_x_even_when_market_max_is_higher() -> None:
+def test_isolated_fallback_is_two_x_even_when_market_max_is_higher() -> None:
     db = FakeDb()
     client = SequenceUpdateClient(
         universe=[{"name": "VIX", "maxLeverage": 3}],
@@ -322,16 +324,16 @@ def test_isolated_fallback_is_one_x_even_when_market_max_is_higher() -> None:
 
     assert result.is_ok is True
     assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
-    assert result.desired_leverage == 1
-    assert result.effective_leverage == 1
-    assert result.actual_leverage == 1
+    assert result.desired_leverage == 2
+    assert result.effective_leverage == 2
+    assert result.actual_leverage == 2
     assert client.updates == [
         {"coin": "xyz:VIX", "leverage": 3, "is_cross": True},
-        {"coin": "xyz:VIX", "leverage": 1, "is_cross": False},
+        {"coin": "xyz:VIX", "leverage": 2, "is_cross": False},
     ]
 
 
-def test_cxmt_is_forced_to_one_x_even_when_cross_margin_is_supported() -> None:
+def test_cxmt_is_forced_to_two_x_even_when_cross_margin_is_supported() -> None:
     db = FakeDb()
     client = FakeClient(universe=[{"name": "CXMT", "maxLeverage": 5}])
 
@@ -349,11 +351,11 @@ def test_cxmt_is_forced_to_one_x_even_when_cross_margin_is_supported() -> None:
 
     assert result.is_ok is True
     assert result.actual_margin_mode == DESIRED_MARGIN_MODE
-    assert result.desired_leverage == 1
-    assert result.effective_leverage == 1
-    assert result.actual_leverage == 1
+    assert result.desired_leverage == 2
+    assert result.effective_leverage == 2
+    assert result.actual_leverage == 2
     assert client.updates == [
-        {"coin": "xyz:CXMT", "leverage": 1, "is_cross": True},
+        {"coin": "xyz:CXMT", "leverage": 2, "is_cross": True},
     ]
 
 
@@ -398,7 +400,7 @@ def test_success_response_does_not_confirm_wrong_active_position_leverage() -> N
     assert result.reason_code == REASON_LEVERAGE_NOT_CONFIRMED
 
 
-def test_active_isolated_only_position_is_topped_up_to_one_x() -> None:
+def test_active_isolated_only_position_is_adjusted_to_two_x() -> None:
     class ActiveIsolatedOnlyClient(AssetAwareClient):
         def __init__(self):
             super().__init__(
@@ -440,7 +442,7 @@ def test_active_isolated_only_position_is_topped_up_to_one_x() -> None:
                             "szi": "8.061",
                             "leverage": {
                                 "type": "isolated",
-                                "value": 1 if self.topped_up else 4,
+                                "value": 2 if self.topped_up else 4,
                             },
                         }
                     }
@@ -477,14 +479,14 @@ def test_active_isolated_only_position_is_topped_up_to_one_x() -> None:
     assert result.is_ok is True
     assert result.status == STATUS_CONFIRMED
     assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
-    assert result.actual_leverage == 1
+    assert result.actual_leverage == 2
     assert client.updates == [
-        {"coin": "xyz:EWY", "leverage": 1, "is_cross": False, "asset_id": 47}
+        {"coin": "xyz:EWY", "leverage": 2, "is_cross": False, "asset_id": 47}
     ]
-    assert client.top_ups == [{"coin": "xyz:EWY", "leverage": 1, "asset_id": 47}]
+    assert client.top_ups == [{"coin": "xyz:EWY", "leverage": 2, "asset_id": 47}]
 
 
-def test_active_no_cross_position_adds_margin_then_sets_one_x() -> None:
+def test_active_no_cross_position_adds_margin_then_sets_two_x() -> None:
     class ActiveNoCrossClient(AssetAwareClient):
         def __init__(self):
             super().__init__(
@@ -535,7 +537,7 @@ def test_active_no_cross_position_adds_margin_then_sets_one_x() -> None:
                             "marginUsed": "350",
                             "leverage": {
                                 "type": "isolated",
-                                "value": 1 if self.update_count > 1 else 4,
+                                "value": 2 if self.update_count > 1 else 4,
                             },
                         }
                     }
@@ -571,11 +573,72 @@ def test_active_no_cross_position_adds_margin_then_sets_one_x() -> None:
 
     assert result.is_ok is True
     assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
-    assert result.actual_leverage == 1
+    assert result.actual_leverage == 2
     assert len(client.updates) == 2
-    assert client.top_ups == [{"coin": "xyz:EWY", "leverage": 1, "asset_id": 47}]
+    assert client.top_ups == [{"coin": "xyz:EWY", "leverage": 2, "asset_id": 47}]
     assert client.margin_additions == [
-        {"coin": "xyz:EWY", "amount": Decimal("1057.000"), "asset_id": 47}
+        {"coin": "xyz:EWY", "amount": Decimal("353.5"), "asset_id": 47}
+    ]
+
+
+def test_isolated_margin_excess_uses_larger_notional_and_keeps_buffer() -> None:
+    removable = isolated_margin_excess_for_target_leverage(
+        {
+            "szi": "10",
+            "positionValue": "1000",
+            "entryPx": "105",
+            "marginUsed": "600",
+        },
+        target_leverage=2,
+    )
+
+    # The entry-price notional (1050) is larger than the current positionValue,
+    # so the calculation retains 525 target margin plus a 2.625 USDC buffer.
+    assert removable == Decimal("72.375000")
+
+
+def test_remove_excess_isolated_margin_uses_fresh_exchange_position() -> None:
+    class MarginClient:
+        def __init__(self):
+            self.removals = []
+
+        async def account_state(self, address=None, dex=""):
+            return {
+                "assetPositions": [
+                    {
+                        "position": {
+                            "coin": "CL",
+                            "szi": "10",
+                            "positionValue": "1000",
+                            "entryPx": "100",
+                            "marginUsed": "600",
+                        }
+                    }
+                ]
+            }
+
+        async def remove_isolated_margin(self, *, coin, amount, asset_id=None):
+            self.removals.append(
+                {"coin": coin, "amount": amount, "asset_id": asset_id}
+            )
+            return {"status": "ok", "response": {"type": "default"}}
+
+    client = MarginClient()
+    removed = asyncio.run(
+        remove_excess_isolated_margin_for_target_leverage(
+            db=FakeDb(),
+            client=client,
+            account_address="0x" + "5" * 40,
+            dex="xyz",
+            canonical_coin_value="xyz:CL",
+            asset_id=47,
+            target_leverage=2,
+        )
+    )
+
+    assert removed == Decimal("97.500000")
+    assert client.removals == [
+        {"coin": "xyz:CL", "amount": Decimal("97.500000"), "asset_id": 47}
     ]
 
 
@@ -735,7 +798,7 @@ def test_stale_confirmed_cache_refreshes_before_open() -> None:
     assert client.updates == [{"coin": "BTC", "leverage": 10, "is_cross": True}]
 
 
-def test_legacy_isolated_market_override_is_reduced_to_one_x_on_refresh() -> None:
+def test_legacy_isolated_market_override_is_changed_to_two_x_on_refresh() -> None:
     row = MarketRiskSetting(
         execution_venue="HYPERLIQUID",
         account_address=("0x" + "5" * 40).lower(),
@@ -777,12 +840,12 @@ def test_legacy_isolated_market_override_is_reduced_to_one_x_on_refresh() -> Non
     )
 
     assert result.is_ok is True
-    assert result.desired_leverage == 1
-    assert result.effective_leverage == 1
+    assert result.desired_leverage == 2
+    assert result.effective_leverage == 2
     assert result.actual_margin_mode == FALLBACK_MARGIN_MODE
-    assert result.actual_leverage == 1
-    assert db.row.desired_leverage == 1
-    assert client.updates == [{"coin": "xyz:CL", "leverage": 1, "is_cross": False}]
+    assert result.actual_leverage == 2
+    assert db.row.desired_leverage == 2
+    assert client.updates == [{"coin": "xyz:CL", "leverage": 2, "is_cross": False}]
 
 
 def test_stale_isolated_row_migrates_to_cross_market_maximum_when_meta_allows_cross() -> None:
@@ -996,8 +1059,8 @@ def test_follower_migration_seeds_risk_templates_without_reusing_old_confirmatio
     assert btc.actual_margin_mode is None
     assert btc.actual_leverage is None
     assert cl.desired_margin_mode == FALLBACK_MARGIN_MODE
-    assert cl.desired_leverage == 1
-    assert cl.effective_leverage == 1
+    assert cl.desired_leverage == 2
+    assert cl.effective_leverage == 2
     assert cl.status == STATUS_NEEDS_REFRESH
     assert cl.actual_margin_mode is None
 
@@ -1057,7 +1120,7 @@ def test_follower_migration_confirms_seeded_risk_templates_for_new_account() -> 
     assert payload["blockers"] == []
     assert client.updates == [
         {"coin": "BTC", "leverage": 10, "is_cross": True},
-        {"coin": "xyz:CL", "leverage": 1, "is_cross": False},
+        {"coin": "xyz:CL", "leverage": 2, "is_cross": False},
     ]
     btc, cl = db.added
     assert btc.status == STATUS_CONFIRMED
@@ -1065,4 +1128,4 @@ def test_follower_migration_confirms_seeded_risk_templates_for_new_account() -> 
     assert btc.actual_leverage == 10
     assert cl.status == STATUS_CONFIRMED
     assert cl.actual_margin_mode == FALLBACK_MARGIN_MODE
-    assert cl.actual_leverage == 1
+    assert cl.actual_leverage == 2

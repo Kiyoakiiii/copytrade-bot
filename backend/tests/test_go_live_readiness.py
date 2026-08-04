@@ -116,7 +116,7 @@ def test_unconfirmed_cross_effective_leverage_blocks_open() -> None:
     assert "failed to set cross" in (result.reason or "")
 
 
-def test_manual_risk_service_forces_isolated_markets_to_one_x() -> None:
+def test_manual_risk_service_forces_isolated_markets_to_two_x() -> None:
     class FakeClient:
         def __init__(self):
             self.updates = []
@@ -141,11 +141,11 @@ def test_manual_risk_service_forces_isolated_markets_to_one_x() -> None:
     )
 
     assert result.is_ok is True
-    assert result.effective_leverage == 1
-    assert client.updates == [("BTC", 1, False)]
+    assert result.effective_leverage == 2
+    assert client.updates == [("BTC", 2, False)]
 
 
-def test_manual_risk_service_forces_cxmt_to_one_x_even_in_cross_mode() -> None:
+def test_manual_risk_service_forces_cxmt_to_two_x_even_in_cross_mode() -> None:
     class FakeClient:
         def __init__(self):
             self.updates = []
@@ -170,8 +170,8 @@ def test_manual_risk_service_forces_cxmt_to_one_x_even_in_cross_mode() -> None:
     )
 
     assert result.is_ok is True
-    assert result.effective_leverage == 1
-    assert client.updates == [("xyz:CXMT", 1, True)]
+    assert result.effective_leverage == 2
+    assert client.updates == [("xyz:CXMT", 2, True)]
 
 
 def test_global_trading_disabled_prevents_live_order() -> None:

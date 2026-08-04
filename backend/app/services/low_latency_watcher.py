@@ -80,6 +80,7 @@ from app.services.calculator import (
 )
 from app.services.execution_router import ExecutionVenue
 from app.services.execution_alerts import (
+    COPY_ORDER_INSUFFICIENT_COLLATERAL,
     HYPERLIQUID_NETWORK_UPGRADE_POST_ONLY_REJECTION,
     is_hyperliquid_network_upgrade_post_only_error,
 )
@@ -109,7 +110,8 @@ from app.services.hyperliquid_risk_settings import (
     effective_leverage_for_margin_mode,
     ensure_hyperliquid_market_risk_settings,
     market_requires_isolated_margin,
-    one_x_leverage_required,
+    isolated_leverage_required,
+    remove_excess_isolated_margin_for_target_leverage,
 )
 from app.services.leader_config import active_leaders_statement, is_coin_allowed, normalize_leader_address
 from app.services.order_policy import (
@@ -1293,11 +1295,11 @@ class FillDrivenExecutionEngine:
         warmed = 0
         for row in rows:
             persisted_effective = _int_or_none(row.effective_leverage)
-            if one_x_leverage_required(
+            if isolated_leverage_required(
                 margin_mode=row.actual_margin_mode or row.desired_margin_mode,
                 canonical_coin_value=row.canonical_coin,
             ):
-                policy_effective = 1
+                policy_effective = 2
             else:
                 policy_effective = (
                     _int_or_none(row.market_max_leverage)
@@ -1307,8 +1309,8 @@ class FillDrivenExecutionEngine:
                 persisted_effective != policy_effective
                 or _int_or_none(row.actual_leverage) != policy_effective
             ):
-                # Never reuse a legacy >1x isolated/CXMT confirmation.  The
-                # first risk-increasing order must reconfirm the 1x policy at
+                # Never reuse a legacy non-2x isolated/CXMT confirmation. The
+                # first risk-increasing order must reconfirm the 2x policy at
                 # the exchange before it can submit.
                 continue
             result = _risk_setting_result_from_row(row)
@@ -2224,7 +2226,12 @@ class FillDrivenExecutionEngine:
         leader_margin_mode_observed = _observed_margin_mode(leader_position)
         margin_ok = True
         required_margin: Decimal | None = None
+        available_collateral: Decimal | None = None
         if target_delta_abs > 0 and not reduce_only and follower_value:
+            available_collateral = _decimal_from_payload(
+                follower_value,
+                "available_collateral_used_for_margin_check",
+            )
             margin_ok, required_margin = available_collateral_sufficient(
                 _account_value_result_like(follower_value),
                 target_delta_notional=target_delta_abs,
@@ -2604,6 +2611,11 @@ class FillDrivenExecutionEngine:
                 "follower_leverage_confirmed": False,
                 "margin_sufficient": margin_ok,
                 "required_initial_margin": str(required_margin) if required_margin is not None else None,
+                "available_collateral": (
+                    str(available_collateral)
+                    if available_collateral is not None
+                    else None
+                ),
                 "order_submit_transport": self.settings.order_submit_transport,
                 "order_policy": "FAST_MARKET_ONLY",
                 "transition_action": transition_plan.action.value if transition_plan else "BLOCK",
@@ -3024,6 +3036,53 @@ class FillDrivenExecutionEngine:
                     metadata_json={"source_fill_id": fill.source_fill_id, "dex": fill.market.dex},
                 )
             )
+            if "insufficient available collateral for target delta" in blockers:
+                db.add(
+                    RiskEvent(
+                        severity="critical",
+                        event_type=COPY_ORDER_INSUFFICIENT_COLLATERAL,
+                        symbol=fill.market.canonical_coin,
+                        leader_address=leader.leader_address,
+                        message="insufficient available collateral for target delta",
+                        metadata_json=_json_safe(
+                            {
+                                "source_fill_id": fill.source_fill_id,
+                                "order_id": order.id,
+                                "execution_account_suffix": (
+                                    self.execution_scope[-4:]
+                                    if self.execution_scope
+                                    else "MAIN"
+                                ),
+                                "dex": fill.market.dex,
+                                "canonical_coin": fill.market.canonical_coin,
+                                "order_action": order.order_action,
+                                "position_side": order.position_side,
+                                "quantity": str(order.quantity),
+                                "target_notional": (
+                                    str(target_notional)
+                                    if target_notional is not None
+                                    else None
+                                ),
+                                "delta_notional": (
+                                    str(delta_notional)
+                                    if delta_notional is not None
+                                    else None
+                                ),
+                                "effective_leverage": effective_leverage,
+                                "required_initial_margin": (
+                                    str(required_margin)
+                                    if required_margin is not None
+                                    else None
+                                ),
+                                "available_collateral": (
+                                    str(available_collateral)
+                                    if available_collateral is not None
+                                    else None
+                                ),
+                            }
+                        ),
+                    )
+                )
         if status == "PENDING_SUBMIT":
             _trace_set(order, "order_plan_commit_started_at", datetime.now(timezone.utc))
         await db.commit()
@@ -3928,11 +3987,11 @@ class FillDrivenExecutionEngine:
                     return cached, "process_cache_planned_leverage"
 
         # Planning resolves the policy from the already-prewarmed authoritative
-        # market metadata: cross-capable=max leverage, isolated-only=1x.  Reuse
+        # market metadata: cross-capable=max leverage, isolated-only=2x. Reuse
         # that exact value here instead of querying a stale per-market DB target
         # or taking the minimum with it.
         if planned_margin_mode == FALLBACK_MARGIN_MODE:
-            effective_leverage = 1
+            effective_leverage = 2
         else:
             effective_leverage = (
                 checklist_effective
@@ -7007,21 +7066,21 @@ class HyperliquidLowLatencyWatcher:
         except Exception as exc:
             self.state.last_error = f"latency cache warmup: {redact_text(exc)[:160]}"
         try:
-            confirmed, failed = await self._reconcile_one_x_market_risk_settings()
+            confirmed, failed = await self._reconcile_isolated_market_risk_settings()
             if confirmed or failed:
                 log.info(
-                    "hyperliquid_one_x_risk_settings_reconciled",
+                    "hyperliquid_isolated_risk_settings_reconciled",
                     confirmed=confirmed,
                     failed=failed,
                 )
         except Exception as exc:
-            self.state.last_error = f"1x risk reconciliation: {redact_text(exc)[:160]}"
+            self.state.last_error = f"2x isolated risk reconciliation: {redact_text(exc)[:160]}"
             log.warning(
-                "hyperliquid_one_x_risk_settings_reconcile_failed",
+                "hyperliquid_isolated_risk_settings_reconcile_failed",
                 error=redact_text(exc)[:200],
             )
 
-    async def _reconcile_one_x_market_risk_settings(self) -> tuple[int, int]:
+    async def _reconcile_isolated_market_risk_settings(self) -> tuple[int, int]:
         account = self.settings.hyperliquid_follower_account_address()
         if not account:
             return 0, 0
@@ -7049,23 +7108,64 @@ class HyperliquidLowLatencyWatcher:
                     )
                 ).all()
             }
-        targets = [
-            (
+        configured_default_leverage = int(
+            getattr(self.settings, "hyperliquid_default_leverage", 10) or 10
+        )
+        targets = []
+        for row in rows:
+            scope = (
                 str(row.dex or "").lower(),
-                str(row.canonical_coin or ""),
-                row.asset_id,
-                row.market_max_leverage,
+                str(row.canonical_coin or "").upper(),
             )
-            for row in rows
-            if one_x_leverage_required(
-                margin_mode=row.actual_margin_mode or row.desired_margin_mode,
-                canonical_coin_value=row.canonical_coin,
+            if scope not in active_position_scopes:
+                continue
+            plan = self.engine.market_leverage_plan_cache.get(scope)
+            market_meta = getattr(plan, "market_meta", None) if plan is not None else None
+            if not isinstance(market_meta, dict):
+                # Unknown/delisted market metadata must not be guessed during
+                # startup. The normal per-market loader will resolve it before
+                # the next risk-increasing order, while reductions stay live.
+                continue
+            market_only_isolated = market_requires_isolated_margin(market_meta)
+            expected_margin_mode = (
+                FALLBACK_MARGIN_MODE if market_only_isolated else DESIRED_MARGIN_MODE
             )
-            and any(
-                _int_or_none(value) != 1
-                for value in (row.desired_leverage, row.effective_leverage, row.actual_leverage)
+            target_leverage = _market_policy_effective_leverage(
+                market_meta,
+                canonical_coin_value=str(row.canonical_coin or ""),
+                configured_default_leverage=configured_default_leverage,
             )
-        ]
+            if target_leverage is None:
+                continue
+            market_max_leverage = (
+                _int_or_none(market_meta.get("maxLeverage"))
+                or _int_or_none(row.market_max_leverage)
+            )
+            asset_id = _int_or_none(getattr(plan, "asset_id", None)) or row.asset_id
+            if not (
+                str(row.desired_margin_mode or "").upper() != expected_margin_mode
+                or str(row.actual_margin_mode or "").upper() != expected_margin_mode
+                or any(
+                    _int_or_none(value) != target_leverage
+                    for value in (
+                        row.desired_leverage,
+                        row.effective_leverage,
+                        row.actual_leverage,
+                    )
+                )
+            ):
+                continue
+            targets.append(
+                (
+                    scope[0],
+                    str(row.canonical_coin or ""),
+                    asset_id,
+                    market_max_leverage,
+                    market_only_isolated,
+                    expected_margin_mode,
+                    target_leverage,
+                )
+            )
         targets.sort(
             key=lambda item: (
                 (item[0], item[1].upper()) not in active_position_scopes,
@@ -7075,10 +7175,20 @@ class HyperliquidLowLatencyWatcher:
         )
         confirmed = 0
         failed = 0
-        for dex, canonical, asset_id, market_max_leverage in targets:
+        for (
+            dex,
+            canonical,
+            asset_id,
+            market_max_leverage,
+            market_only_isolated,
+            expected_margin_mode,
+            target_leverage,
+        ) in targets:
             cache_scope = (dex, canonical.upper())
-            lock_key = (*cache_scope, 1)
+            lock_key = (*cache_scope, target_leverage)
             risk_lock = self.engine._risk_settings_locks.setdefault(lock_key, asyncio.Lock())
+            released_margin = Decimal("0")
+            margin_release_error: Exception | None = None
             async with risk_lock:
                 async with self.db_session_factory() as db:
                     result = await ensure_hyperliquid_market_risk_settings(
@@ -7090,29 +7200,74 @@ class HyperliquidLowLatencyWatcher:
                         canonical_coin_value=canonical,
                         asset_id=asset_id,
                         market_max_leverage=market_max_leverage,
-                        desired_default_leverage=1,
+                        market_only_isolated=market_only_isolated,
+                        desired_default_leverage=configured_default_leverage,
                         action_type="PREPARE_OPEN",
                         force_refresh=True,
                     )
+                    if (
+                        result.is_ok
+                        and result.actual_margin_mode == FALLBACK_MARGIN_MODE
+                        and result.effective_leverage == target_leverage
+                        and result.actual_leverage == target_leverage
+                    ):
+                        try:
+                            released_margin = (
+                                await remove_excess_isolated_margin_for_target_leverage(
+                                    db=db,
+                                    client=self.execution_client,
+                                    account_address=account,
+                                    dex=dex,
+                                    canonical_coin_value=canonical,
+                                    asset_id=asset_id,
+                                    target_leverage=target_leverage,
+                                )
+                            )
+                        except Exception as exc:
+                            # Excess margin is conservative. Failure to release it
+                            # must never block copying or invalidate a confirmed
+                            # leverage setting; retry on a later startup instead.
+                            margin_release_error = exc
                     await db.commit()
             for cache_key in list(self.engine._risk_settings_ok_cache):
                 if cache_key[:2] == cache_scope:
                     self.engine._risk_settings_ok_cache.pop(cache_key, None)
-            if not result.is_ok or result.effective_leverage != 1 or result.actual_leverage != 1:
+            if (
+                not result.is_ok
+                or result.actual_margin_mode != expected_margin_mode
+                or result.effective_leverage != target_leverage
+                or result.actual_leverage != target_leverage
+            ):
                 failed += 1
                 log.warning(
-                    "hyperliquid_one_x_market_reconcile_failed",
+                    "hyperliquid_isolated_market_reconcile_failed",
                     dex=dex,
                     canonical_coin=canonical,
                     reason=redact_text(result.reason_code or result.reason or result.status)[:160],
                 )
                 continue
+            if margin_release_error is not None:
+                log.warning(
+                    "hyperliquid_isolated_margin_release_failed",
+                    dex=dex,
+                    canonical_coin=canonical,
+                    target_leverage=target_leverage,
+                    error=redact_text(margin_release_error)[:160],
+                )
+            elif released_margin > 0:
+                log.info(
+                    "hyperliquid_isolated_margin_released",
+                    dex=dex,
+                    canonical_coin=canonical,
+                    target_leverage=target_leverage,
+                    amount=str(released_margin),
+                )
             self.engine._risk_settings_ok_cache[
-                (dex, canonical.upper(), 1, result.desired_margin_mode)
+                (dex, canonical.upper(), target_leverage, result.desired_margin_mode)
             ] = result
             if result.actual_margin_mode:
                 self.engine._risk_settings_ok_cache[
-                    (dex, canonical.upper(), 1, result.actual_margin_mode)
+                    (dex, canonical.upper(), target_leverage, result.actual_margin_mode)
                 ] = result
             confirmed += 1
         return confirmed, failed
@@ -12722,7 +12877,7 @@ def _market_policy_effective_leverage(
         if market_requires_isolated_margin(meta)
         else DESIRED_MARGIN_MODE
     )
-    policy_default = 1 if margin_mode == FALLBACK_MARGIN_MODE else market_max
+    policy_default = 2 if margin_mode == FALLBACK_MARGIN_MODE else market_max
     return (
         effective_leverage_for_margin_mode(
             market_max,

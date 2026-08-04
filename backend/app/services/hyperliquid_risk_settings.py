@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
 from sqlalchemy import func, select, update
@@ -22,8 +22,8 @@ from app.services.baseline import BASELINE_WAIT_UNTIL_FLAT
 from app.services.execution_router import ExecutionVenue
 from app.services.hyperliquid_dex import canonical_coin, dex_display_name, mask_address, parse_coin
 from app.services.hyperliquid_execution import (
-    FORCED_ONE_X_MARKETS,
-    ISOLATED_ONLY_LEVERAGE,
+    FORCED_ISOLATED_LEVERAGE_MARKETS,
+    ISOLATED_TARGET_LEVERAGE,
     build_hyperliquid_leverage_plan,
     resolve_asset_id_from_meta,
 )
@@ -31,7 +31,10 @@ from app.services.leader_config import active_leaders_statement, is_coin_allowed
 
 DESIRED_MARGIN_MODE = "CROSS"
 FALLBACK_MARGIN_MODE = "ISOLATED"
-ISOLATED_MAX_LEVERAGE = ISOLATED_ONLY_LEVERAGE
+ISOLATED_MAX_LEVERAGE = ISOLATED_TARGET_LEVERAGE
+ISOLATED_MARGIN_REBALANCE_BUFFER_RATIO = Decimal("0.005")
+ISOLATED_MARGIN_REBALANCE_MIN_BUFFER = Decimal("1")
+ISOLATED_MARGIN_REBALANCE_MIN_RELEASE = Decimal("1")
 STATUS_UNKNOWN = "UNKNOWN"
 STATUS_SETTING = "SETTING"
 STATUS_CONFIRMED = "CONFIRMED"
@@ -129,7 +132,7 @@ def desired_leverage_for_margin_mode(
     canonical_coin_value: str | None = None,
 ) -> int:
     desired = int(desired_default_leverage or 10)
-    if one_x_leverage_required(
+    if isolated_leverage_required(
         margin_mode=margin_mode,
         canonical_coin_value=canonical_coin_value,
     ):
@@ -137,14 +140,15 @@ def desired_leverage_for_margin_mode(
     return desired
 
 
-def one_x_leverage_required(
+def isolated_leverage_required(
     *,
     margin_mode: str | None,
     canonical_coin_value: str | None,
 ) -> bool:
     return (
         _normalize_margin_mode(margin_mode) == FALLBACK_MARGIN_MODE
-        or str(canonical_coin_value or "").upper() in FORCED_ONE_X_MARKETS
+        or str(canonical_coin_value or "").upper()
+        in FORCED_ISOLATED_LEVERAGE_MARKETS
     )
 
 
@@ -208,7 +212,7 @@ async def ensure_hyperliquid_market_risk_settings(
     now = datetime.now(timezone.utc)
     # The caller resolves the current market policy from authoritative exchange
     # metadata.  Do not let an old persisted target (for example, legacy
-    # isolated 1x on a market that now supports cross margin) override it.
+    # isolated 2x on a market that now supports cross margin) override it.
     desired_default = requested_default
     if not row.desired_margin_mode:
         row.desired_margin_mode = DESIRED_MARGIN_MODE
@@ -337,7 +341,7 @@ async def ensure_hyperliquid_market_risk_settings(
         if (
             not _update_response_confirmed(response)
             and _normalize_margin_mode(margin_mode) == FALLBACK_MARGIN_MODE
-            and attempt_effective == ISOLATED_ONLY_LEVERAGE
+            and attempt_effective == ISOLATED_TARGET_LEVERAGE
             and _isolated_margin_top_up_required(response)
             and hasattr(client, "top_up_isolated_only_margin")
         ):
@@ -578,7 +582,7 @@ async def build_market_risk_settings_coverage(
         "desired_margin_mode": DESIRED_MARGIN_MODE,
         "target_default_leverage": desired_default,
         "effective_leverage_rule": (
-            "cross=min(default, market_max_leverage); isolated=1x; xyz:CXMT=1x"
+            "cross=min(default, market_max_leverage); isolated=2x; xyz:CXMT=2x"
         ),
         "ttl_seconds": ttl_seconds,
         "markets_confirmed_count": len(confirmed),
@@ -1201,6 +1205,25 @@ async def _add_isolated_margin(
     )
 
 
+async def _remove_isolated_margin(
+    client: Any,
+    *,
+    coin: str,
+    amount: Decimal,
+    asset_id: int | None,
+    nonce: int | None = None,
+) -> Any:
+    kwargs = {"coin": coin, "amount": amount}
+    if asset_id is not None:
+        kwargs["asset_id"] = asset_id
+    if nonce is not None:
+        kwargs["nonce"] = nonce
+    return await _call_with_optional_action_kwargs(
+        client.remove_isolated_margin,
+        kwargs,
+    )
+
+
 async def _call_with_optional_action_kwargs(method: Any, kwargs: dict[str, Any]) -> Any:
     remaining = dict(kwargs)
     for _attempt in range(3):
@@ -1305,6 +1328,122 @@ async def _isolated_margin_addition_for_target_leverage(
         price_buffer = max(Decimal("1"), target_margin * Decimal("0.005"))
         return shortfall + price_buffer
     return None
+
+
+def isolated_margin_excess_for_target_leverage(
+    position: Any,
+    *,
+    target_leverage: int = ISOLATED_TARGET_LEVERAGE,
+) -> Decimal:
+    """Return safely removable isolated margin, retaining a price buffer."""
+    if target_leverage <= 0 or position is None:
+        return Decimal("0")
+
+    def value(*names: str) -> Any:
+        for name in names:
+            if isinstance(position, dict):
+                candidate = position.get(name)
+            else:
+                candidate = getattr(position, name, None)
+            if candidate is not None and candidate != "":
+                return candidate
+        return None
+
+    size = _decimal_or_none(value("szi", "size"))
+    notional = _decimal_or_none(value("positionValue", "notional"))
+    entry_px = _decimal_or_none(value("entryPx", "entry_px"))
+    margin_used = _decimal_or_none(value("marginUsed", "margin_used"))
+    if size is None or abs(size) <= Decimal("0.00000001") or margin_used is None:
+        return Decimal("0")
+
+    reference_candidates: list[Decimal] = []
+    if notional is not None:
+        reference_candidates.append(abs(notional))
+    if entry_px is not None:
+        reference_candidates.append(abs(size * entry_px))
+    if not reference_candidates:
+        return Decimal("0")
+    reference_notional = max(reference_candidates)
+    if reference_notional <= 0:
+        return Decimal("0")
+
+    target_margin = reference_notional / Decimal(target_leverage)
+    safety_buffer = max(
+        ISOLATED_MARGIN_REBALANCE_MIN_BUFFER,
+        target_margin * ISOLATED_MARGIN_REBALANCE_BUFFER_RATIO,
+    )
+    removable = margin_used - target_margin - safety_buffer
+    if removable < ISOLATED_MARGIN_REBALANCE_MIN_RELEASE:
+        return Decimal("0")
+    return removable.quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+
+
+async def _load_active_position_for_margin_rebalance(
+    client: Any,
+    *,
+    account_address: str,
+    dex: str,
+    canonical_coin_value: str,
+) -> dict[str, Any] | None:
+    if not hasattr(client, "account_state"):
+        return None
+    try:
+        state = await client.account_state(address=account_address, dex=dex)
+    except TypeError:
+        state = await client.account_state(account_address, dex=dex)
+    expected = parse_coin(canonical_coin_value, default_dex=dex)
+    for item in (state or {}).get("assetPositions", []) or []:
+        position = item.get("position", item)
+        if not isinstance(position, dict):
+            continue
+        parsed = parse_coin(str(position.get("coin") or ""), default_dex=dex)
+        if parsed.canonical_coin != expected.canonical_coin:
+            continue
+        size = _decimal_or_none(position.get("szi") or position.get("size"))
+        if size is not None and abs(size) > Decimal("0.00000001"):
+            return position
+    return None
+
+
+async def remove_excess_isolated_margin_for_target_leverage(
+    *,
+    db: Any,
+    client: Any,
+    account_address: str,
+    dex: str,
+    canonical_coin_value: str,
+    asset_id: int | None = None,
+    target_leverage: int = ISOLATED_TARGET_LEVERAGE,
+) -> Decimal:
+    """Release legacy excess margin after an isolated leverage migration."""
+    if not hasattr(client, "remove_isolated_margin"):
+        return Decimal("0")
+    position = await _load_active_position_for_margin_rebalance(
+        client,
+        account_address=account_address,
+        dex=dex,
+        canonical_coin_value=canonical_coin_value,
+    )
+    removable = isolated_margin_excess_for_target_leverage(
+        position,
+        target_leverage=target_leverage,
+    )
+    if removable <= 0:
+        return Decimal("0")
+    action_nonce = await _allocate_durable_signed_action_nonce(db, client)
+    response = await _remove_isolated_margin(
+        client,
+        coin=canonical_coin_value,
+        amount=removable,
+        asset_id=asset_id,
+        nonce=action_nonce,
+    )
+    if not _update_response_confirmed(response):
+        raise RuntimeError(
+            "isolated margin removal did not return confirmed ok status: "
+            f"{_mask_response(response)}"
+        )
+    return removable
 
 
 async def _confirm_active_position_risk_setting(

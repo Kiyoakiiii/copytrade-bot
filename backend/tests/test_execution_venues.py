@@ -636,6 +636,11 @@ def test_hyperliquid_execution_client_strips_dex_prefix_for_sdk_leverage_and_ord
             amount=Decimal("12.3456781"),
             asset_id=47,
         )
+        remove_margin_response = await client.remove_isolated_margin(
+            coin="hyna:ZEC",
+            amount=Decimal("12.3456789"),
+            asset_id=47,
+        )
         payload = build_hyperliquid_ioc_order(
             coin="ZEC",
             dex="hyna",
@@ -648,15 +653,30 @@ def test_hyperliquid_execution_client_strips_dex_prefix_for_sdk_leverage_and_ord
         )
         order_response = await client.place_market_order(**payload)
         await client.close()
-        return client, leverage_response, top_up_response, add_margin_response, order_response
+        return (
+            client,
+            leverage_response,
+            top_up_response,
+            add_margin_response,
+            remove_margin_response,
+            order_response,
+        )
 
     try:
-        client, leverage_response, top_up_response, add_margin_response, order_response = asyncio.run(run())
+        (
+            client,
+            leverage_response,
+            top_up_response,
+            add_margin_response,
+            remove_margin_response,
+            order_response,
+        ) = asyncio.run(run())
         assert leverage_response == {"status": "ok"}
         assert top_up_response == {"status": "ok"}
         assert add_margin_response == {"status": "ok"}
+        assert remove_margin_response == {"status": "ok"}
         assert order_response == {"status": "ok"}
-        assert client.dexes == ["hyna", "hyna", "hyna", "hyna"]
+        assert client.dexes == ["hyna", "hyna", "hyna", "hyna", "hyna"]
         leverage_payload = client._client.posts[0][1]
         assert leverage_payload["action"] == {
             "type": "updateLeverage",
@@ -676,6 +696,13 @@ def test_hyperliquid_execution_client_strips_dex_prefix_for_sdk_leverage_and_ord
             "asset": 4242,
             "isBuy": True,
             "ntli": 12345679,
+        }
+        remove_margin_payload = client._client.posts[3][1]
+        assert remove_margin_payload["action"] == {
+            "type": "updateIsolatedMargin",
+            "asset": 4242,
+            "isBuy": True,
+            "ntli": -12345678,
         }
         assert client.exchange.info.name == "hyna:ZEC"
         assert client.exchange.orders[0]["name"] == "hyna:ZEC"
