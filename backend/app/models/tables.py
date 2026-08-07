@@ -668,6 +668,7 @@ class RiskEvent(Base, TimestampMixin):
     __tablename__ = "risk_events"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    dedupe_key: Mapped[str | None] = mapped_column(String(200), unique=True, index=True)
     severity: Mapped[str] = mapped_column(String(20), index=True)
     event_type: Mapped[str] = mapped_column(String(80), index=True)
     symbol: Mapped[str | None] = mapped_column(String(32), index=True)

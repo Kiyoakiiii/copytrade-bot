@@ -82,6 +82,7 @@ from app.services.execution_router import ExecutionVenue
 from app.services.execution_alerts import (
     COPY_ORDER_INSUFFICIENT_COLLATERAL,
     HYPERLIQUID_NETWORK_UPGRADE_POST_ONLY_REJECTION,
+    LEADER_LIQUIDATION_DETECTED,
     is_hyperliquid_network_upgrade_post_only_error,
 )
 from app.services.hyperliquid import HyperliquidInfoClient, fill_unique_id
@@ -181,6 +182,16 @@ SHARED_MARKET_META_CACHE_VERSION = "v1"
 SHARED_MARKET_META_LOCK_PREFIX = "copytrade:hyperliquid:market-meta"
 SHARED_PERP_DEX_DIRECTORY_CACHE_VERSION = "v1"
 SHARED_PERP_DEX_DIRECTORY_LOCK_PREFIX = "copytrade:hyperliquid:perp-dex-directory"
+LIQUIDATION_DETACHED_STATUS = "LIQUIDATION_DETACHED"
+LIQUIDATION_NOT_FOLLOWED_ACTION = "LIQUIDATION_NOT_FOLLOWED"
+LIQUIDATION_NOT_FOLLOWED_REASON = (
+    "LEADER_LIQUIDATION_NOT_FOLLOWED: authoritative leader liquidation fill "
+    "was recorded without submitting a follower order"
+)
+LIQUIDATION_DETACHED_REASON = (
+    "leader liquidation was intentionally not copied; follower market requires "
+    "manual handling and remains owned until the actual position is flat"
+)
 
 
 def _durable_replay_wait_seconds(
@@ -265,6 +276,140 @@ class FillEvent:
         if not self.time_ms:
             return None
         return datetime.fromtimestamp(self.time_ms / 1000, timezone.utc)
+
+
+def _execution_account_suffix(execution_scope: str) -> str:
+    normalized = str(execution_scope or "").strip().lower()
+    return normalized[-4:] if normalized else "MAIN"
+
+
+def _leader_liquidation_dedupe_key(
+    *,
+    execution_scope: str,
+    leader_address: str,
+    transaction_hash: Any = None,
+    fallback_identity: Any = None,
+) -> str:
+    scope = str(execution_scope or "").strip().lower() or "main"
+    leader = normalize_leader_address(leader_address)
+    transaction = str(transaction_hash or "").strip().lower()
+    identity = (
+        f"{scope}|{leader}|tx:{transaction}"
+        if transaction
+        else f"{scope}|{leader}|fallback:{fallback_identity}"
+    )
+    return f"leader_liquidation:{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+def _leader_liquidation_metadata_from_fill(fill: FillEvent) -> dict[str, Any] | None:
+    raw = fill.raw if isinstance(fill.raw, dict) else {}
+    liquidation = raw.get("liquidation")
+    if not isinstance(liquidation, dict):
+        return None
+    liquidated_user = normalize_leader_address(
+        liquidation.get("liquidatedUser")
+        or liquidation.get("liquidated_user")
+        or ""
+    )
+    leader_address = normalize_leader_address(fill.leader_address)
+    if not liquidated_user or liquidated_user != leader_address:
+        # Never infer a liquidation from position direction. The authoritative
+        # exchange payload must explicitly name this followed leader as the
+        # liquidated user. A different address means the leader supplied
+        # liquidity to somebody else's liquidation; a missing address is
+        # ambiguous and therefore remains an ordinary fill.
+        return None
+    implied = derive_leader_post_position_from_fill(fill)
+    direction = str(raw.get("dir") or raw.get("direction") or "").casefold()
+    explicitly_reduce_like = "close" in direction or "reduce" in direction
+    if not (implied.is_reduce or implied.is_close or explicitly_reduce_like):
+        # A genuine liquidation can only reduce the liquidated user's
+        # exposure. Requiring both independent signals prevents malformed or
+        # future payload variants from freezing a normal lifecycle. Direction
+        # remains sufficient when an otherwise authoritative fill omits the
+        # optional startPosition field.
+        return None
+    transaction_hash = raw.get("hash")
+    return {
+        "transaction_hash": str(transaction_hash or "") or None,
+        "canonical_coin": fill.market.canonical_coin,
+        "dex": fill.market.dex,
+        "event_time_ms": fill.time_ms,
+        "leader_fill_size": str(fill.size),
+        "leader_fill_price": str(fill.price),
+        "leader_start_position": str(implied.start_position)
+        if implied.start_position is not None
+        else None,
+        "leader_post_position": str(implied.signed_size_after),
+        "leader_position_flat_after": bool(implied.is_close),
+        "liquidation_method": liquidation.get("method"),
+        "liquidated_user": liquidated_user,
+        "detection_source": "userFills",
+        "source_fill_id": fill.source_fill_id,
+    }
+
+
+async def _insert_execution_alert_once(
+    db: Any,
+    *,
+    dedupe_key: str,
+    event_type: str,
+    symbol: str | None,
+    leader_address: str | None,
+    message: str,
+    metadata: dict[str, Any],
+) -> None:
+    values = {
+        "dedupe_key": str(dedupe_key)[:200],
+        "severity": "critical",
+        "event_type": event_type,
+        "symbol": str(symbol or "")[:32] or None,
+        "leader_address": normalize_leader_address(leader_address or "") or None,
+        "message": message,
+        "metadata_json": _json_safe(metadata),
+    }
+    if isinstance(db, AsyncSession):
+        await db.execute(
+            insert(RiskEvent)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=[RiskEvent.dedupe_key])
+        )
+        return
+    db.add(RiskEvent(**values))
+
+
+async def _record_leader_liquidation_fill_alert(
+    db: Any,
+    *,
+    fill: FillEvent,
+    execution_scope: str,
+) -> dict[str, Any] | None:
+    metadata = _leader_liquidation_metadata_from_fill(fill)
+    if metadata is None:
+        return None
+    dedupe_key = _leader_liquidation_dedupe_key(
+        execution_scope=execution_scope,
+        leader_address=fill.leader_address,
+        transaction_hash=metadata.get("transaction_hash"),
+        fallback_identity=(
+            f"{fill.source_fill_id}|{fill.market.canonical_coin}|{fill.time_ms}"
+        ),
+    )
+    metadata = {
+        **metadata,
+        "dedupe_key": dedupe_key,
+        "execution_account_suffix": _execution_account_suffix(execution_scope),
+    }
+    await _insert_execution_alert_once(
+        db,
+        dedupe_key=dedupe_key,
+        event_type=LEADER_LIQUIDATION_DETECTED,
+        symbol=fill.market.canonical_coin,
+        leader_address=fill.leader_address,
+        message="leader liquidation detected from an authoritative user fill",
+        metadata=metadata,
+    )
+    return metadata
 
 
 class RetryableFillProcessingError(RuntimeError):
@@ -1167,6 +1312,19 @@ def _manual_fill_position_confirmation_spec(
     return checkpoint_side, _q(after_abs), MANUAL_FILL_POSITION_EXACT
 
 
+def _follower_fill_implies_flat(fill: dict[str, Any]) -> bool:
+    start = _decimal_from_value(fill.get("startPosition"))
+    size = _decimal_from_value(fill.get("sz") or fill.get("size"))
+    side = str(fill.get("side") or "").upper()
+    if start is None or size is None or size <= 0 or side not in {"A", "B"}:
+        return False
+    after = start + size if side == "B" else start - size
+    return bool(
+        abs(start) > ALLOCATION_TRANSITION_TOLERANCE
+        and abs(after) <= ALLOCATION_TRANSITION_TOLERANCE
+    )
+
+
 def _manual_fill_position_checkpoint_satisfied(
     entry: FollowerManualPositionGuardEntry,
     *,
@@ -1276,6 +1434,7 @@ class FillDrivenExecutionEngine:
         self._account_abstraction_refresh_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._account_abstraction_full_refresh_at: dict[tuple[str, str], datetime] = {}
         self.pending_intents = PendingIntentLedger()
+        self._liquidation_detached_markets: set[tuple[str, str]] = set()
         self._state_refresh_task: asyncio.Task | None = None
         self._account_abstraction_refresh_tasks: dict[tuple[str, str, str], asyncio.Task] = {}
 
@@ -1354,6 +1513,61 @@ class FillDrivenExecutionEngine:
             await self._refresh_account_abstraction(db, role, address)
             warmed += 1
         return warmed
+
+    async def warm_liquidation_detached_markets(self, db: Any) -> int:
+        rows = (
+            await db.execute(
+                select(
+                    LeaderPositionAllocationRecord.dex,
+                    LeaderPositionAllocationRecord.canonical_coin,
+                )
+                .where(
+                    LeaderPositionAllocationRecord.execution_venue
+                    == ExecutionVenue.HYPERLIQUID.value
+                )
+                .where(
+                    LeaderPositionAllocationRecord.venue_account
+                    == self.execution_scope
+                )
+                .where(
+                    LeaderPositionAllocationRecord.status
+                    == LIQUIDATION_DETACHED_STATUS
+                )
+                .where(
+                    LeaderPositionAllocationRecord.allocated_qty
+                    > ALLOCATION_TRANSITION_TOLERANCE
+                )
+                .distinct()
+            )
+        ).all()
+        self._liquidation_detached_markets = {
+            (str(dex or "").lower(), str(coin or "").upper())
+            for dex, coin in rows
+            if coin
+        }
+        return len(self._liquidation_detached_markets)
+
+    def _liquidation_market_detached(self, market: MarketKey) -> bool:
+        return (
+            str(market.dex or "").lower(),
+            str(market.canonical_coin or "").upper(),
+        ) in self._liquidation_detached_markets
+
+    def _mark_liquidation_market_detached(self, market: MarketKey) -> None:
+        self._liquidation_detached_markets.add(
+            (
+                str(market.dex or "").lower(),
+                str(market.canonical_coin or "").upper(),
+            )
+        )
+
+    def _release_liquidation_market_detached(self, market: MarketKey) -> None:
+        self._liquidation_detached_markets.discard(
+            (
+                str(market.dex or "").lower(),
+                str(market.canonical_coin or "").upper(),
+            )
+        )
 
     async def handle_fill(
         self,
@@ -1434,6 +1648,22 @@ class FillDrivenExecutionEngine:
         # ownership checks still run later before any order can be submitted.
         if isinstance(db, AsyncSession):
             await self._release_resolved_pending_intents_for_market(db, fill.market)
+            if self._liquidation_market_detached(fill.market):
+                return await self._record_liquidation_detached_market_fill_ignored(
+                    db,
+                    fill=fill,
+                    leader=leader,
+                    implied=derive_leader_post_position_from_fill(fill),
+                    allocation_id=None,
+                    dedupe_started_at=dedupe_started_at,
+                    dedupe_done_at=dedupe_done_at,
+                    debounce_started_at=debounce_started_at,
+                    debounce_released_at=debounce_released_at,
+                    lock_wait_started_at=lock_wait_started_at,
+                    lock_acquired_at=lock_acquired_at,
+                    ws_received_at=ws_received_at,
+                    decision_started_at=decision_started_at,
+                )
             lifecycle_allocation = await self._peek_allocation_for_lifecycle_gate(
                 db,
                 leader,
@@ -1443,6 +1673,66 @@ class FillDrivenExecutionEngine:
                 lifecycle_allocation
             )
             early_fill_implied_position = derive_leader_post_position_from_fill(fill)
+            leader_liquidation = _leader_liquidation_metadata_from_fill(fill)
+            if leader_liquidation is not None:
+                # Classify from the authoritative fill payload before metadata,
+                # price, account, or follower-state reads.  This policy submits
+                # no order, so none of those hot-path dependencies are relevant.
+                liquidation_allocation = await self._load_allocation(
+                    db,
+                    leader,
+                    fill.market,
+                    None,
+                )
+                if (
+                    liquidation_allocation is not None
+                    and await self._allocation_has_durable_unresolved_order(
+                        db,
+                        liquidation_allocation,
+                    )
+                ):
+                    # A prior ordinary copy order may still change follower
+                    # quantity. Keep this fill durable until that outcome is
+                    # known instead of letting a late receipt overwrite the
+                    # liquidation checkpoint/detachment state.
+                    raise RetryableFillProcessingError(
+                        "LIQUIDATION_POLICY_HANDOFF_PENDING: prior same-market "
+                        "copy order outcome is unresolved"
+                    )
+                return await self._record_liquidation_not_followed(
+                    db,
+                    fill=fill,
+                    leader=leader,
+                    allocation=liquidation_allocation,
+                    implied=early_fill_implied_position,
+                    liquidation_metadata=leader_liquidation,
+                    advance_leader_checkpoint=True,
+                    dedupe_started_at=dedupe_started_at,
+                    dedupe_done_at=dedupe_done_at,
+                    debounce_started_at=debounce_started_at,
+                    debounce_released_at=debounce_released_at,
+                    lock_wait_started_at=lock_wait_started_at,
+                    lock_acquired_at=lock_acquired_at,
+                    ws_received_at=ws_received_at,
+                    decision_started_at=decision_started_at,
+                )
+            if _allocation_liquidation_detached(lifecycle_allocation):
+                self._mark_liquidation_market_detached(fill.market)
+                return await self._record_liquidation_detached_market_fill_ignored(
+                    db,
+                    fill=fill,
+                    leader=leader,
+                    implied=early_fill_implied_position,
+                    allocation_id=lifecycle_allocation.id,
+                    dedupe_started_at=dedupe_started_at,
+                    dedupe_done_at=dedupe_done_at,
+                    debounce_started_at=debounce_started_at,
+                    debounce_released_at=debounce_released_at,
+                    lock_wait_started_at=lock_wait_started_at,
+                    lock_acquired_at=lock_acquired_at,
+                    ws_received_at=ws_received_at,
+                    decision_started_at=decision_started_at,
+                )
             pending_checkpoint_dust_reopen = (
                 _fill_is_minimum_residual_pending_checkpoint_reopen(
                     lifecycle_allocation,
@@ -3769,6 +4059,206 @@ class FillDrivenExecutionEngine:
             await asyncio.sleep(UNRESOLVED_SAME_MARKET_RETRY_SLEEP_SECONDS)
         return blocking
 
+    async def _record_liquidation_detached_market_fill_ignored(
+        self,
+        db: Any,
+        *,
+        fill: FillEvent,
+        leader: LeaderConfig,
+        implied: FillImpliedPosition,
+        allocation_id: int | None,
+        dedupe_started_at: datetime,
+        dedupe_done_at: datetime,
+        debounce_started_at: datetime,
+        debounce_released_at: datetime,
+        lock_wait_started_at: datetime,
+        lock_acquired_at: datetime,
+        ws_received_at: datetime,
+        decision_started_at: datetime,
+    ) -> ExecutionOrder:
+        now = datetime.now(timezone.utc)
+        leader_notional = (
+            implied.notional_after_estimate
+            if implied.confidence == "HIGH"
+            else None
+        )
+        return await self._record_lifecycle_ignored_order(
+            db,
+            fill=fill,
+            leader=leader,
+            reason=(
+                "LIQUIDATION_DETACHED_MARKET_LOCKED: this follower market "
+                "requires manual handling after a leader liquidation; every "
+                "later copy fill is ignored until the actual follower position "
+                "is flat"
+            ),
+            target_side_hint=(
+                implied.side_after
+                if implied.confidence == "HIGH"
+                else PositionSide.FLAT
+            ),
+            leader_position_notional=leader_notional,
+            leader_entry_px=implied.entry_px,
+            leader_account_value=_configured_leader_account_value(leader),
+            follower_account_value=None,
+            dedupe_started_at=dedupe_started_at,
+            dedupe_done_at=dedupe_done_at,
+            debounce_started_at=debounce_started_at,
+            debounce_released_at=debounce_released_at,
+            lock_wait_started_at=lock_wait_started_at,
+            lock_acquired_at=lock_acquired_at,
+            ws_received_at=ws_received_at,
+            decision_started_at=decision_started_at,
+            account_cache_read_at=now,
+            account_cache_read_done_at=now,
+            price_cache_read_at=now,
+            price_cache_read_done_at=now,
+            action="LIQUIDATION_DETACHED_IGNORED",
+            allocation_id=allocation_id,
+            lifecycle_gate="LIQUIDATION_DETACHED_MARKET_LOCKED",
+        )
+
+    async def _record_liquidation_not_followed(
+        self,
+        db: Any,
+        *,
+        fill: FillEvent,
+        leader: LeaderConfig,
+        allocation: LeaderPositionAllocationRecord | None,
+        implied: FillImpliedPosition,
+        liquidation_metadata: dict[str, Any],
+        advance_leader_checkpoint: bool,
+        dedupe_started_at: datetime,
+        dedupe_done_at: datetime,
+        debounce_started_at: datetime,
+        debounce_released_at: datetime,
+        lock_wait_started_at: datetime,
+        lock_acquired_at: datetime,
+        ws_received_at: datetime,
+        decision_started_at: datetime,
+    ) -> ExecutionOrder:
+        now = datetime.now(timezone.utc)
+        # This additional durable alert write exists only on an
+        # authoritatively classified liquidation. Ordinary fills never enter
+        # this branch and incur no alert query or background rescan.
+        await _record_leader_liquidation_fill_alert(
+            db,
+            fill=fill,
+            execution_scope=self.execution_scope,
+        )
+        checkpoint = _apply_liquidation_not_followed_checkpoint(
+            allocation,
+            implied=implied,
+            leader_account_value=_configured_leader_account_value(leader),
+            source_fill_id=fill.source_fill_id,
+            now=now,
+            advance_leader_checkpoint=advance_leader_checkpoint,
+        )
+        if allocation is not None:
+            db.add(
+                AllocationEvent(
+                    allocation_id=allocation.id,
+                    execution_order_id=None,
+                    leader_id=allocation.leader_id or leader.id,
+                    leader_address=allocation.leader_address,
+                    source_fill_id=fill.source_fill_id,
+                    execution_venue=allocation.execution_venue,
+                    dex=allocation.dex,
+                    canonical_coin=allocation.canonical_coin,
+                    position_side=allocation.position_side,
+                    action=str(checkpoint["allocation_event_action"]),
+                    before_notional=checkpoint["before_notional"],
+                    after_notional=Decimal(allocation.allocated_notional or 0),
+                    before_qty=checkpoint["before_qty"],
+                    after_qty=Decimal(allocation.allocated_qty or 0),
+                    metadata_json=_json_safe(
+                        {
+                            **liquidation_metadata,
+                            "policy": "NEVER_COPY_LEADER_LIQUIDATIONS",
+                            "checkpoint_safe": checkpoint["checkpoint_safe"],
+                            "leader_checkpoint_advanced": checkpoint[
+                                "leader_checkpoint_advanced"
+                            ],
+                            "allocation_status_before": checkpoint["status_before"],
+                            "allocation_status_after": allocation.status,
+                            "follower_qty_unchanged": True,
+                        }
+                    ),
+                )
+            )
+        db.add(
+            RiskEvent(
+                severity="warning",
+                event_type="LEADER_LIQUIDATION_NOT_FOLLOWED",
+                symbol=fill.market.canonical_coin,
+                leader_address=leader.leader_address,
+                message=LIQUIDATION_NOT_FOLLOWED_REASON,
+                metadata_json=_json_safe(
+                    {
+                        **liquidation_metadata,
+                        "execution_scope": self.execution_scope,
+                        "allocation_id": allocation.id if allocation is not None else None,
+                        "allocation_status": allocation.status if allocation is not None else None,
+                        "checkpoint_safe": checkpoint["checkpoint_safe"],
+                        "leader_checkpoint_advanced": checkpoint[
+                            "leader_checkpoint_advanced"
+                        ],
+                        "follower_order_submitted": False,
+                        "policy": "NEVER_COPY_LEADER_LIQUIDATIONS",
+                    }
+                ),
+            )
+        )
+        leader_notional = (
+            implied.notional_after_estimate
+            if implied.confidence == "HIGH"
+            else None
+        )
+        order = await self._record_lifecycle_ignored_order(
+            db,
+            fill=fill,
+            leader=leader,
+            reason=LIQUIDATION_NOT_FOLLOWED_REASON,
+            target_side_hint=(
+                implied.side_after
+                if implied.confidence == "HIGH"
+                else _allocation_position_side(allocation) or PositionSide.FLAT
+            ),
+            leader_position_notional=leader_notional,
+            leader_entry_px=implied.entry_px,
+            leader_account_value=_configured_leader_account_value(leader),
+            follower_account_value=None,
+            dedupe_started_at=dedupe_started_at,
+            dedupe_done_at=dedupe_done_at,
+            debounce_started_at=debounce_started_at,
+            debounce_released_at=debounce_released_at,
+            lock_wait_started_at=lock_wait_started_at,
+            lock_acquired_at=lock_acquired_at,
+            ws_received_at=ws_received_at,
+            decision_started_at=decision_started_at,
+            account_cache_read_at=now,
+            account_cache_read_done_at=now,
+            price_cache_read_at=now,
+            price_cache_read_done_at=now,
+            action=LIQUIDATION_NOT_FOLLOWED_ACTION,
+            allocation_id=allocation.id if allocation is not None else None,
+            lifecycle_gate="LEADER_LIQUIDATION_NOT_FOLLOWED",
+            checklist_details={
+                "liquidation_detection": liquidation_metadata,
+                "checkpoint_safe": checkpoint["checkpoint_safe"],
+                "leader_checkpoint_advanced": checkpoint[
+                    "leader_checkpoint_advanced"
+                ],
+                "allocation_status": allocation.status if allocation is not None else None,
+                "follower_order_submitted": False,
+            },
+        )
+        if _allocation_liquidation_detached(allocation):
+            # The ignored order and detached allocation are already committed.
+            # Publish the fast in-memory gate only after durability succeeds.
+            self._mark_liquidation_market_detached(fill.market)
+        return order
+
     async def _record_lifecycle_ignored_order(
         self,
         db: Any,
@@ -3793,9 +4283,12 @@ class FillDrivenExecutionEngine:
         account_cache_read_done_at: datetime,
         price_cache_read_at: datetime,
         price_cache_read_done_at: datetime,
+        action: str = "IGNORED_OLD_LIFECYCLE",
+        allocation_id: int | None = None,
+        lifecycle_gate: str = "IGNORED_OLD_LIFECYCLE",
+        checklist_details: dict[str, Any] | None = None,
     ) -> ExecutionOrder:
         now = datetime.now(timezone.utc)
-        action = "IGNORED_OLD_LIFECYCLE"
         cloid = build_hyperliquid_cloid(
             leader_address=leader.leader_address,
             coin=fill.market.coin,
@@ -3807,7 +4300,7 @@ class FillDrivenExecutionEngine:
         )
         order = ExecutionOrder(
             leader_id=leader.id,
-            allocation_id=None,
+            allocation_id=allocation_id,
             leader_address=leader.leader_address,
             source_fill_id=fill.source_fill_id,
             source_type="AUTO_COPY",
@@ -3877,12 +4370,13 @@ class FillDrivenExecutionEngine:
             ),
             missing_latency_fields=[],
             pre_trade_checklist={
-                "lifecycle_gate": "IGNORED_OLD_LIFECYCLE",
+                "lifecycle_gate": lifecycle_gate,
                 "lifecycle_reason": reason,
                 "fill_implied_position": _fill_implied_payload(derive_leader_post_position_from_fill(fill)),
                 "order_policy": "FAST_MARKET_ONLY",
                 "transition_action": action,
                 "blockers": [],
+                **(checklist_details or {}),
             },
         )
         _set_latency_fields(order)
@@ -5094,6 +5588,14 @@ class FillDrivenExecutionEngine:
             reduce_only=reduce_only,
             allow_missed_reduce_catchup=bool((order.pre_trade_checklist or {}).get("missed_reduce_catchup")),
         )
+        if _leader_liquidation_metadata_from_fill(fill) is not None:
+            # Defense in depth: liquidation fills are terminated during
+            # planning. If a legacy/recovered plan ever reaches the final
+            # pre-send guard, it still must never reach the exchange.
+            blockers.append(
+                "LEADER_LIQUIDATION_NOT_FOLLOWED: liquidation orders are "
+                "forbidden at the final submit boundary"
+            )
         action = str(order.order_action or "").upper()
         checklist = order.pre_trade_checklist or {}
         manual_guard_blocked = False
@@ -5165,6 +5667,7 @@ class FillDrivenExecutionEngine:
             return
         allocation_update_started_at = datetime.now(timezone.utc)
         _trace_set(order, "allocation_update_started_at", allocation_update_started_at)
+        liquidation_detached = _allocation_liquidation_detached(allocation)
         result = apply_filled_order_to_allocation_state(
             allocation,
             order,
@@ -5174,6 +5677,11 @@ class FillDrivenExecutionEngine:
         )
         if result is None:
             return
+        if liquidation_detached:
+            # This receipt belongs to an ordinary order planned before the
+            # later liquidation skip. Apply its real fill quantity, but never
+            # let the late receipt reattach the residual to automatic copying.
+            _restore_liquidation_detached_status(allocation)
         minimum_residual_economic_flat_intent = bool(
             (order.pre_trade_checklist or {}).get(
                 "minimum_residual_early_close"
@@ -6368,8 +6876,14 @@ class FillDrivenExecutionEngine:
                 .where(LeaderPositionAllocationRecord.dex == market.dex)
                 .where(func.upper(LeaderPositionAllocationRecord.canonical_coin) == str(market.canonical_coin).upper())
                 .where(LeaderPositionAllocationRecord.status != "CLOSED")
-                .where(LeaderConfig.enabled.is_(True))
-                .where(LeaderConfig.deleted_at.is_(None))
+                .where(
+                    or_(
+                        LeaderPositionAllocationRecord.status
+                        == LIQUIDATION_DETACHED_STATUS,
+                        LeaderConfig.enabled.is_(True)
+                        & LeaderConfig.deleted_at.is_(None),
+                    )
+                )
                 .order_by(LeaderPositionAllocationRecord.created_at.asc(), LeaderPositionAllocationRecord.id.asc())
                 .with_for_update()
                 .execution_options(populate_existing=True)
@@ -6797,12 +7311,30 @@ class HyperliquidLowLatencyWatcher:
         self._stopped = asyncio.Event()
         self._leader_lock = asyncio.Lock()
         self._subscribed: set[str] = set()
+        self._liquidation_subscribed: set[str] = set()
         self._leader_fill_subscription_event = asyncio.Event()
+        self._leader_liquidation_subscription_event = asyncio.Event()
         self._account_abstraction_refresh_event = asyncio.Event()
         self._leader_fill_backfill_start_ms: int | None = None
         self._leader_fill_backfill_lock = asyncio.Lock()
         self._leader_fill_startup_backfill_done = False
         self._leader_snapshot_backfilled_through_ms: dict[str, int] = {}
+        self._liquidation_alert_not_before_ms = int(
+            (datetime.now(timezone.utc) - timedelta(
+                seconds=max(
+                    60.0,
+                    float(
+                        getattr(
+                            settings,
+                            "leader_fill_startup_backfill_seconds",
+                            60.0,
+                        )
+                        or 60.0
+                    ),
+                )
+            )).timestamp()
+            * 1000
+        )
         self._fill_ingress_guard = asyncio.Lock()
         self._fill_ingress_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._fill_queue_guard = asyncio.Lock()
@@ -6838,6 +7370,9 @@ class HyperliquidLowLatencyWatcher:
         self._follower_state_refresh_tasks: dict[str, asyncio.Task] = {}
         self._follower_rest_refresh_failures: dict[str, int] = {}
         self._follower_rest_refresh_next_at: dict[str, float] = {}
+        self._liquidation_cache_releases_after_commit: set[
+            tuple[str, str]
+        ] = set()
         self._liveness_stuck_signature: str | None = None
         self._writer_lease_connection: Any | None = None
         self._writer_lease_key = _writer_lease_key(
@@ -6871,12 +7406,15 @@ class HyperliquidLowLatencyWatcher:
             await self._refresh_follower_account_abstraction_once()
             self._account_abstraction_refresh_event.clear()
         await self._restore_persistent_manual_position_guards()
+        async with self.db_session_factory() as db:
+            await self.engine.warm_liquidation_detached_markets(db)
         await self._refresh_active_follower_positions_once(reason="STARTUP_ACTIVE_REFRESH")
         await self._replay_unprocessed_fills_once()
         await self._resume_unstarted_orders_once()
         self._schedule_background_task(self._warm_latency_caches())
         tasks = [
             asyncio.create_task(self._leader_fill_ws_loop()),
+            asyncio.create_task(self._leader_liquidation_ws_loop()),
             asyncio.create_task(self._ws_loop()),
             asyncio.create_task(self._leader_refresh_loop()),
             asyncio.create_task(self._price_poll_loop()),
@@ -7302,6 +7840,7 @@ class HyperliquidLowLatencyWatcher:
             self._update_websocket_connected_state()
         if changed:
             self._leader_fill_subscription_event.set()
+            self._leader_liquidation_subscription_event.set()
         if active_changed:
             # Enabling a leader often follows a collateral transfer. Wake the
             # out-of-band balance poller immediately instead of waiting for its
@@ -7437,6 +7976,22 @@ class HyperliquidLowLatencyWatcher:
                     synced, skipped = await self._sync_allocations_to_actual_follower_positions(db)
                     await self._reconcile_manual_position_guards(db)
                     await db.commit()
+                    release_keys = set(
+                        self._liquidation_cache_releases_after_commit
+                    )
+                    self._liquidation_cache_releases_after_commit.clear()
+                    for dex, canonical_coin in release_keys:
+                        parsed = parse_coin(canonical_coin, default_dex=dex)
+                        self.engine._release_liquidation_market_detached(
+                            MarketKey(
+                                dex=dex,
+                                coin=parsed.coin,
+                                canonical_coin=canonical_coin,
+                                raw_coin=canonical_coin,
+                                asset_id=None,
+                                venue_symbol=canonical_coin,
+                            )
+                        )
                 self.state.last_allocation_sync_at = datetime.now(timezone.utc)
                 self.state.allocation_sync_count = synced
                 self.state.allocation_sync_skipped_count = skipped
@@ -7444,6 +7999,7 @@ class HyperliquidLowLatencyWatcher:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self._liquidation_cache_releases_after_commit.clear()
                 self.state.allocation_sync_last_error = redact_text(exc)[:200]
                 self.state.last_error = f"allocation sync: {redact_text(exc)[:160]}"
                 log.warning("allocation_sync_failed", error=redact_text(exc))
@@ -7489,8 +8045,14 @@ class HyperliquidLowLatencyWatcher:
             .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
             .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
             .where(LeaderPositionAllocationRecord.status != "CLOSED")
-            .where(LeaderConfig.enabled.is_(True))
-            .where(LeaderConfig.deleted_at.is_(None))
+            .where(
+                or_(
+                    LeaderPositionAllocationRecord.status
+                    == LIQUIDATION_DETACHED_STATUS,
+                    LeaderConfig.enabled.is_(True)
+                    & LeaderConfig.deleted_at.is_(None),
+                )
+            )
         )
         dex_query = allocation_dexes
         if follower:
@@ -7583,8 +8145,14 @@ class HyperliquidLowLatencyWatcher:
                 .where(LeaderPositionAllocationRecord.execution_venue == ExecutionVenue.HYPERLIQUID.value)
                 .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
                 .where(LeaderPositionAllocationRecord.status != "CLOSED")
-                .where(LeaderConfig.enabled.is_(True))
-                .where(LeaderConfig.deleted_at.is_(None))
+                .where(
+                    or_(
+                        LeaderPositionAllocationRecord.status
+                        == LIQUIDATION_DETACHED_STATUS,
+                        LeaderConfig.enabled.is_(True)
+                        & LeaderConfig.deleted_at.is_(None),
+                    )
+                )
                 .with_for_update(of=LeaderPositionAllocationRecord)
                 .execution_options(populate_existing=True)
             )
@@ -7791,6 +8359,7 @@ class HyperliquidLowLatencyWatcher:
                 # show the expected directional delta versus the allocation.
                 skipped += 1
                 continue
+            liquidation_detached = _allocation_liquidation_detached(allocation)
             if _allocation_has_flat_leader_close_intent(allocation):
                 applied = await self._sync_flat_leader_close_intent_allocation(
                     db,
@@ -7863,7 +8432,11 @@ class HyperliquidLowLatencyWatcher:
                 allocation.allocated_notional = actual_notional if actual_notional > 0 else sync["actual_notional"]
                 allocation.target_notional = allocation.allocated_notional
                 allocation.avg_entry_price = _position_entry_price(position) or mark_price or allocation.avg_entry_price
-                allocation.status = "OPEN"
+                allocation.status = (
+                    LIQUIDATION_DETACHED_STATUS
+                    if liquidation_detached
+                    else "OPEN"
+                )
             allocation.last_reconcile_at = datetime.now(timezone.utc)
             # Do not probe this server-onupdate ORM attribute with hasattr after
             # an autoflush. SQLAlchemy may have expired it, and probing performs
@@ -7872,8 +8445,14 @@ class HyperliquidLowLatencyWatcher:
             allocation.updated_at = allocation.last_reconcile_at
             if sync.get("closed"):
                 _clear_deferred_reduce_after_follower_flat(allocation)
+                if liquidation_detached:
+                    self._liquidation_cache_releases_after_commit.add(
+                        (market.dex, market.canonical_coin.upper())
+                    )
             else:
                 _clear_deferred_reduce(allocation)
+                if liquidation_detached:
+                    allocation.pending_reduce_reason = LIQUIDATION_DETACHED_REASON
             db.add(
                 RiskEvent(
                     severity="info",
@@ -7922,6 +8501,12 @@ class HyperliquidLowLatencyWatcher:
             allocation = row[0]
             leader_enabled = bool(row[1])
             leader_deleted_at = row[2]
+            if _allocation_liquidation_detached(allocation):
+                # Liquidation residuals belong to the follower until the actual
+                # position is flat. Deleting the leader must never manufacture
+                # a release while that exposure still exists.
+                skipped += 1
+                continue
             if self.engine.pending_intents.has_pending_allocation(allocation):
                 skipped += 1
                 continue
@@ -8320,6 +8905,52 @@ class HyperliquidLowLatencyWatcher:
                 log.warning("low_latency_leader_fill_ws_reconnect", error=redact_text(exc))
                 await asyncio.sleep(3)
 
+    async def _leader_liquidation_ws_loop(self) -> None:
+        """Monitor liquidation bookkeeping on a socket isolated from fill ingress."""
+
+        while not self._stopped.is_set():
+            try:
+                async with websockets.connect(
+                    self.settings.hyperliquid_ws_url,
+                    ping_interval=20,
+                    compression=None,
+                    max_queue=HYPERLIQUID_WS_MAX_QUEUE,
+                    max_size=HYPERLIQUID_WS_MAX_MESSAGE_BYTES,
+                ) as ws:
+                    self._liquidation_subscribed.clear()
+                    self._leader_liquidation_subscription_event.clear()
+                    await self._subscribe_active_leader_liquidations(ws)
+                    next_app_ping_at = (
+                        asyncio.get_running_loop().time()
+                        + HYPERLIQUID_WS_APP_PING_SECONDS
+                    )
+                    while not self._stopped.is_set():
+                        if asyncio.get_running_loop().time() >= next_app_ping_at:
+                            await self._send_ws_ping(ws)
+                            next_app_ping_at = (
+                                asyncio.get_running_loop().time()
+                                + HYPERLIQUID_WS_APP_PING_SECONDS
+                            )
+                        if self._leader_liquidation_subscription_event.is_set():
+                            self._leader_liquidation_subscription_event.clear()
+                            await self._subscribe_active_leader_liquidations(ws)
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            continue
+                        await self._handle_leader_liquidation_ws_message(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "low_latency_leader_liquidation_ws_reconnect",
+                    error=redact_text(exc)[:200],
+                )
+                try:
+                    await asyncio.wait_for(self._stopped.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    pass
+
     async def _durable_leader_fill_backfill_start_ms(self) -> int:
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         fallback = self._startup_leader_fill_backfill_start_ms(now_ms)
@@ -8377,6 +9008,19 @@ class HyperliquidLowLatencyWatcher:
                 continue
             await self._subscribe(ws, {"type": "userFills", "user": address})
             self._subscribed.add(key)
+
+    async def _subscribe_active_leader_liquidations(self, ws: Any) -> None:
+        async with self._leader_lock:
+            leaders = list(self.state.ws_leaders)
+        for address in leaders:
+            key = f"userNonFundingLedgerUpdates:{address}"
+            if key in self._liquidation_subscribed:
+                continue
+            await self._subscribe(
+                ws,
+                {"type": "userNonFundingLedgerUpdates", "user": address},
+            )
+            self._liquidation_subscribed.add(key)
 
     def _update_websocket_connected_state(self) -> None:
         leader_fill_ready = not self.state.ws_leaders or self.state.leader_fills_ws_connected
@@ -8563,6 +9207,151 @@ class HyperliquidLowLatencyWatcher:
     async def _send_ws_ping(self, ws: Any) -> None:
         await ws.send(json.dumps({"method": "ping"}))
 
+    async def _handle_leader_liquidation_ws_message(
+        self,
+        raw_message: str | bytes,
+    ) -> None:
+        try:
+            message = json.loads(raw_message)
+        except Exception:
+            return
+        if message.get("channel") != "userNonFundingLedgerUpdates":
+            return
+        data = message.get("data")
+        if not isinstance(data, dict):
+            return
+        user_address = normalize_leader_address(data.get("user", ""))
+        async with self._leader_lock:
+            leader = self.state.active_leaders.get(user_address)
+            ws_leader = user_address in self.state.ws_leaders
+        if leader is None or not ws_leader:
+            return
+        await self._handle_leader_non_funding_ledger_updates(
+            leader_address=user_address,
+            data=data,
+        )
+
+    async def _handle_leader_non_funding_ledger_updates(
+        self,
+        *,
+        leader_address: str,
+        data: dict[str, Any],
+    ) -> None:
+        updates = data.get("nonFundingLedgerUpdates")
+        if updates is None:
+            updates = data.get("non_funding_ledger_updates")
+        if not isinstance(updates, list):
+            return
+        is_snapshot = bool(data.get("isSnapshot"))
+        earliest_liquidation_ms: int | None = None
+        async with self.db_session_factory() as db:
+            for update_payload in updates:
+                if not isinstance(update_payload, dict):
+                    continue
+                delta = update_payload.get("delta")
+                if not isinstance(delta, dict) or str(delta.get("type") or "").casefold() != "liquidation":
+                    continue
+                event_time_ms = _int_or_none(update_payload.get("time")) or 0
+                if (
+                    is_snapshot
+                    and event_time_ms > 0
+                    and event_time_ms < self._liquidation_alert_not_before_ms
+                ):
+                    # The ledger subscription can replay historical bookkeeping
+                    # on first subscribe.  Only the same bounded startup window
+                    # used by fill recovery is eligible for a new alert.
+                    continue
+                raw_positions = delta.get("liquidatedPositions")
+                if raw_positions is None:
+                    raw_positions = delta.get("liquidated_positions")
+                positions: list[dict[str, Any]] = []
+                for raw_position in raw_positions if isinstance(raw_positions, list) else []:
+                    if not isinstance(raw_position, dict):
+                        continue
+                    raw_coin = str(raw_position.get("coin") or "")
+                    try:
+                        parsed = parse_coin(raw_coin)
+                        coin = parsed.canonical_coin
+                    except Exception:
+                        coin = raw_coin
+                    positions.append(
+                        {
+                            "coin": coin,
+                            "szi": str(raw_position.get("szi") or ""),
+                        }
+                    )
+                transaction_hash = update_payload.get("hash")
+                fallback_identity = json.dumps(
+                    {
+                        "time": event_time_ms,
+                        "positions": positions,
+                        "account_value": delta.get("accountValue"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                dedupe_key = _leader_liquidation_dedupe_key(
+                    execution_scope=self.execution_scope,
+                    leader_address=leader_address,
+                    transaction_hash=transaction_hash,
+                    fallback_identity=fallback_identity,
+                )
+                symbol = positions[0]["coin"] if positions else None
+                metadata = {
+                    "execution_account_suffix": _execution_account_suffix(
+                        self.execution_scope
+                    ),
+                    "event_time_ms": event_time_ms or None,
+                    "transaction_hash": str(transaction_hash or "") or None,
+                    "canonical_coin": symbol,
+                    "liquidated_positions": positions,
+                    "account_value": str(delta.get("accountValue") or "") or None,
+                    "leverage_type": str(delta.get("leverageType") or "") or None,
+                    "detection_source": "userNonFundingLedgerUpdates",
+                    "is_snapshot": is_snapshot,
+                }
+                await _insert_execution_alert_once(
+                    db,
+                    dedupe_key=dedupe_key,
+                    event_type=LEADER_LIQUIDATION_DETECTED,
+                    symbol=symbol,
+                    leader_address=leader_address,
+                    message="leader liquidation detected from the non-funding ledger",
+                    metadata=metadata,
+                )
+                if event_time_ms > 0:
+                    earliest_liquidation_ms = (
+                        event_time_ms
+                        if earliest_liquidation_ms is None
+                        else min(earliest_liquidation_ms, event_time_ms)
+                    )
+            await db.commit()
+        if earliest_liquidation_ms is not None:
+            # The ledger event is an independent safety trigger.  If the fill
+            # stream was delayed or disconnected, pull the exact fills through
+            # the existing durable exactly-once inbox immediately.
+            backfill_start_ms = max(
+                earliest_liquidation_ms - LEADER_FILL_BACKFILL_OVERLAP_MS,
+                0,
+            )
+            if self._leader_fill_backfill_start_ms is None:
+                self._leader_fill_backfill_start_ms = backfill_start_ms
+            else:
+                self._leader_fill_backfill_start_ms = min(
+                    self._leader_fill_backfill_start_ms,
+                    backfill_start_ms,
+                )
+            self._schedule_background_task(
+                self._backfill_leader_fills_after_liquidation(backfill_start_ms)
+            )
+
+    async def _backfill_leader_fills_after_liquidation(
+        self,
+        start_time_ms: int,
+    ) -> None:
+        async with self._leader_fill_backfill_lock:
+            await self._backfill_leader_fills_since(start_time_ms)
+
     async def _handle_ws_message(
         self,
         raw_message: str | bytes,
@@ -8703,6 +9492,7 @@ class HyperliquidLowLatencyWatcher:
                 )
             return
         durable_guards: dict[tuple[str, str], tuple[MarketKey, FollowerMarketGuard]] = {}
+        liquidation_released_markets: set[tuple[str, str]] = set()
         async with self.db_session_factory() as db:
             for fill in fills:
                 try:
@@ -8727,8 +9517,36 @@ class HyperliquidLowLatencyWatcher:
                     fill=fill,
                     observed_at=ws_received_at,
                 )
+                if (
+                    _follower_fill_implies_flat(fill)
+                    and await self._release_liquidation_detached_after_authoritative_flat_fill(
+                        db,
+                        market=market,
+                        fill=fill,
+                        observed_at=ws_received_at,
+                    )
+                ):
+                    guard.active = False
+                    guard.reconciled_at = ws_received_at or datetime.now(timezone.utc)
+                    guard.position_change_confirmed_at = guard.reconciled_at
+                    guard.updated_at = guard.reconciled_at
+                    liquidation_released_markets.add(
+                        (market.dex, market.canonical_coin.upper())
+                    )
                 durable_guards[(market.dex, market.canonical_coin.upper())] = (market, guard)
             await db.commit()
+        for dex, canonical_coin in liquidation_released_markets:
+            parsed = parse_coin(canonical_coin, default_dex=dex)
+            self.engine._release_liquidation_market_detached(
+                MarketKey(
+                    dex=dex,
+                    coin=parsed.coin,
+                    canonical_coin=canonical_coin,
+                    raw_coin=canonical_coin,
+                    asset_id=None,
+                    venue_symbol=canonical_coin,
+                )
+            )
         for market, guard in durable_guards.values():
             if bool(guard.active):
                 self.manual_position_guard.mark(
@@ -8770,6 +9588,102 @@ class HyperliquidLowLatencyWatcher:
             .limit(1)
         )
         return row is not None
+
+    async def _release_liquidation_detached_after_authoritative_flat_fill(
+        self,
+        db: Any,
+        *,
+        market: MarketKey,
+        fill: dict[str, Any],
+        observed_at: datetime | None,
+    ) -> bool:
+        allocation = await db.scalar(
+            select(LeaderPositionAllocationRecord)
+            .where(
+                LeaderPositionAllocationRecord.execution_venue
+                == ExecutionVenue.HYPERLIQUID.value
+            )
+            .where(
+                LeaderPositionAllocationRecord.venue_account
+                == self.execution_scope
+            )
+            .where(LeaderPositionAllocationRecord.dex == market.dex)
+            .where(
+                func.upper(LeaderPositionAllocationRecord.canonical_coin)
+                == market.canonical_coin.upper()
+            )
+            .where(
+                LeaderPositionAllocationRecord.status
+                == LIQUIDATION_DETACHED_STATUS
+            )
+            .with_for_update()
+            .limit(1)
+        )
+        if allocation is None:
+            return False
+        before_qty = Decimal(allocation.allocated_qty or 0)
+        before_notional = Decimal(allocation.allocated_notional or 0)
+        now = _datetime_or_none(observed_at) or datetime.now(timezone.utc)
+        allocation.allocated_qty = Decimal("0")
+        allocation.allocated_notional = Decimal("0")
+        allocation.target_notional = Decimal("0")
+        allocation.status = "CLOSED"
+        allocation.last_reconcile_at = now
+        allocation.updated_at = now
+        _clear_deferred_reduce_after_follower_flat(allocation)
+        db.add(
+            AllocationEvent(
+                allocation_id=allocation.id,
+                execution_order_id=None,
+                leader_id=allocation.leader_id,
+                leader_address=allocation.leader_address,
+                source_fill_id=None,
+                execution_venue=allocation.execution_venue,
+                dex=allocation.dex,
+                canonical_coin=allocation.canonical_coin,
+                position_side=allocation.position_side,
+                action="LIQUIDATION_MANUAL_FLAT_RELEASE",
+                before_notional=before_notional,
+                after_notional=Decimal("0"),
+                before_qty=before_qty,
+                after_qty=Decimal("0"),
+                metadata_json=_json_safe(
+                    {
+                        "reason": "authoritative follower fill proved actual position flat",
+                        "follower_fill_id": fill_unique_id(
+                            self.settings.hyperliquid_follower_account_address()
+                            or "follower",
+                            fill,
+                        ),
+                        "observed_at": now.isoformat(),
+                    }
+                ),
+            )
+        )
+        db.add(
+            RiskEvent(
+                severity="info",
+                event_type="LIQUIDATION_MANUAL_MARKET_RELEASED",
+                symbol=allocation.canonical_coin,
+                leader_address=allocation.leader_address,
+                message=(
+                    "liquidation manual-handling market released after an "
+                    "authoritative follower fill proved the actual position flat"
+                ),
+                metadata_json=_json_safe(
+                    {
+                        "allocation_id": allocation.id,
+                        "execution_scope": self.execution_scope,
+                        "dex": allocation.dex,
+                        "canonical_coin": allocation.canonical_coin,
+                        "before_qty": str(before_qty),
+                        "before_notional": str(before_notional),
+                        "observed_at": now.isoformat(),
+                    }
+                ),
+            )
+        )
+        return True
 
     async def _persist_unmatched_follower_fill_guard(
         self,
@@ -11207,8 +12121,14 @@ class HyperliquidLowLatencyWatcher:
                 .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
                 .where(LeaderPositionAllocationRecord.status != "CLOSED")
                 .where(LeaderPositionAllocationRecord.allocated_qty > Decimal("0"))
-                .where(LeaderConfig.enabled.is_(True))
-                .where(LeaderConfig.deleted_at.is_(None))
+                .where(
+                    or_(
+                        LeaderPositionAllocationRecord.status
+                        == LIQUIDATION_DETACHED_STATUS,
+                        LeaderConfig.enabled.is_(True)
+                        & LeaderConfig.deleted_at.is_(None),
+                    )
+                )
                 .distinct()
             )
         ).all()
@@ -11289,6 +12209,10 @@ class HyperliquidLowLatencyWatcher:
 def _coalesce_same_batch_fills(events: list[FillEvent]) -> tuple[list[FillEvent], list[FillEvent]]:
     if len(events) <= 1:
         return events, []
+    if any(_fill_has_liquidation_marker(event) for event in events):
+        # Never merge a liquidation fill with an ordinary fill. Per-fill
+        # classification is more important than batching for this rare path.
+        return events, []
     order_events, order_skipped, has_order_keys = _aggregate_same_order_fills(events)
     if has_order_keys:
         return order_events, order_skipped
@@ -11298,6 +12222,8 @@ def _coalesce_same_batch_fills(events: list[FillEvent]) -> tuple[list[FillEvent]
 
 def _coalesce_queued_lifecycle_fills(events: list[FillEvent]) -> tuple[list[FillEvent], list[FillEvent]]:
     if len(events) <= 1:
+        return events, []
+    if any(_fill_has_liquidation_marker(event) for event in events):
         return events, []
 
     selected: list[FillEvent] = []
@@ -11437,6 +12363,8 @@ def _coalesce_legacy_same_batch_fills(events: list[FillEvent]) -> tuple[list[Fil
 
 
 def _aggregate_same_order_fills(events: list[FillEvent]) -> tuple[list[FillEvent], list[FillEvent], bool]:
+    if any(_fill_has_liquidation_marker(event) for event in events):
+        return events, [], False
     selected_by_index: dict[int, FillEvent] = {}
     skipped: list[FillEvent] = []
     handled_indexes: set[int] = set()
@@ -14058,6 +14986,93 @@ def _allocation_active(allocation: LeaderPositionAllocationRecord | None) -> boo
     return Decimal(allocation.allocated_qty or 0) > ALLOCATION_TRANSITION_TOLERANCE or Decimal(allocation.allocated_notional or 0) > ALLOCATION_TRANSITION_TOLERANCE
 
 
+def _allocation_liquidation_detached(
+    allocation: LeaderPositionAllocationRecord | None,
+) -> bool:
+    return bool(
+        allocation is not None
+        and str(allocation.status or "").upper() == LIQUIDATION_DETACHED_STATUS
+    )
+
+
+def _allocation_position_side(
+    allocation: LeaderPositionAllocationRecord | None,
+) -> PositionSide | None:
+    if allocation is None:
+        return None
+    return _position_side_or_none(getattr(allocation, "position_side", None))
+
+
+def _fill_has_liquidation_marker(fill: FillEvent) -> bool:
+    return isinstance((fill.raw or {}).get("liquidation"), dict)
+
+
+def _restore_liquidation_detached_status(
+    allocation: LeaderPositionAllocationRecord,
+) -> None:
+    qty = abs(Decimal(allocation.allocated_qty or 0))
+    notional = abs(Decimal(allocation.allocated_notional or 0))
+    allocation.target_notional = notional
+    _clear_deferred_reduce(allocation)
+    if qty <= ALLOCATION_TRANSITION_TOLERANCE:
+        allocation.status = "CLOSED"
+        allocation.target_notional = Decimal("0")
+        return
+    allocation.status = LIQUIDATION_DETACHED_STATUS
+    allocation.pending_reduce_reason = LIQUIDATION_DETACHED_REASON
+
+
+def _apply_liquidation_not_followed_checkpoint(
+    allocation: LeaderPositionAllocationRecord | None,
+    *,
+    implied: FillImpliedPosition,
+    leader_account_value: Decimal | None,
+    source_fill_id: str,
+    now: datetime,
+    advance_leader_checkpoint: bool = True,
+) -> dict[str, Any]:
+    before_qty = (
+        Decimal(allocation.allocated_qty or 0)
+        if allocation is not None
+        else Decimal("0")
+    )
+    before_notional = (
+        Decimal(allocation.allocated_notional or 0)
+        if allocation is not None
+        else Decimal("0")
+    )
+    status_before = str(allocation.status or "") if allocation is not None else None
+    checkpoint_safe = bool(
+        implied.confidence == "HIGH" and (implied.is_reduce or implied.is_close)
+    )
+    leader_checkpoint_advanced = bool(
+        advance_leader_checkpoint and checkpoint_safe
+    )
+    if allocation is not None:
+        # Intentionally skipped liquidation quantity never changes the follower
+        # ledger. Any liquidation terminates automatic handling of this market;
+        # every later fill remains ignored until the actual follower position is
+        # flat. The checkpoint is informational only and cannot reactivate it.
+        allocation.target_notional = abs(Decimal(allocation.allocated_notional or 0))
+        if advance_leader_checkpoint:
+            allocation.last_leader_account_value = leader_account_value
+        if leader_checkpoint_advanced:
+            allocation.last_leader_position_notional = implied.notional_after_estimate
+            allocation.last_leader_position_size = implied.size_after
+        allocation.last_source_fill_id = source_fill_id
+        allocation.last_reconcile_at = now
+        _restore_liquidation_detached_status(allocation)
+    return {
+        "before_qty": before_qty,
+        "before_notional": before_notional,
+        "status_before": status_before,
+        "checkpoint_safe": checkpoint_safe,
+        "leader_checkpoint_advanced": leader_checkpoint_advanced,
+        "detached": allocation is not None,
+        "allocation_event_action": "LIQUIDATION_SKIP_DETACHED",
+    }
+
+
 def _allocation_lifecycle_active(allocation: LeaderPositionAllocationRecord | None) -> bool:
     if allocation is None:
         return False
@@ -14137,6 +15152,8 @@ def _market_owner_blocker(
 
 def _allocation_has_flat_leader_close_intent(allocation: LeaderPositionAllocationRecord | None) -> bool:
     if allocation is None:
+        return False
+    if _allocation_liquidation_detached(allocation):
         return False
     target = abs(Decimal(getattr(allocation, "target_notional", 0) or 0))
     if target > ALLOCATION_TRANSITION_TOLERANCE:
@@ -14861,7 +15878,11 @@ def _effective_aggregate_follower_qty_for_reduce_scope(
 
 
 def _allocation_needs_manual_review(allocation: LeaderPositionAllocationRecord | None) -> bool:
-    return allocation is not None and str(allocation.status or "").upper() == "NEEDS_MANUAL_REVIEW"
+    return bool(
+        allocation is not None
+        and str(allocation.status or "").upper()
+        in {"NEEDS_MANUAL_REVIEW", LIQUIDATION_DETACHED_STATUS}
+    )
 
 
 def _ignore_without_allocation_reason(

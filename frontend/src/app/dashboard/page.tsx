@@ -144,6 +144,9 @@ type DashboardRealtime = {
     coin: string;
     symbol: string;
     execution_venue: string;
+    execution_account: string;
+    dex: string;
+    canonical_coin: string | null;
     position_side: string;
     target_notional: string;
     allocated_notional: string;
@@ -268,6 +271,9 @@ export default function DashboardPage() {
   const followerMigration = data?.runtime.follower_migration;
   const migrationBlocked = Boolean(followerMigration?.status && followerMigration.status !== "READY");
   const migrationCompleted = followerMigration?.last_action === "CUTOVER_COMPLETED_KILL_SWITCH_ON";
+  const liquidationManualMarkets = data?.active_allocations.filter(
+    (allocation) => allocation.status === "LIQUIDATION_DETACHED"
+  ) ?? [];
 
   return (
     <AppShell>
@@ -307,6 +313,30 @@ export default function DashboardPage() {
                   Old allocations archived; {followerMigration?.waiting_until_flat_count ?? 0} current leader position(s) wait until flat. Kill Switch remains on.
                 </div>
               )}
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {liquidationManualMarkets.length ? (
+        <section className="mb-4 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-danger">
+          <div className="flex items-start gap-3">
+            <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0" />
+            <div className="min-w-0">
+              <div className="font-semibold">Liquidation markets require manual handling</div>
+              <div className="mt-1 text-sm">
+                All later copy fills are disabled for these account/market pairs. They release automatically only after the actual follower position is flat.
+              </div>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {liquidationManualMarkets.map((allocation) => (
+                  <span
+                    className="rounded border border-red-200 bg-white px-2 py-1 font-mono text-xs"
+                    key={`${allocation.execution_account}:${allocation.dex}:${allocation.canonical_coin}:${allocation.leader_address}`}
+                  >
+                    {allocation.execution_account ? allocation.execution_account.slice(-4) : "MAIN"} · {allocation.canonical_coin ?? allocation.coin} · {allocation.position_side} · qty {allocation.allocated_qty}
+                  </span>
+                ))}
+              </div>
             </div>
           </div>
         </section>

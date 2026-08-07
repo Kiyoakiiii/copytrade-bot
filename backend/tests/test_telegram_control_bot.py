@@ -10,8 +10,10 @@ from app.models import AppSetting, AuditLog, RiskEvent
 from app.services.execution_alerts import (
     COPY_ORDER_INSUFFICIENT_COLLATERAL,
     HYPERLIQUID_NETWORK_UPGRADE_POST_ONLY_REJECTION,
+    LEADER_LIQUIDATION_DETECTED,
     format_copy_order_insufficient_collateral_alert,
     format_hyperliquid_network_upgrade_alert,
+    format_leader_liquidation_alert,
     is_hyperliquid_network_upgrade_post_only_error,
 )
 from app.services.telegram_control_bot import (
@@ -325,6 +327,37 @@ def test_insufficient_collateral_alert_contains_actionable_values_and_masks_addr
     assert "4a80" in text
     assert event.leader_address not in text
     assert "不会自动补单" in text
+
+
+def test_leader_liquidation_alert_is_actionable_and_masks_address() -> None:
+    event = RiskEvent(
+        id=80,
+        severity="critical",
+        event_type=LEADER_LIQUIDATION_DETECTED,
+        symbol="CASHCAT",
+        leader_address="<REDACTED_EVM_ADDRESS>",
+        message="leader liquidation detected",
+        metadata_json={
+            "execution_account_suffix": "MAIN",
+            "event_time_ms": 1_785_900_000_123,
+            "leverage_type": "Cross",
+            "account_value": "920.15",
+            "liquidated_positions": [{"coin": "CASHCAT", "szi": "-252764"}],
+            "detection_source": "userNonFundingLedgerUpdates",
+        },
+        created_at=datetime(2026, 8, 5, 5, 0, tzinfo=timezone.utc),
+    )
+
+    text = format_leader_liquidation_alert(event)
+
+    assert "Leader 发生强平" in text
+    assert "CASHCAT -252764" in text
+    assert "强平成交不跟随" in text
+    assert "立即停止这个账户中该币种的自动跟单" in text
+    assert "实际仓位归零前" in text
+    assert "仓位归零后自动释放" in text
+    assert "9d42" in text
+    assert event.leader_address not in text
 
 
 def test_execution_alert_dispatch_resumes_recipients_without_resending_completed_one() -> None:

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from app.api.deps import AppSettings, CurrentUser, DbSession
 from app.api.risk import get_risk_setting
@@ -220,7 +220,17 @@ async def build_dashboard_realtime_payload(
         await db.execute(
             select(LeaderPositionAllocationRecord)
             .where(LeaderPositionAllocationRecord.status != "CLOSED")
-            .order_by(LeaderPositionAllocationRecord.updated_at.desc())
+            .order_by(
+                case(
+                    (
+                        LeaderPositionAllocationRecord.status
+                        == "LIQUIDATION_DETACHED",
+                        0,
+                    ),
+                    else_=1,
+                ),
+                LeaderPositionAllocationRecord.updated_at.desc(),
+            )
             .limit(25)
         )
     ).scalars().all()
@@ -398,6 +408,9 @@ async def build_dashboard_realtime_payload(
                 "coin": row.hyperliquid_coin,
                 "symbol": row.binance_symbol or row.venue_symbol,
                 "execution_venue": row.execution_venue,
+                "execution_account": row.venue_account,
+                "dex": row.dex,
+                "canonical_coin": row.canonical_coin,
                 "position_side": row.position_side,
                 "target_notional": str(row.target_notional),
                 "allocated_notional": str(row.allocated_notional),
