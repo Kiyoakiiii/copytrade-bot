@@ -45,218 +45,443 @@ copytrade-bot/
   .env.example
 ```
 
-## Disaster Recovery / New Server Deployment
+## New Server Deployment Runbook For The Next AI
 
-The GitHub repository is intended to restore the application code and deployment
-templates on a new server. It deliberately does not contain live secrets or live
-database data.
+This is the authoritative handoff procedure for deploying this bot on a new
+server. Read this section before running commands. Also read
+[`docs/fill_driven_hot_path.md`](docs/fill_driven_hot_path.md) before changing
+execution logic.
 
-Not stored in Git:
+### Non-negotiable operating rules
 
-- `.env` with private keys, admin bootstrap password, app secrets, and wallet addresses.
-- TLS files under `deploy/certs/`.
-- Optional Nginx basic-auth file `deploy/htpasswd`.
-- Postgres and Redis Docker volumes.
-- Database backup files under `backups/`.
+1. **Never expose a secret.** Do not print, `cat`, log, paste, commit, or include
+   in a response any `.env` value, signer/private key, Telegram token, API
+   secret, admin password, encryption key, TLS private key, session, or database
+   dump. Avoid `set -x`, `env`, `printenv`, `docker inspect`, and full
+   `docker compose config` output because they can expand secrets. It is safe to
+   use `docker compose config --services`.
+2. **Only one live automatic-copy writer per execution account.** The main
+   `watcher` and explicit `watcher-subaccount` are the automatic-copy
+   order-writing processes. Never run an old-server watcher and a new-server
+   watcher for the same account at the same time. Database deduplication and
+   the writer lease protect processes sharing one database; they cannot protect
+   two independent server databases.
+3. **Do not consume production fills in dry-run during a migration.** A fill
+   processed as `DRY_RUN`, kill-switch-blocked, or otherwise terminal is not
+   replayed later just because live trading is enabled. A fresh installation
+   should start in dry-run; a production database migration must use the
+   dedicated cutover sequence below.
+4. **PostgreSQL is the durable source of truth.** Git does not contain leaders,
+   multipliers, configured account values, blocked coins, allocations,
+   lifecycle ownership, fill outcomes, order history, risk settings, admin
+   users, or performance cursors. Redis may start empty; PostgreSQL may not.
+5. **Never improvise an active allocation database.** If the follower has open
+   positions, restore the production database. A fresh database plus existing
+   exchange positions can create wrong ownership, duplicate exposure, or missed
+   reductions.
+6. **Never use `docker compose down -v`, delete the Postgres volume, retry an
+   `UNKNOWN` order, or reset a dirty Git worktree.** Stop and investigate.
+7. **Main and subaccount routes are isolated.** `watcher` owns leaders without
+   an explicit execution account. `watcher-subaccount` runs with
+   `LOW_LATENCY_LEADER_ROUTE_MODE=EXPLICIT` and owns only leaders routed to its
+   public subaccount address. They share code and market metadata, but not
+   allocations, durable fill scope, orders, positions, or locks.
+8. **Only one backend may poll the configured Telegram bot token.** Stop the
+   old backend before starting the replacement backend, or disable Telegram on
+   one side during staging. Two long-pollers can steal commands from each other.
 
-For a full recovery, keep these outside Git in a password manager or encrypted
-backup store:
+### What Git deliberately does not contain
 
-- A current `.env` or the values needed to rebuild it.
-- A recent Postgres backup produced by `scripts/backup-postgres.sh`.
-- TLS certificate files, or the ability to issue new certificates.
+- `.env` and any signing/authentication material.
+- TLS files under `deploy/certs/` and optional `deploy/htpasswd`.
+- Postgres/Redis Docker volumes.
+- `backups/*.dump` database backups.
 
-### 1. Prepare The Server
+Keep an encrypted/off-server copy of the current `.env`, a recent Postgres
+backup, and the ability to reissue TLS certificates. A restored database dump
+is sensitive even though it does not contain the Hyperliquid signer key: it
+contains account routing, order history, allocation state, admin/auth metadata,
+and trading configuration.
 
-Install Docker Engine, Docker Compose v2, Git, and either GitHub CLI or an SSH
-deploy key that can read the private repository.
+### Architecture that must exist after deployment
 
-Ubuntu example:
+| Service | Purpose | May submit orders? |
+|---|---|---|
+| `postgres` | Durable fills, outcomes, orders, allocations and settings | No |
+| `redis` | Coordination/cache support | No |
+| `backend` | FastAPI, UI API, Telegram control/alerts, migrations | Authorized manual API actions only; embedded auto watcher is disabled by Compose |
+| `watcher` | Main-account low-latency fill ingestion and execution | Yes |
+| `watcher-subaccount` | Explicit subaccount low-latency execution | Yes |
+| `analytics` | Cached leader performance refresh every six hours | No |
+| `frontend` | Next.js UI | No |
+| `nginx` | HTTPS reverse proxy | No |
+
+The repository currently defines one explicit subaccount worker in
+`docker-compose.yml`. Its `HYPERLIQUID_SUBACCOUNT_ADDRESS` override is a public
+routing address, not a private key. Before starting it on another installation,
+privately verify that this public address is the intended subaccount and that
+the leaders assigned to it have the same address in
+`leader_configs.hyperliquid_vault_address`. Do not change the signer key just
+because the execution target is a subaccount.
+
+### Phase 1: prepare the replacement server without starting the bot
+
+Use a stable, low-latency Linux host with synchronized time. Ubuntu example:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl git openssl
+sudo apt-get install -y ca-certificates curl git openssl rsync
 curl -fsSL https://get.docker.com | sudo sh
 sudo usermod -aG docker "$USER"
 newgrp docker
+timedatectl show -p NTPSynchronized
 ```
 
-Authenticate to GitHub or install an SSH deploy key, then clone:
+Clone and confirm the exact revision. Do not copy the old working directory or
+its build artifacts over the clone.
 
 ```bash
-cd /opt
-git clone git@github.com:Kiyoakiiii/copytrade-bot.git
-cd copytrade-bot
+sudo mkdir -p /opt/copytrade-bot
+sudo chown "$USER":"$USER" /opt/copytrade-bot
+git clone git@github.com:Kiyoakiiii/copytrade-bot.git /opt/copytrade-bot
+cd /opt/copytrade-bot
+git fetch origin
+git checkout main
+git pull --ff-only origin main
+git status --short
+git log -1 --oneline
+docker compose config --services
 ```
 
-### 2. Recreate Runtime-Only Files
-
-Create `.env` from the template and fill the live values manually. Do not paste
-private keys into GitHub issues, README files, commits, screenshots, or logs.
+`git status --short` must be empty before deployment. Build images now, while
+the old server is still live, to minimize cutover time. Compose requires its
+declared env file even for a build, so create a secret-free temporary copy of
+the example; do not start services with it:
 
 ```bash
 cp .env.example .env
 chmod 600 .env
-nano .env
+docker compose build --pull
 ```
 
-Minimum Hyperliquid production fields:
+The frontend production build is executed inside `docker compose build
+frontend`; the final frontend image intentionally contains only the standalone
+runtime and cannot rerun `npm` tests. Run the backend suite after the runtime
+`.env` has been restored in Phase 2.
 
-```env
-DATABASE_URL=postgresql+asyncpg://postgres/copytrade
-REDIS_URL=redis://redis:6379/0
-DEFAULT_PREFERRED_VENUE=HYPERLIQUID
-ENABLE_HYPERLIQUID_EXECUTION=true
-ENABLE_BINANCE_EXECUTION=false
-ENABLE_BINANCE_FALLBACK=false
+Do not run `docker compose up` yet during a production migration.
 
-HYPERLIQUID_EXECUTION_NETWORK=mainnet
-HYPERLIQUID_ACCOUNT_ADDRESS=<follower_account_address>
-HYPERLIQUID_SIGNER_PRIVATE_KEY=<never_commit_this>
-HYPERLIQUID_API_WALLET_ADDRESS=<api_wallet_address_if_used>
-HYPERLIQUID_DEFAULT_LEVERAGE=10
-HYPERLIQUID_DEFAULT_MARGIN_MODE=CROSS
-HYPERLIQUID_TRADING_ENABLED=false
+### Phase 2: recreate runtime-only files securely
 
-TRADING_ENABLED=false
-APP_SECRET_KEY=<openssl_rand_hex_32>
-ENCRYPTION_MASTER_KEY=<openssl_rand_hex_32>
-ADMIN_EMAIL=<your_admin_email>
-ADMIN_PASSWORD_BOOTSTRAP=<temporary_first_login_password>
-REQUIRE_TOTP=true
-COOKIE_SECURE=true
-NEXT_PUBLIC_API_BASE=/api
+Preferred migration method: transfer the existing `.env` over encrypted SSH,
+then restrict it immediately. Do not display it to verify the copy.
+
+```bash
+scp <old-server>:/home/ubuntu/copytrade-bot/.env /opt/copytrade-bot/.env
+chmod 600 /opt/copytrade-bot/.env
 ```
 
-Generate app secrets with:
+If the old `.env` is unavailable, rebuild it from a password manager:
+
+```bash
+cd /opt/copytrade-bot
+cp .env.example .env
+chmod 600 .env
+```
+
+At minimum, privately verify that these categories are configured without
+printing their values:
+
+- PostgreSQL and Redis URLs.
+- Main follower public account address.
+- Exactly one signer source: preferred `HYPERLIQUID_SIGNER_PRIVATE_KEY`, the
+  legacy private-key alias, or a securely mounted private-key file.
+- API-wallet public address when an API wallet signs for the main account.
+- Mainnet execution and WebSocket/info URLs.
+- Public subaccount routing, if the subaccount worker is used.
+- `APP_SECRET_KEY` and `ENCRYPTION_MASTER_KEY`. Preserve the old values when
+  restoring the old database.
+- Admin/TOTP, cookie, IP allowlist and Telegram settings.
+- `TRADING_ENABLED` and `HYPERLIQUID_TRADING_ENABLED` according to the fresh
+  install or production-cutover path below.
+
+Safe presence check (prints only `set`/`unset`, never values):
+
+```bash
+for key in DATABASE_URL HYPERLIQUID_ACCOUNT_ADDRESS APP_SECRET_KEY \
+  ENCRYPTION_MASTER_KEY; do
+  if grep -q "^${key}=." .env; then echo "${key}=set"; else echo "${key}=unset"; fi
+done
+```
+
+Run the backend test suite against the image before starting any service:
+
+```bash
+docker compose run --rm --no-deps backend pytest -q
+```
+
+Generate new application secrets only for a completely fresh database:
 
 ```bash
 openssl rand -hex 32
 openssl rand -hex 32
 ```
 
-Create the Nginx runtime files. The private certificate key must not be committed.
+Put the generated values directly into `.env`; never place them in this file,
+a shell transcript, a commit, or a chat response.
 
-For a real domain, issue a certificate with your preferred ACME client and copy
-or install the files as:
+Nginx requires certificate mount targets before it can start. For an existing
+domain, securely install or reissue the certificate:
 
 ```bash
+cd /opt/copytrade-bot
 mkdir -p deploy/certs
 sudo install -m 644 /etc/letsencrypt/live/<domain>/fullchain.pem deploy/certs/fullchain.pem
 sudo install -m 600 /etc/letsencrypt/live/<domain>/privkey.pem deploy/certs/privkey.pem
+touch deploy/htpasswd
+chmod 600 deploy/htpasswd
 ```
 
-For a temporary emergency recovery without a domain, create a self-signed cert:
+For a temporary recovery endpoint only, a self-signed certificate can be used:
 
 ```bash
 mkdir -p deploy/certs
 openssl req -x509 -newkey rsa:4096 -nodes \
   -keyout deploy/certs/privkey.pem \
   -out deploy/certs/fullchain.pem \
-  -days 30 \
-  -subj "/CN=copytrade-local"
+  -days 30 -subj "/CN=copytrade-recovery"
 chmod 600 deploy/certs/privkey.pem
-```
-
-If you are not using Nginx basic auth, create an empty mount target:
-
-```bash
 touch deploy/htpasswd
 ```
 
-If you enable the commented basic-auth lines in `deploy/nginx.conf`, generate
-the file instead:
+Open only SSH, HTTP and HTTPS in the host firewall. Do not expose Postgres,
+Redis, FastAPI port 8000, or Next.js port 3000 publicly.
+
+### Phase 3A: completely fresh installation
+
+Use this path only when there are no production allocations or follower
+positions to preserve.
+
+1. Set `TRADING_ENABLED=false`, `HYPERLIQUID_TRADING_ENABLED=false`, and
+   `BINANCE_TRADING_ENABLED=false` in `.env`.
+2. Start the stack and put the database kill switch on:
 
 ```bash
-docker run --rm httpd:2.4-alpine htpasswd -nbB <user> '<password>' > deploy/htpasswd
-chmod 600 deploy/htpasswd
-```
-
-### 3. Start A Fresh Instance
-
-Start in dry-run first. The backend automatically runs Alembic migrations.
-
-```bash
-docker compose up -d --build
+cd /opt/copytrade-bot
+docker compose up -d
+docker compose exec -T backend python -m app.scripts.kill_switch_on
 docker compose ps
-docker compose exec backend curl -fsS http://localhost:8000/health
+docker compose exec -T backend curl -fsS http://127.0.0.1:8000/health
 ```
 
-Open:
+3. Open `https://<domain>/login`, enroll TOTP, then configure leaders in
+   `/leaders`. For every leader, confirm the full public address, execution
+   account, multiplier, configured account value, max per-coin position and
+   blocked coins.
+4. Use `/dashboard` and `/preflight` to verify both follower accounts, watcher
+   subscriptions, current positions, market coverage and risk settings.
+5. Inspect dry-run outcomes before following the normal go-live procedure later
+   in this README.
 
-```text
-https://<server>/login
-https://<server>/preflight
-```
+### Phase 3B: migrate the live production bot without duplicates or lost state
 
-If this is a fresh database with no backup, add leaders again in the frontend.
-Set each leader's `copy_multiplier`, fixed `Account value used`, caps, allowed
-coins, and blocked coins before enabling live trading.
+This path preserves existing leader lifecycles. Keep the outage short, but
+never overlap order-writing workers.
 
-### 4. Restore Existing Bot State From Backup
+#### 3B.1 Quiesce and back up the old server
 
-Git alone does not restore database state. To preserve leader settings,
-fixed account values, allocations, baselines, risk settings, order history, and
-frontend-managed configuration, restore a Postgres backup.
-
-On the old server, while it is still available:
+On the old server:
 
 ```bash
 cd /home/ubuntu/copytrade-bot
+docker compose exec -T backend python -m app.scripts.kill_switch_on
+docker compose stop watcher watcher-subaccount analytics backend frontend nginx
 ./scripts/backup-postgres.sh
+sha256sum backups/copytrade_*.dump | tail -1
 ```
 
-Copy the resulting `backups/copytrade_*.dump` file to the new server using
-`scp`, `rsync`, or another encrypted transfer. Do not commit the dump to Git.
-Treat database dumps as sensitive because they contain account configuration,
-leader settings, allocation state, order history, and admin/auth metadata.
+Stopping both watchers is the decisive no-duplicate boundary. The kill switch
+is written first so the restored database starts in a safe state. Leave the old
+watchers stopped until the migration is either completed or deliberately rolled
+back.
+
+Transfer the newest dump over encrypted SSH and verify its checksum on the new
+server. Never commit it:
+
+```bash
+mkdir -p /opt/copytrade-bot/backups
+scp <old-server>:/home/ubuntu/copytrade-bot/backups/copytrade_<timestamp>.dump \
+  /opt/copytrade-bot/backups/
+chmod 600 /opt/copytrade-bot/backups/copytrade_<timestamp>.dump
+sha256sum /opt/copytrade-bot/backups/copytrade_<timestamp>.dump
+```
+
+If the watcher outage may exceed the configured startup backfill window,
+increase `LEADER_FILL_STARTUP_BACKFILL_SECONDS` before first start so it covers
+the outage. The durable database cursor and periodic backfill are additional
+protection, not permission to run two servers concurrently.
+
+#### 3B.2 Restore with every order writer stopped
 
 On the new server:
 
 ```bash
 cd /opt/copytrade-bot
-mkdir -p backups
-# put the dump file under backups/
-CONFIRM_RESTORE=1 ./scripts/restore-postgres.sh backups/copytrade_YYYYMMDDTHHMMSSZ.dump
-docker compose up -d --build
+docker compose up -d postgres redis
+docker compose stop watcher watcher-subaccount analytics backend frontend nginx || true
+CONFIRM_RESTORE=1 ./scripts/restore-postgres.sh \
+  backups/copytrade_<timestamp>.dump
+docker compose up -d backend frontend nginx analytics
+docker compose exec -T backend curl -fsS http://127.0.0.1:8000/health
 ```
 
-After restore, confirm:
+The backend automatically runs `alembic upgrade head`. Confirm the database is
+on the repository head and the restored kill switch is still on:
 
 ```bash
-docker compose exec postgres pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB
-docker compose exec backend curl -fsS http://localhost:8000/health
+docker compose exec -T postgres psql -U copytrade -d copytrade -Atc \
+  "select version_num from alembic_version;"
+docker compose exec -T postgres psql -U copytrade -d copytrade -Atc \
+  "select coalesce(value->>'kill_switch','missing') from app_settings where key='risk';"
 ```
 
-Then open `/leaders`, `/dashboard`, `/positions/allocations`, and `/preflight`.
-Confirm leaders, multipliers, fixed account values, caps, active allocations,
-and follower account state before turning off the kill switch.
+Do not start either watcher yet. With only backend/frontend running, privately
+verify in the UI:
 
-### 5. Live Cutover Checklist
+- all enabled leader addresses, multipliers and configured account values;
+- each leader's main/subaccount route;
+- blocked coins and max per-coin limits;
+- active allocations, including `LIQUIDATION_DETACHED` manual markets;
+- main and subaccount public follower identities;
+- no unexpected `PENDING_SUBMIT`, `SUBMITTING` or `UNKNOWN` order.
 
-Before live trading on a replacement server:
+`/preflight` will correctly report the watchers as unavailable at this stage.
 
-1. Keep `TRADING_ENABLED=false` and `HYPERLIQUID_TRADING_ENABLED=false` until
-   `/preflight` is green.
-2. Confirm the follower address shown in the UI is the intended new/live follower.
-3. Confirm all three readiness flags in the runtime status are true:
-   watcher running, websocket connected, and ready for low-latency live.
-4. Confirm `stale_over_2s` allocations are zero in the UI or DB checks.
-5. Confirm no unexpected active allocations from old/deleted leaders.
-6. Turn on `TRADING_ENABLED=true` and `HYPERLIQUID_TRADING_ENABLED=true`.
-7. Restart the stack.
-8. Turn off the frontend kill switch only after the first dry-run/live checks
-   match expected sizing and route.
+#### 3B.3 Live handoff
 
-Useful DB checks:
+For an existing production database, the copied `.env` should retain the known
+working live venue flags. Do not start a restored production watcher with live
+flags off merely to make it “dry-run”; that would consume real leader fills
+without executing them.
+
+1. Confirm the old server's two watcher services are still stopped.
+2. Confirm both new-server watcher services are stopped.
+3. In the new frontend Risk page, turn the kill switch off.
+4. Immediately start the new workers:
 
 ```bash
-docker compose exec postgres psql -U copytrade -d copytrade -c \
-  "select right(leader_address,4), copy_multiplier, fixed_account_value from leader_configs where enabled and deleted_at is null order by id;"
-
-docker compose exec postgres psql -U copytrade -d copytrade -c \
-  "select count(*) filter (where last_reconcile_at is null or last_reconcile_at < now() - interval '2 seconds') as stale_over_2s, count(*) as active_allocations from leader_position_allocations where status <> 'CLOSED';"
+cd /opt/copytrade-bot
+docker compose up -d watcher watcher-subaccount
 ```
+
+5. Watch both workers until they report WebSocket and durable-pipeline
+   readiness. Fills during the stopped interval are handled by startup/durable
+   backfill.
+
+Do not turn the old server back on after this point. Its database is now stale.
+
+### Phase 4: post-start acceptance checks
+
+Service and writer readiness:
+
+```bash
+docker compose ps
+docker compose exec -T postgres psql -U copytrade -d copytrade -P pager=off -c \
+  "select key, value->>'status' as status, value->>'last_heartbeat_at' as heartbeat, value->>'last_error' as error from app_settings where key like 'task_status:low_latency_watcher%' order by key;"
+docker compose exec -T postgres psql -U copytrade -d copytrade -P pager=off -c \
+  "select key, value->>'websocket_connected' as ws, value->>'ready_for_low_latency_live' as ready, value->>'account_value_ready' as balance_ready, value->>'durable_inbox_pending_count' as pending_fills, value->>'durable_inbox_retrying_count' as retrying_fills, value->>'durable_outbox_pending_submit_count' as pending_orders, value->>'durable_outbox_unknown_count' as unknown_orders from app_settings where key='watcher_status' or key like 'watcher_status:%' order by key;"
+```
+
+Expected for both account scopes:
+
+- `websocket_connected=true`;
+- `ready_for_low_latency_live=true`;
+- `account_value_ready=true` with no account-value blockers;
+- pending/retrying/stuck durable inbox counts are zero;
+- pending/submitting/unknown durable outbox counts are zero;
+- no poll fallback in live mode;
+- heartbeats continue updating.
+
+Durable fill/outcome and order checks:
+
+```bash
+docker compose exec -T postgres psql -U copytrade -d copytrade -P pager=off -c \
+  "select count(*) as unfinished_live_fills from source_fills where is_snapshot=false and processed_at is null;"
+docker compose exec -T postgres psql -U copytrade -d copytrade -P pager=off -c \
+  "select status, count(*) from execution_orders where source_type='AUTO_COPY' and status in ('PENDING_SUBMIT','SUBMITTING','UNKNOWN') group by status;"
+docker compose exec -T postgres psql -U copytrade -d copytrade -P pager=off -c \
+  "select right(leader_address,4) as leader, copy_multiplier, fixed_account_value, case when coalesce(hyperliquid_vault_address,'')='' then 'MAIN' else 'SUB' end as route from leader_configs where enabled and deleted_at is null order by id;"
+```
+
+After the first real fill, verify all of the following before declaring the
+migration complete:
+
+- the exchange leader history contains the same fill as `source_fills`;
+- every non-snapshot source fill has exactly one terminal
+  `source_fill_outcomes` row;
+- all coalesced fill IDs point to one equivalent order, not duplicate orders;
+- the order has one unique `cloid` and is `FILLED`;
+- actual follower quantity equals the account-scoped allocation quantity;
+- main and subaccount orders have the correct `venue_account` scope;
+- `leader_event_to_ws_ms`, `ws_to_actual_send_ms`, and exchange fill time are
+  plausible. First-time leverage configuration can take seconds; subsequent
+  hot-path sends should not inherit it.
+
+Useful recent latency query:
+
+```bash
+docker compose exec -T postgres psql -U copytrade -d copytrade -P pager=off -c \
+  "select id, right(leader_address,4) as leader, canonical_coin, order_action, leader_event_to_ws_ms, coalesce((latency_trace->'metrics'->>'ws_to_actual_send_ms')::int,ws_to_submit_ms) as ws_to_actual_send_ms, submit_to_ack_ms, event_to_ack_ms from execution_orders where source_type='AUTO_COPY' and created_at >= now()-interval '1 hour' order by id;"
+```
+
+### Rollback without creating duplicates
+
+If the new server must be abandoned after its watchers have processed any fill:
+
+1. Turn on the new database kill switch.
+2. Stop **both new watcher services**.
+3. Back up the new Postgres database.
+4. Restore that newest database onto the old server.
+5. Verify configuration and only then start the old watchers.
+
+Never simply restart the old watchers against their pre-cutover database. They
+do not know which fills/orders the new server processed and can duplicate or
+miss trades.
+
+### Routine code deployment on the same server
+
+For a normal code update that keeps the same Postgres volume:
+
+```bash
+cd /home/ubuntu/copytrade-bot
+git status --short
+git fetch origin
+git pull --ff-only origin main
+docker compose build backend frontend
+docker compose up -d backend frontend analytics watcher watcher-subaccount nginx
+docker compose ps
+```
+
+The watchers use durable source fills, deterministic IDs, unique `cloid`
+constraints and startup backfill across a short restart. Do not delete volumes
+or start a second server as part of a routine deployment.
+
+### Git safety gate before any future push
+
+Before committing, the next AI must:
+
+```bash
+git status --short
+git diff --check
+git diff --name-only
+git ls-files .env
+git check-ignore .env
+```
+
+`.env` must not be tracked and must be ignored. Stage explicit source files,
+never `git add -A` blindly. Inspect staged filenames and scan staged additions
+for private keys, Telegram/API tokens, passwords, certificate material and
+high-entropy credential literals before pushing.
 
 ## Implemented
 
@@ -266,7 +491,7 @@ docker compose exec postgres psql -U copytrade -d copytrade -c \
 - Binance account risk gate requires Hedge Mode, symbol `ISOLATED` margin, and 10x leverage before live opens/adds.
 - Hyperliquid execution venue support with default `HYPERLIQUID` preference, optional Binance fallback, per-leader venue settings, and venue-isolated allocation/order fields.
 - Hyperliquid market-equivalent orders are aggressive IOC limit orders with `cloid`; no GTC/resting auto orders are intended.
-- Hyperliquid risk gate sets isolated `min(10, coin_max_leverage)` before open/add; if max leverage is below 10 the coin is WARNING, not BLOCKED. Close/reduce intent is reduce-only and may proceed when it lowers risk.
+- Hyperliquid risk policy uses cross margin and the market maximum leverage when cross is supported. Markets that truly require isolated margin use 2x. Risk settings are prewarmed/cached outside the normal fill hot path; close/reduce intent remains reduce-only.
 - Hedge Mode orders always send `positionSide=LONG` or `SHORT`; `reduceOnly`, `positionSide=BOTH`, and close-all are not used for live orders.
 - Automatic copy orders are MARKET-only. The auto executor ignores leader `use_market_order` for AUTO_COPY and never sends LIMIT, price, or timeInForce.
 - Automatic copy orders generate Binance `newClientOrderId`, record `PENDING_SUBMIT` before submit, mark unknown network/timeout outcomes as `UNKNOWN`, and never immediately replay an unknown order.
@@ -295,7 +520,13 @@ BINANCE_TRADING_ENABLED=false
 
 Binance mappings are only required for Binance execution. A Hyperliquid coin that is tradable in Hyperliquid meta can still be copied even when Binance has no matching symbol. If Hyperliquid is unavailable and `ENABLE_BINANCE_FALLBACK=true`, Binance is used only when the Binance mapping and Binance risk checks are valid.
 
-Hyperliquid cannot safely represent simultaneous long and short allocations for the same coin on the same follower account. Same-direction allocations from multiple leaders can aggregate on one account, but opposite-direction allocations must be blocked unless separate Hyperliquid account/vault routing is configured.
+Each follower account/market has exactly one active leader lifecycle owner. The
+first valid new open from flat wins; fills from competing leaders cannot attach
+to that lifecycle. When the actual follower position is flat, ownership is
+released immediately, and only a later new open can acquire it. A manually
+opened follower position locks that account/market, while manual changes to an
+already-owned copy position change the real quantity used by subsequent
+proportional reductions. Main and subaccount ownership are independent.
 
 Leverage does not affect the copy ratio formula. The only supported sizing mode is
 `ACCOUNT_RATIO`. Target notional is:
@@ -310,7 +541,9 @@ target_notional =
 `copy_multiplier` scales the leader's account-risk ratio onto your account. It is
 not a direct multiplier of the leader's notional position.
 
-If a Hyperliquid coin has `maxLeverage < 10`, the bot uses that max leverage for isolated margin. That increases required margin, so pre-trade checks block open/add if follower withdrawable margin is insufficient.
+For a cross-capable Hyperliquid market, the bot uses cross margin at the market
+maximum leverage. A market that the exchange marks as isolated-only uses 2x.
+Leverage affects required margin but never changes the copy-ratio formula.
 
 ## Leader Configuration
 
@@ -336,7 +569,7 @@ Hyperliquid venue:
 
 - API connectivity and wallet/private-key configuration
 - enabled coins against Hyperliquid meta
-- `exists_in_meta`, `max_leverage`, `target_leverage=min(10,max_leverage)`, isolated margin mode, and OK/WARNING/BLOCKED risk status per coin
+- `exists_in_meta`, market maximum leverage, cross/isolated capability, effective policy leverage, and OK/WARNING/BLOCKED risk status per coin
 - allocation consistency against follower Hyperliquid positions when account state is available
 - no unresolved Hyperliquid `PENDING_SUBMIT` / `UNKNOWN` / `SUBMITTED` / `PARTIALLY_FILLED` auto orders
 
@@ -360,8 +593,9 @@ Account-state readiness is also required before small live copy:
 
 - Follower Hyperliquid account state must be loaded and fresh.
 - Each enabled leader account state must be loaded and fresh.
-- State is marked stale after `ACCOUNT_STATE_STALE_SECONDS` seconds, default `10`.
-- The poller refresh interval is `ACCOUNT_STATE_POLL_SECONDS`, default `5`.
+- State freshness uses `ACCOUNT_STATE_STALE_SECONDS` and
+  `ACCOUNT_STATE_POLL_SECONDS` from the deployed `.env`; do not assume a value
+  from an old README or another server.
 - If follower state is unavailable, Preflight shows `Follower Hyperliquid account state unavailable` and blocks live readiness.
 - If an enabled leader has no state or stale state, Preflight shows the leader address and blocks live readiness.
 
@@ -453,8 +687,8 @@ HYPERLIQUID_PRIVATE_KEY=
 HYPERLIQUID_PRIVATE_KEY_FILE=
 HYPERLIQUID_API_WALLET_ADDRESS=
 HYPERLIQUID_VAULT_ADDRESS=
-HYPERLIQUID_DEFAULT_LEVERAGE=10
-HYPERLIQUID_DEFAULT_MARGIN_MODE=ISOLATED
+HYPERLIQUID_DEFAULT_LEVERAGE=50
+HYPERLIQUID_DEFAULT_MARGIN_MODE=CROSS
 HYPERLIQUID_TRADING_ENABLED=false
 ```
 
@@ -484,11 +718,11 @@ docker compose exec backend python -m app.scripts.kill_switch_on
 docker compose up -d --build
 ```
 
-4. Open `/preflight` and confirm Hyperliquid API, follower account state, leader state, meta universe, enabled coins, target leverage, and allocation checks. Coins with max leverage below 10 should show WARNING, not BLOCKED.
+4. Open `/preflight` and confirm Hyperliquid API, follower account state, leader state, meta universe, enabled coins, cross/isolated policy leverage, and allocation checks.
 5. Add one leader in `/leaders`. Leave allowed coins empty for `ALL_COINS`, or choose a custom allowlist only when you want to restrict coins.
 6. Open `/dashboard` and confirm `My Hyperliquid Follower Account` shows accountValue, withdrawable, positions, update age, and no stale warning.
 7. Open `/leaders` or a leader detail page and confirm the leader accountValue, positions, copyability, route, and allocation status are visible.
-8. Watch dry-run orders in `/orders`: venue is correct, Hyperliquid orders are MARKET/IOC intent with cloid, risk checklist has isolated/effective leverage, account-state freshness checks, allocations update, and no live exchange order is submitted.
+8. Watch dry-run orders in `/orders`: venue is correct, Hyperliquid orders are MARKET/IOC intent with cloid, risk checklist has the cached margin mode/effective leverage, account-state freshness checks, allocations update, and no live exchange order is submitted.
 
 ## Small Live Start
 
