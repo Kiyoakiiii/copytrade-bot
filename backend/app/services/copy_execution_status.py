@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select, tuple_
 
 from app.models import ExecutionOrder, LeaderConfig
 from app.services.execution_router import ExecutionVenue
@@ -41,6 +41,84 @@ async def latest_copy_orders_by_market(
         if key not in latest:
             latest[key] = row
     return latest
+
+
+async def latest_copy_orders_for_markets(
+    db: Any,
+    market_keys: set[CopyOrderKey],
+) -> dict[CopyOrderKey, ExecutionOrder]:
+    """Load exactly one latest order for each visible leader/market scope.
+
+    The overview only renders currently open leader positions. Loading the
+    latest 500 complete order rows (including trace JSON) on every refresh was
+    both unnecessary and expensive. The window query keeps the same newest
+    ``created_at, id`` semantics while returning only rows the page can show.
+    """
+
+    normalized_keys = {
+        copy_order_key(
+            leader_address=leader_address,
+            dex=dex,
+            canonical_coin=canonical_coin,
+        )
+        for leader_address, dex, canonical_coin in market_keys
+        if leader_address and canonical_coin
+    }
+    if not normalized_keys:
+        return {}
+
+    leader_expr = func.lower(ExecutionOrder.leader_address)
+    dex_expr = func.lower(func.coalesce(ExecutionOrder.dex, ""))
+    coin_expr = func.upper(
+        func.coalesce(
+            ExecutionOrder.canonical_coin,
+            ExecutionOrder.venue_symbol,
+            ExecutionOrder.source_coin,
+            "",
+        )
+    )
+    ranked = (
+        select(
+            ExecutionOrder.id.label("order_id"),
+            func.row_number()
+            .over(
+                partition_by=(leader_expr, dex_expr, coin_expr),
+                order_by=(
+                    ExecutionOrder.created_at.desc(),
+                    ExecutionOrder.id.desc(),
+                ),
+            )
+            .label("scope_rank"),
+        )
+        .where(ExecutionOrder.source_type == "AUTO_COPY")
+        .where(
+            ExecutionOrder.execution_venue
+            == ExecutionVenue.HYPERLIQUID.value
+        )
+        .where(
+            tuple_(leader_expr, dex_expr, coin_expr).in_(
+                sorted(normalized_keys)
+            )
+        )
+        .subquery()
+    )
+    rows = (
+        await db.execute(
+            select(ExecutionOrder)
+            .join(ranked, ranked.c.order_id == ExecutionOrder.id)
+            .where(ranked.c.scope_rank == 1)
+        )
+    ).scalars().all()
+    return {
+        copy_order_key(
+            leader_address=row.leader_address,
+            dex=row.dex,
+            canonical_coin=(
+                row.canonical_coin or row.venue_symbol or row.source_coin
+            ),
+        ): row
+        for row in rows
+    }
 
 
 def copy_order_key(*, leader_address: str | None, dex: str | None, canonical_coin: str | None) -> CopyOrderKey:

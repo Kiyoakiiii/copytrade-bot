@@ -116,9 +116,12 @@ type LeaderAccountState = {
     baseline_status?: string | null;
     baseline_id?: number | null;
   }>;
+  position_count?: number;
   dex_states?: LeaderAccountState[];
   leader: { id: number };
 };
+
+const LEADER_OVERVIEW_REALTIME_MIN_INTERVAL_MS = 15_000;
 
 export default function LeadersPage() {
   const [leaders, setLeaders] = useState<Leader[]>([]);
@@ -148,13 +151,14 @@ export default function LeadersPage() {
   const realtimeRefreshTimerRef = useRef<number | null>(null);
   const realtimeRefreshRunningRef = useRef(false);
   const realtimeRefreshQueuedRef = useRef(false);
+  const realtimeRefreshLastStartedAtRef = useRef(0);
   const saveFeedbackTimerRef = useRef<number | null>(null);
 
   async function load(options?: { preserveEdits?: boolean; includePerformance?: boolean }) {
     setError("");
     const [rows, accounts, executionAccountOptions, performancePayload] = await Promise.all([
       apiFetch<Leader[]>(`/leaders?include_deleted=${showDeleted ? "true" : "false"}`),
-      apiFetch<LeaderAccountState[]>("/account-states/leaders").catch(() => []),
+      apiFetch<LeaderAccountState[]>("/account-states/leaders?compact=true").catch(() => []),
       apiFetch<ExecutionAccountOption[]>("/leaders/execution-accounts"),
       options?.includePerformance
         ? apiFetch<LeaderPerformanceOverview>("/leaders/performance").catch(() => null)
@@ -177,11 +181,17 @@ export default function LeadersPage() {
   function scheduleRealtimeRefresh(delayMs = 750) {
     realtimeRefreshQueuedRef.current = true;
     if (realtimeRefreshRunningRef.current || realtimeRefreshTimerRef.current !== null) return;
+    const elapsedSinceLastRefresh = Date.now() - realtimeRefreshLastStartedAtRef.current;
+    const throttledDelayMs = Math.max(
+      delayMs,
+      LEADER_OVERVIEW_REALTIME_MIN_INTERVAL_MS - elapsedSinceLastRefresh,
+    );
     realtimeRefreshTimerRef.current = window.setTimeout(async () => {
       realtimeRefreshTimerRef.current = null;
       if (!realtimeRefreshQueuedRef.current || realtimeRefreshRunningRef.current) return;
       realtimeRefreshQueuedRef.current = false;
       realtimeRefreshRunningRef.current = true;
+      realtimeRefreshLastStartedAtRef.current = Date.now();
       try {
         await load({ preserveEdits: true });
       } catch (err) {
@@ -189,11 +199,10 @@ export default function LeadersPage() {
       } finally {
         realtimeRefreshRunningRef.current = false;
         // Collapse an event burst into one trailing refresh. The leaders page
-        // includes a large account-state payload, so it must never fan out one
-        // multi-megabyte request set per SSE event.
-        if (realtimeRefreshQueuedRef.current) scheduleRealtimeRefresh(5000);
+        // must never fan out one request set per SSE event or reconnect-poll tick.
+        if (realtimeRefreshQueuedRef.current) scheduleRealtimeRefresh(0);
       }
-    }, delayMs);
+    }, Math.max(0, throttledDelayMs));
   }
 
   const realtime = useDashboardStream({
@@ -596,7 +605,7 @@ function LeaderRow({
         />
         <Metric label="Position notional" value={accountState?.total_ntl_pos ?? "--"} />
         <Metric label="State age" value={formatAge(accountState?.data_age_ms)} />
-        <Metric label="Default / xyz positions" value={`${accountState?.dex_states?.find((item) => (item.dex ?? "") === "")?.positions.length ?? 0} / ${accountState?.dex_states?.find((item) => item.dex === "xyz")?.positions.length ?? 0}`} />
+        <Metric label="Default / xyz positions" value={`${dexPositionCount(accountState, "")} / ${dexPositionCount(accountState, "xyz")}`} />
       </div>
       {accountState?.error_message ? <div className="border-t border-line px-4 py-3 text-sm text-danger">{accountState.error_message}</div> : null}
       {accountState?.positions.length ? (
@@ -887,6 +896,11 @@ function formatAge(value: number | null | undefined): string {
 
 function formatOpenTime(position: LeaderAccountState["positions"][number]): string {
   return formatOpenTimeLabel(position);
+}
+
+function dexPositionCount(state: LeaderAccountState | undefined, dex: string): number {
+  const dexState = state?.dex_states?.find((item) => (item.dex ?? "") === dex);
+  return dexState?.position_count ?? dexState?.positions.length ?? 0;
 }
 
 function humanLabel(value: string | null | undefined): string {

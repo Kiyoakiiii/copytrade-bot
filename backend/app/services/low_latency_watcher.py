@@ -99,6 +99,8 @@ from app.services.hyperliquid_execution import (
     ValidatedOrderParams,
     build_hyperliquid_cloid,
     build_hyperliquid_leverage_plan,
+    isolated_target_leverage,
+    market_leverage_override,
     resolve_asset_id_from_meta,
     validate_hyperliquid_order_params,
 )
@@ -111,7 +113,6 @@ from app.services.hyperliquid_risk_settings import (
     effective_leverage_for_margin_mode,
     ensure_hyperliquid_market_risk_settings,
     market_requires_isolated_margin,
-    isolated_leverage_required,
     remove_excess_isolated_margin_for_target_leverage,
 )
 from app.services.leader_config import active_leaders_statement, is_coin_allowed, normalize_leader_address
@@ -1454,23 +1455,23 @@ class FillDrivenExecutionEngine:
         warmed = 0
         for row in rows:
             persisted_effective = _int_or_none(row.effective_leverage)
-            if isolated_leverage_required(
+            policy_effective = effective_leverage_for_margin_mode(
+                row.market_max_leverage,
+                desired_default_leverage=int(
+                    self.settings.hyperliquid_default_leverage or 10
+                ),
                 margin_mode=row.actual_margin_mode or row.desired_margin_mode,
                 canonical_coin_value=row.canonical_coin,
-            ):
-                policy_effective = 2
-            else:
-                policy_effective = (
-                    _int_or_none(row.market_max_leverage)
-                    or int(self.settings.hyperliquid_default_leverage or 10)
-                )
+            )
+            if policy_effective is None:
+                continue
             if (
                 persisted_effective != policy_effective
                 or _int_or_none(row.actual_leverage) != policy_effective
             ):
-                # Never reuse a legacy non-2x isolated/CXMT confirmation. The
-                # first risk-increasing order must reconfirm the 2x policy at
-                # the exchange before it can submit.
+                # Never reuse a confirmation whose leverage differs from the
+                # current cross/isolated/per-market policy. The first
+                # risk-increasing order must reconfirm before submission.
                 continue
             result = _risk_setting_result_from_row(row)
             self._risk_settings_ok_cache[
@@ -1642,10 +1643,11 @@ class FillDrivenExecutionEngine:
         # belongs to a lifecycle that began while somebody else owned the market.
         # Complete it as IGNORED before metadata, prices, account values, follower
         # guards, or handoff waits so it cannot head-of-line block a later genuine
-        # startPosition=0 open.  A same-side increase from an economically flat
-        # (< venue minimum) leader remainder is also a genuine new lifecycle once
-        # it crosses back into tradeable size; the authoritative follower-flat and
-        # ownership checks still run later before any order can be submitted.
+        # startPosition=0 open.  An increase or direct flip from an economically
+        # flat (< venue minimum) leader remainder is also a genuine new lifecycle
+        # once the post-fill leg crosses back into tradeable size; the
+        # authoritative follower-flat and ownership checks still run later before
+        # any order can be submitted.
         if isinstance(db, AsyncSession):
             await self._release_resolved_pending_intents_for_market(db, fill.market)
             if self._liquidation_market_detached(fill.market):
@@ -1779,6 +1781,10 @@ class FillDrivenExecutionEngine:
             lifecycle_economic_dust_reopen_mode = (
                 "FOLLOWER_MINIMUM_RESIDUAL_CHECKPOINT"
                 if lifecycle_economic_dust_reopen and checkpoint_dust_reopen
+                else "LEADER_ABSOLUTE_DUST_FLIP"
+                if lifecycle_economic_dust_reopen
+                and absolute_dust_reopen
+                and bool(getattr(early_fill_implied_position, "is_flip", False))
                 else "LEADER_ABSOLUTE_DUST"
                 if lifecycle_economic_dust_reopen and absolute_dust_reopen
                 else None
@@ -2089,6 +2095,10 @@ class FillDrivenExecutionEngine:
         lifecycle_economic_dust_reopen_mode = (
             "FOLLOWER_MINIMUM_RESIDUAL_CHECKPOINT"
             if lifecycle_economic_dust_reopen and checkpoint_dust_reopen
+            else "LEADER_ABSOLUTE_DUST_FLIP"
+            if lifecycle_economic_dust_reopen
+            and absolute_dust_reopen
+            and bool(getattr(fill_implied_position, "is_flip", False))
             else "LEADER_ABSOLUTE_DUST"
             if lifecycle_economic_dust_reopen and absolute_dust_reopen
             else None
@@ -2202,7 +2212,7 @@ class FillDrivenExecutionEngine:
                     ),
                     "economic_dust_reopen_formula": (
                         "leader startPosition was below the venue minimum and "
-                        "the same-side increase crossed back into tradeable size; "
+                        "the increase or direct flip crossed back into tradeable size; "
                         "treat follower-flat state as a new account-ratio lifecycle"
                     ),
                 }
@@ -2262,7 +2272,13 @@ class FillDrivenExecutionEngine:
             fill_implied_position,
             transition_plan,
             allow_missed_reduce_catchup=missed_reduce_catchup,
-            allow_checkpoint_flip_open=lifecycle_checkpoint_flip_open,
+            allow_checkpoint_flip_open=(
+                lifecycle_checkpoint_flip_open
+                or bool(
+                    lifecycle_economic_dust_reopen
+                    and getattr(fill_implied_position, "is_flip", False)
+                )
+            ),
         )
         if fill_direction_guard_reason:
             blockers.append(fill_direction_guard_reason)
@@ -3069,9 +3085,9 @@ class FillDrivenExecutionEngine:
                     symbol=fill.market.canonical_coin,
                     leader_address=leader.leader_address,
                     message=(
-                        "leader increased a sub-minimum same-side remainder back "
-                        "into tradeable size; follower-flat state was treated as "
-                        "a new account-ratio lifecycle"
+                        "leader moved a sub-minimum remainder back into tradeable "
+                        "size by increasing or directly flipping it; follower-flat "
+                        "state was treated as a new account-ratio lifecycle"
                     ),
                     metadata_json=_json_safe(
                         {
@@ -4481,11 +4497,22 @@ class FillDrivenExecutionEngine:
                     return cached, "process_cache_planned_leverage"
 
         # Planning resolves the policy from the already-prewarmed authoritative
-        # market metadata: cross-capable=max leverage, isolated-only=2x. Reuse
+        # market metadata: cross-capable=max leverage, isolated-only=policy
+        # leverage (3x by default, CASHCAT 1x). Reuse
         # that exact value here instead of querying a stale per-market DB target
         # or taking the minimum with it.
         if planned_margin_mode == FALLBACK_MARGIN_MODE:
-            effective_leverage = 2
+            effective_leverage = (
+                effective_leverage_for_margin_mode(
+                    market_max_leverage,
+                    desired_default_leverage=int(
+                        self.settings.hyperliquid_default_leverage or 10
+                    ),
+                    margin_mode=planned_margin_mode,
+                    canonical_coin_value=fill.market.canonical_coin,
+                )
+                or isolated_target_leverage(fill.market.canonical_coin)
+            )
         else:
             effective_leverage = (
                 checklist_effective
@@ -7612,7 +7639,7 @@ class HyperliquidLowLatencyWatcher:
                     failed=failed,
                 )
         except Exception as exc:
-            self.state.last_error = f"2x isolated risk reconciliation: {redact_text(exc)[:160]}"
+            self.state.last_error = f"isolated risk reconciliation: {redact_text(exc)[:160]}"
             log.warning(
                 "hyperliquid_isolated_risk_settings_reconcile_failed",
                 error=redact_text(exc)[:200],
@@ -12482,16 +12509,28 @@ def _same_order_key(event: FillEvent) -> tuple[str, ...] | None:
 
 def _same_order_lifecycle_segments(events: list[FillEvent], indexes: list[int]) -> list[list[int]]:
     segments: list[list[int]] = []
-    start = 0
-    for pos, idx in enumerate(indexes):
-        if pos == 0:
-            continue
+    current: list[int] = []
+    for idx in indexes:
         implied = derive_leader_post_position_from_fill(events[idx])
-        if _fill_is_new_open_from_flat(implied):
-            segments.append(indexes[start:pos])
-            start = pos
-    segments.append(indexes[start:])
-    return [segment for segment in segments if segment]
+        if implied.is_flip:
+            # A flip contains both the close of one lifecycle and the open of
+            # another.  It must retain its own authoritative startPosition;
+            # combining it with adjacent fragments can choose a later, smaller
+            # absolute startPosition and synthesize the wrong post-fill size.
+            # Keep the flip as a singleton boundary. Fills on either side may
+            # still coalesce independently.
+            if current:
+                segments.append(current)
+                current = []
+            segments.append([idx])
+            continue
+        if _fill_is_new_open_from_flat(implied) and current:
+            segments.append(current)
+            current = []
+        current.append(idx)
+    if current:
+        segments.append(current)
+    return segments
 
 
 def _unique_order_segment_indexes(events: list[FillEvent], indexes: list[int]) -> list[int]:
@@ -13805,7 +13844,11 @@ def _market_policy_effective_leverage(
         if market_requires_isolated_margin(meta)
         else DESIRED_MARGIN_MODE
     )
-    policy_default = 2 if margin_mode == FALLBACK_MARGIN_MODE else market_max
+    policy_default = market_leverage_override(canonical_coin_value) or (
+        isolated_target_leverage(canonical_coin_value)
+        if margin_mode == FALLBACK_MARGIN_MODE
+        else market_max
+    )
     return (
         effective_leverage_for_margin_mode(
             market_max,
@@ -15550,7 +15593,7 @@ def _order_intent_blockers(
         blockers.append(
             "OWNERSHIP_ACQUISITION_GUARD: a released market can only be claimed "
             "by a genuine leader open from startPosition=0, a checkpoint-contiguous "
-            "flip, or a same-side increase from sub-minimum dust into tradeable size"
+            "flip, or an increase/direct flip from sub-minimum dust into tradeable size"
         )
     if position_side not in {"LONG", "SHORT"}:
         blockers.append("INTERNAL_SUBMIT_GUARD: missing position_side")
@@ -15566,6 +15609,7 @@ def _order_intent_blockers(
         allow_missed_reduce_catchup=allow_missed_reduce_catchup,
         allow_checkpoint_flip_open=bool(
             checklist.get("market_ownership_checkpoint_flip_open")
+            or checklist.get("market_ownership_economic_dust_reopen")
         ),
     )
     if direction_reason:
@@ -15959,13 +16003,14 @@ def _fill_is_economic_dust_reopen(
     reference_price: Decimal,
     min_order_value: Decimal,
 ) -> bool:
-    """Recognize a same-side add after the leader is economically flat.
+    """Recognize a material increase or direct flip from leader economic dust.
 
     The follower deliberately closes instead of retaining an untradeable
     residual below the venue minimum.  A later fill may therefore be an
-    ``is_increase`` for the leader while it is a genuine ``OPEN`` for the flat
-    follower.  Require the fill's authoritative startPosition to be below the
-    minimum and the post-fill position to cross back to at least the minimum.
+    ``is_increase`` or ``is_flip`` for the leader while its material post-fill
+    leg is a genuine ``OPEN`` for the flat follower. Require the fill's
+    authoritative startPosition to be below the minimum and the post-fill
+    position to cross back to at least the minimum.
     """
     if fill_implied_position is None:
         return False
@@ -15974,14 +16019,13 @@ def _fill_is_economic_dust_reopen(
     ).upper()
     if confidence not in {"HIGH", "MEDIUM"}:
         return False
-    if not bool(getattr(fill_implied_position, "is_increase", False)):
+    is_increase = bool(getattr(fill_implied_position, "is_increase", False))
+    is_flip = bool(getattr(fill_implied_position, "is_flip", False))
+    if not (is_increase or is_flip):
         return False
-    if (
-        bool(getattr(fill_implied_position, "is_open", False))
-        or bool(getattr(fill_implied_position, "is_reduce", False))
-        or bool(getattr(fill_implied_position, "is_close", False))
-        or bool(getattr(fill_implied_position, "is_flip", False))
-    ):
+    if bool(getattr(fill_implied_position, "is_open", False)) or bool(
+        getattr(fill_implied_position, "is_reduce", False)
+    ) or bool(getattr(fill_implied_position, "is_close", False)):
         return False
     price = abs(Decimal(reference_price or 0))
     minimum = abs(Decimal(min_order_value or 0))
@@ -15998,8 +16042,10 @@ def _fill_is_economic_dust_reopen(
         or signed_size_after is None
         or abs(start_position) <= ALLOCATION_TRANSITION_TOLERANCE
         or abs(signed_size_after) <= abs(start_position)
-        or (start_position > 0) != (signed_size_after > 0)
     ):
+        return False
+    same_direction = (start_position > 0) == (signed_size_after > 0)
+    if is_increase != same_direction or is_flip == same_direction:
         return False
     start_notional = abs(start_position) * price
     post_notional = abs(signed_size_after) * price

@@ -1,7 +1,97 @@
 # Copytrade Bot
 
-FastAPI + Next.js control plane for copying public Hyperliquid perpetual fills into follower execution venues.
-Hyperliquid execution is the default primary venue, with Binance USD-M Futures available as an optional fallback.
+> A low-latency, fill-driven Hyperliquid copy-execution engine with durable
+> deduplication, multi-leader lifecycle ownership, and isolated multi-account
+> routing.
+
+## Overview
+
+Copytrade Bot follows public Hyperliquid perpetual fills in real time and
+manages the complete follower-position lifecycle across multiple leaders and
+execution accounts. Hyperliquid is the primary execution venue; Binance USD-M
+Futures is available as an optional fallback.
+
+Many copy-trading scripts periodically compare position snapshots. This project
+follows the fill stream instead. That is harder to implement, but it avoids
+waiting for the next polling interval and preserves the order of rapid adds,
+reductions, closes, and reversals. The main execution rules are:
+
+- **No duplicate logical execution.** Deterministic fill identity, database
+  uniqueness constraints, durable outcomes, exchange client order IDs, and
+  recovery reconciliation prevent the same source fill from being submitted
+  twice.
+- **No silent fill loss.** Every observed fill receives a traceable outcome, and
+  source-stream freshness recovery covers gaps without replaying fills that have
+  already reached a terminal state.
+- **Low latency without weakening correctness.** WebSocket ingestion, cached
+  account and market context, prewarmed risk settings, per-market sequencing,
+  and a dedicated submission path keep avoidable local work out of the hot path.
+
+Latency is recorded for each fill, split into upstream delivery, local
+decision/queueing, actual transmission, and exchange acknowledgement. This
+makes it possible to distinguish a slow local path from delayed upstream data
+or exchange processing instead of relying on a single average.
+
+## Technical Design
+
+- **Durable fill-to-order pipeline.** Source fills, decisions, execution plans,
+  order attempts, exchange outcomes, and allocation changes are persisted in
+  PostgreSQL. Restart recovery continues from durable state instead of guessing
+  from memory.
+- **High-frequency burst handling.** Rapid split fills are deduplicated
+  individually and sequenced by execution account and market, avoiding a global
+  lock while preserving deterministic position transitions.
+- **FIFO market ownership.** When multiple leaders trade the same coin, the
+  first valid new lifecycle owns that account/market. Ownership is released as
+  soon as the real follower position is economically flat; only a later new open
+  may acquire it.
+- **Dust-aware lifecycle semantics.** Exchange-minimum residual positions are
+  closed and released instead of leaving stale ownership behind. A later add
+  from a leader's dust position is treated as a new open and competes under the
+  same FIFO rule.
+- **Main/subaccount isolation.** Multiple follower accounts use the same tested
+  execution engine and shared market metadata while keeping fill scope,
+  ownership, allocations, orders, positions, writer leases, and locks isolated.
+- **Actual-position-aware proportional copying.** Opens use the configured
+  leader account value and multiplier; adds, reductions, and closes follow
+  lifecycle proportions. Manual size changes to a managed follower position are
+  incorporated into later reductions, while independently opened manual
+  positions lock the coin against automatic ownership.
+- **Operational safety.** Preflight gates, dry-run mode, venue-specific live
+  switches, reconciliation, a Telegram remote kill switch and alerts, staged
+  latency telemetry, and a six-hour cached leader-performance dashboard cover
+  day-to-day operation and incident handling.
+- **Market-aware risk controls.** Per-leader coin blocking, per-coin position
+  caps, cached leverage/margin policy, reduce-only exit intent, liquidation
+  handling, and manual-intervention states are applied without putting remote
+  metadata calls in the normal order hot path.
+
+## Execution Flow
+
+```text
+Leader WebSocket fills
+        |
+        v
+Durable dedup inbox -> lifecycle ownership + proportional sizing
+        |                              |
+        |                              v
+        |                    durable execution plan
+        |                              |
+        v                              v
+freshness recovery           signed follower submission
+                                       |
+                                       v
+                         exchange reconciliation + allocations
+```
+
+The backend is built with FastAPI, async SQLAlchemy, PostgreSQL, and Redis. The
+operator interface is a Next.js dashboard, and the full stack is packaged with
+Docker Compose behind Nginx. See the
+[deployment runbook](#new-server-deployment-runbook) for a safe
+server migration and [`docs/fill_driven_hot_path.md`](docs/fill_driven_hot_path.md)
+for the execution-path design.
+
+## Safety-First Live Trading
 
 Default mode is dry-run. Live execution requires all gates:
 
@@ -45,17 +135,17 @@ copytrade-bot/
   .env.example
 ```
 
-## New Server Deployment Runbook For The Next AI
+## New Server Deployment Runbook
 
-This is the authoritative handoff procedure for deploying this bot on a new
-server. Read this section before running commands. Also read
+This is the authoritative procedure for deploying this bot on a new server.
+Read this section before running commands. Also read
 [`docs/fill_driven_hot_path.md`](docs/fill_driven_hot_path.md) before changing
 execution logic.
 
 ### Non-negotiable operating rules
 
-1. **Never expose a secret.** Do not print, `cat`, log, paste, commit, or include
-   in a response any `.env` value, signer/private key, Telegram token, API
+1. **Never expose a secret.** Do not print, `cat`, log, paste, commit, publish,
+   or otherwise disclose any `.env` value, signer/private key, Telegram token, API
    secret, admin password, encryption key, TLS private key, session, or database
    dump. Avoid `set -x`, `env`, `printenv`, `docker inspect`, and full
    `docker compose config` output because they can expand secrets. It is safe to
@@ -466,9 +556,9 @@ The watchers use durable source fills, deterministic IDs, unique `cloid`
 constraints and startup backfill across a short restart. Do not delete volumes
 or start a second server as part of a routine deployment.
 
-### Git safety gate before any future push
+### Git safety gate before any push
 
-Before committing, the next AI must:
+Before committing or pushing code, run:
 
 ```bash
 git status --short
@@ -491,7 +581,7 @@ high-entropy credential literals before pushing.
 - Binance account risk gate requires Hedge Mode, symbol `ISOLATED` margin, and 10x leverage before live opens/adds.
 - Hyperliquid execution venue support with default `HYPERLIQUID` preference, optional Binance fallback, per-leader venue settings, and venue-isolated allocation/order fields.
 - Hyperliquid market-equivalent orders are aggressive IOC limit orders with `cloid`; no GTC/resting auto orders are intended.
-- Hyperliquid risk policy uses cross margin and the market maximum leverage when cross is supported. Markets that truly require isolated margin use 2x. Risk settings are prewarmed/cached outside the normal fill hot path; close/reduce intent remains reduce-only.
+- Hyperliquid risk policy uses cross margin and the market maximum leverage when cross is supported. Markets that truly require isolated margin use 3x, except CASHCAT which remains 1x. Risk settings are prewarmed/cached outside the normal fill hot path; close/reduce intent remains reduce-only.
 - Hedge Mode orders always send `positionSide=LONG` or `SHORT`; `reduceOnly`, `positionSide=BOTH`, and close-all are not used for live orders.
 - Automatic copy orders are MARKET-only. The auto executor ignores leader `use_market_order` for AUTO_COPY and never sends LIMIT, price, or timeInForce.
 - Automatic copy orders generate Binance `newClientOrderId`, record `PENDING_SUBMIT` before submit, mark unknown network/timeout outcomes as `UNKNOWN`, and never immediately replay an unknown order.
@@ -542,7 +632,7 @@ target_notional =
 not a direct multiplier of the leader's notional position.
 
 For a cross-capable Hyperliquid market, the bot uses cross margin at the market
-maximum leverage. A market that the exchange marks as isolated-only uses 2x.
+maximum leverage. A market that the exchange marks as isolated-only uses 3x; CASHCAT remains an explicit 1x exception.
 Leverage affects required margin but never changes the copy-ratio formula.
 
 ## Leader Configuration

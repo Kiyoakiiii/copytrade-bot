@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.api.account_states import _follower_config_debug, _sizing_payload
+from app.api.account_states import (
+    _compact_account_state_summary,
+    _compact_leader_position_payload,
+    _follower_config_debug,
+    _sizing_payload,
+)
 from app.models import LatestAccountPosition, LatestAccountState, RiskEvent
 from app.services import account_state as account_state_service
 from app.services.account_state import (
@@ -683,6 +688,64 @@ def test_account_state_payload_returns_zero_values_and_camelcase_aliases() -> No
     assert payload["positions"][0]["marginMode"] == "ISOLATED"
 
 
+def test_compact_leader_overview_omits_rich_duplicate_payloads() -> None:
+    now = datetime.now(timezone.utc)
+    state = SimpleNamespace(
+        role=LEADER,
+        address="0x" + "2" * 40,
+        dex="xyz",
+        dex_display_name="XYZ",
+        account_label="leader",
+        account_value=Decimal("1000"),
+        withdrawable=Decimal("900"),
+        total_ntl_pos=Decimal("100"),
+        total_raw_usd=Decimal("1000"),
+        total_margin_used=Decimal("10"),
+        last_update_at=now,
+        source="test",
+        error_message=None,
+    )
+    open_position = SimpleNamespace(active=True)
+    closed_position = SimpleNamespace(active=False)
+
+    payload = _compact_account_state_summary(
+        state,
+        [open_position, closed_position],
+        stale_seconds=10,
+        include_closed=False,
+    )
+
+    assert payload["position_count"] == 1
+    assert payload["positions"] == [{}]
+    assert "dexStates" not in payload
+    assert "account_abstraction" not in payload
+    assert "accountAbstraction" not in payload
+
+
+def test_compact_leader_position_keeps_display_fields_without_raw_payload() -> None:
+    payload = _compact_leader_position_payload(
+        {
+            "coin": "HYPE",
+            "canonical_coin": "HYPE",
+            "side": "LONG",
+            "size": "1",
+            "copyable": True,
+            "baseline_status": "COPY_ALLOWED",
+            "last_copy_order_display_status": "LAST_ORDER_FILLED",
+            "raw_position_payload": {"large": "debug"},
+            "rawPositionPayload": {"large": "debug"},
+            "account_abstraction": {"large": "debug"},
+        }
+    )
+
+    assert payload["canonical_coin"] == "HYPE"
+    assert payload["copyable"] is True
+    assert payload["last_copy_order_display_status"] == "LAST_ORDER_FILLED"
+    assert "raw_position_payload" not in payload
+    assert "rawPositionPayload" not in payload
+    assert "account_abstraction" not in payload
+
+
 def test_account_state_payload_hides_closed_positions_by_default() -> None:
     now = datetime.now(timezone.utc)
     state = SimpleNamespace(
@@ -752,3 +815,6 @@ def test_frontend_operational_pages_use_realtime_stream_fallback() -> None:
         text = path.read_text()
         assert "useDashboardStream" in text
         assert "useRealtimeFallbackPolling" in text
+    leaders_page = (root / "frontend/src/app/leaders/page.tsx").read_text()
+    assert "/account-states/leaders?compact=true" in leaders_page
+    assert "LEADER_OVERVIEW_REALTIME_MIN_INTERVAL_MS = 15_000" in leaders_page

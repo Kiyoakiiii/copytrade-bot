@@ -21,6 +21,7 @@ from app.services.copy_execution_status import (
     copy_order_key,
     copy_order_status_payload,
     latest_copy_orders_by_market,
+    latest_copy_orders_for_markets,
 )
 from app.services.leader_config import (
     active_leaders_statement,
@@ -163,13 +164,20 @@ async def leader_account_states(
     db: DbSession,
     settings: AppSettings,
     include_closed: bool = Query(False),
+    compact: bool = Query(True),
 ):
     await schedule_account_state_refresh_if_stale(
         settings,
         max_age_seconds=monitoring_account_state_stale_seconds(settings),
     )
     leaders = (await db.execute(active_leaders_statement())).scalars().all()
-    return await _leader_state_payloads(db, leaders, settings=settings, include_closed=include_closed)
+    return await _leader_state_payloads(
+        db,
+        leaders,
+        settings=settings,
+        include_closed=include_closed,
+        compact=compact,
+    )
 
 
 @router.get("/leaders/{leader_id}")
@@ -204,13 +212,23 @@ async def _leader_state_payloads(
     settings: AppSettings,
     include_allocations: bool = False,
     include_closed: bool = False,
+    compact: bool = False,
 ) -> list[dict[str, Any]]:
     monitoring_stale_seconds = monitoring_account_state_stale_seconds(settings)
+    leader_addresses = [
+        normalize_leader_address(leader.leader_address)
+        for leader in leaders
+    ]
+    if not leader_addresses:
+        return []
     state_rows = (
-        await db.execute(select(LatestAccountState).where(LatestAccountState.role == LEADER))
+        await db.execute(
+            select(LatestAccountState)
+            .where(LatestAccountState.role == LEADER)
+            .where(LatestAccountState.address.in_(leader_addresses))
+        )
     ).scalars().all()
     states_by_address: dict[str, list[LatestAccountState]] = defaultdict(list)
-    states_by_id = {row.id: row for row in state_rows}
     for row in state_rows:
         states_by_address[row.address.lower()].append(row)
     state_ids = [row.id for row in state_rows]
@@ -236,7 +254,11 @@ async def _leader_state_payloads(
             )
         ).scalars().all():
             allocations_by_leader[allocation.leader_address.lower()].append(allocation)
-    follower_address = settings.hyperliquid_follower_account_address()
+    follower_address = (
+        settings.hyperliquid_follower_account_address()
+        if include_allocations
+        else None
+    )
     follower_states_by_dex: dict[str, LatestAccountState] = {}
     follower_abstraction: dict[str, Any] | None = None
     if follower_address:
@@ -259,12 +281,37 @@ async def _leader_state_payloads(
         watcher_statuses_by_scope(watcher_rows)
     )
     baseline_by_scope = await baselines_by_scope_for_leaders(db, [leader.id for leader in leaders])
-    latest_copy_orders = await latest_copy_orders_by_market(db, leaders)
+    if compact:
+        visible_market_keys = {
+            copy_order_key(
+                leader_address=position.address,
+                dex=position.dex,
+                canonical_coin=(
+                    position.canonical_coin or position.coin
+                ),
+            )
+            for positions in positions_by_state.values()
+            for position in positions
+        }
+        latest_copy_orders = await latest_copy_orders_for_markets(
+            db,
+            visible_market_keys,
+        )
+    else:
+        latest_copy_orders = await latest_copy_orders_by_market(db, leaders)
 
     payloads = []
     for leader in leaders:
         address = normalize_leader_address(leader.leader_address)
-        leader_abstraction = await load_account_abstraction_state(db, role=LEADER, address=address)
+        leader_abstraction = (
+            None
+            if compact
+            else await load_account_abstraction_state(
+                db,
+                role=LEADER,
+                address=address,
+            )
+        )
         leader_states = sorted(states_by_address.get(address, []), key=lambda row: row.dex)
         state = next((row for row in leader_states if row.dex == ""), leader_states[0] if leader_states else None)
         positions_with_state = [
@@ -272,36 +319,66 @@ async def _leader_state_payloads(
             for row in leader_states
             for position in positions_by_state.get(row.id, [])
         ]
-        dex_state_payloads = [
-            account_state_payload(
-                row,
-                positions_by_state.get(row.id, []),
+        if compact:
+            dex_state_payloads = [
+                _compact_account_state_summary(
+                    row,
+                    positions_by_state.get(row.id, []),
+                    stale_seconds=monitoring_stale_seconds,
+                    include_closed=include_closed,
+                )
+                for row in leader_states
+            ]
+            base = _compact_account_state_summary(
+                state,
+                [],
                 stale_seconds=monitoring_stale_seconds,
                 include_closed=include_closed,
-                extra=_account_abstraction_fields(leader_abstraction, dex=row.dex),
             )
-            for row in leader_states
-        ]
-        base = account_state_payload(
-            state,
-            [],
-            stale_seconds=monitoring_stale_seconds,
-            include_closed=include_closed,
-            extra={
-                "leader": _leader_config_payload(leader),
-                "watcher_status": "active"
-                if address
-                in watcher_active_by_scope.get(
-                    watcher_execution_scope(leader.hyperliquid_vault_address),
-                    set(),
+            base.update(
+                {
+                    "leader": _leader_config_payload(leader),
+                    "watcher_status": "active"
+                    if address
+                    in watcher_active_by_scope.get(
+                        watcher_execution_scope(leader.hyperliquid_vault_address),
+                        set(),
+                    )
+                    else "not_subscribed",
+                    "dex_states": dex_state_payloads,
+                }
+            )
+        else:
+            dex_state_payloads = [
+                account_state_payload(
+                    row,
+                    positions_by_state.get(row.id, []),
+                    stale_seconds=monitoring_stale_seconds,
+                    include_closed=include_closed,
+                    extra=_account_abstraction_fields(leader_abstraction, dex=row.dex),
                 )
-                else "not_subscribed",
-                "dex_states": dex_state_payloads,
-                "dexStates": dex_state_payloads,
-                **_account_abstraction_fields(leader_abstraction, dex=state.dex if state else ""),
-            },
-        )
-        base["positions"] = [
+                for row in leader_states
+            ]
+            base = account_state_payload(
+                state,
+                [],
+                stale_seconds=monitoring_stale_seconds,
+                include_closed=include_closed,
+                extra={
+                    "leader": _leader_config_payload(leader),
+                    "watcher_status": "active"
+                    if address
+                    in watcher_active_by_scope.get(
+                        watcher_execution_scope(leader.hyperliquid_vault_address),
+                        set(),
+                    )
+                    else "not_subscribed",
+                    "dex_states": dex_state_payloads,
+                    "dexStates": dex_state_payloads,
+                    **_account_abstraction_fields(leader_abstraction, dex=state.dex if state else ""),
+                },
+            )
+        position_payloads = [
             _position_with_baseline_payload(
                 leader=leader,
                 state_row=state_row,
@@ -316,6 +393,11 @@ async def _leader_state_payloads(
             )
             for state_row, row in positions_with_state
         ]
+        base["positions"] = (
+            [_compact_leader_position_payload(item) for item in position_payloads]
+            if compact
+            else position_payloads
+        )
         if include_allocations:
             base["allocations"] = [
                 _allocation_payload(allocation)
@@ -323,6 +405,96 @@ async def _leader_state_payloads(
             ]
         payloads.append(base)
     return payloads
+
+
+_COMPACT_ACCOUNT_STATE_KEYS = (
+    "role",
+    "address",
+    "dex",
+    "dex_display_name",
+    "account_label",
+    "account_value",
+    "withdrawable",
+    "total_ntl_pos",
+    "total_raw_usd",
+    "total_margin_used",
+    "updated_at",
+    "data_age_ms",
+    "source",
+    "stale",
+    "error_message",
+)
+
+_COMPACT_LEADER_POSITION_KEYS = (
+    "dex",
+    "dex_display_name",
+    "coin",
+    "canonical_coin",
+    "product_type",
+    "side",
+    "size",
+    "notional",
+    "entry_px",
+    "mark_px",
+    "mid_px",
+    "mark_price_stale",
+    "open_time",
+    "first_seen_at",
+    "open_time_source",
+    "updated_at",
+    "data_age_ms",
+    "unrealized_pnl",
+    "copyable",
+    "coin_allowed",
+    "venue_route",
+    "copy_reason",
+    "copy_status",
+    "baseline_status",
+    "baseline_id",
+    "last_copy_order_display_status",
+    "last_copy_order_reason",
+)
+
+
+def _compact_account_state_summary(
+    state: LatestAccountState | None,
+    positions: list[LatestAccountPosition],
+    *,
+    stale_seconds: int,
+    include_closed: bool,
+) -> dict[str, Any]:
+    """Return only fields consumed by the multi-leader overview.
+
+    The rich account-abstraction and raw position payloads remain available on
+    the single-leader detail endpoint.  Repeating them for every DEX and again
+    under camelCase aliases made the overview response multi-megabyte and
+    caused UI refreshes to contend with latency-sensitive processes.
+    """
+
+    payload = account_state_payload(
+        state,
+        [],
+        stale_seconds=stale_seconds,
+        include_closed=include_closed,
+    )
+    summary = {key: payload.get(key) for key in _COMPACT_ACCOUNT_STATE_KEYS}
+    position_count = sum(
+        1
+        for position in positions
+        if include_closed or bool(getattr(position, "active", False))
+    )
+    # Preserve the old overview client's only use of nested positions
+    # (``positions.length``) while omitting every heavy position field.
+    summary["positions"] = [{} for _ in range(position_count)]
+    summary["position_count"] = position_count
+    return summary
+
+
+def _compact_leader_position_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: payload.get(key)
+        for key in _COMPACT_LEADER_POSITION_KEYS
+    }
 
 
 def _position_with_baseline_payload(

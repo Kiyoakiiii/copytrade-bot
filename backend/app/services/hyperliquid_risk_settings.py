@@ -25,13 +25,14 @@ from app.services.hyperliquid_execution import (
     FORCED_ISOLATED_LEVERAGE_MARKETS,
     ISOLATED_TARGET_LEVERAGE,
     build_hyperliquid_leverage_plan,
+    isolated_target_leverage,
+    market_leverage_override,
     resolve_asset_id_from_meta,
 )
 from app.services.leader_config import active_leaders_statement, is_coin_allowed, normalize_leader_address
 
 DESIRED_MARGIN_MODE = "CROSS"
 FALLBACK_MARGIN_MODE = "ISOLATED"
-ISOLATED_MAX_LEVERAGE = ISOLATED_TARGET_LEVERAGE
 ISOLATED_MARGIN_REBALANCE_BUFFER_RATIO = Decimal("0.005")
 ISOLATED_MARGIN_REBALANCE_MIN_BUFFER = Decimal("1")
 ISOLATED_MARGIN_REBALANCE_MIN_RELEASE = Decimal("1")
@@ -132,11 +133,14 @@ def desired_leverage_for_margin_mode(
     canonical_coin_value: str | None = None,
 ) -> int:
     desired = int(desired_default_leverage or 10)
+    explicit_override = market_leverage_override(canonical_coin_value)
+    if explicit_override is not None:
+        return min(desired, explicit_override)
     if isolated_leverage_required(
         margin_mode=margin_mode,
         canonical_coin_value=canonical_coin_value,
     ):
-        return min(desired, ISOLATED_MAX_LEVERAGE)
+        return min(desired, isolated_target_leverage(canonical_coin_value))
     return desired
 
 
@@ -212,7 +216,8 @@ async def ensure_hyperliquid_market_risk_settings(
     now = datetime.now(timezone.utc)
     # The caller resolves the current market policy from authoritative exchange
     # metadata.  Do not let an old persisted target (for example, legacy
-    # isolated 2x on a market that now supports cross margin) override it.
+    # isolated policy leverage on a market that now supports cross margin)
+    # override it.
     desired_default = requested_default
     if not row.desired_margin_mode:
         row.desired_margin_mode = DESIRED_MARGIN_MODE
@@ -341,7 +346,6 @@ async def ensure_hyperliquid_market_risk_settings(
         if (
             not _update_response_confirmed(response)
             and _normalize_margin_mode(margin_mode) == FALLBACK_MARGIN_MODE
-            and attempt_effective == ISOLATED_TARGET_LEVERAGE
             and _isolated_margin_top_up_required(response)
             and hasattr(client, "top_up_isolated_only_margin")
         ):
@@ -582,7 +586,7 @@ async def build_market_risk_settings_coverage(
         "desired_margin_mode": DESIRED_MARGIN_MODE,
         "target_default_leverage": desired_default,
         "effective_leverage_rule": (
-            "cross=min(default, market_max_leverage); isolated=2x; xyz:CXMT=2x"
+            "cross=min(default, market_max_leverage); isolated=3x; CASHCAT=1x"
         ),
         "ttl_seconds": ttl_seconds,
         "markets_confirmed_count": len(confirmed),

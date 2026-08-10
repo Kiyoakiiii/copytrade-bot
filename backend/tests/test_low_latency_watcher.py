@@ -1113,6 +1113,45 @@ def test_sub_minimum_same_side_increase_is_a_new_economic_lifecycle(
 
 
 @pytest.mark.parametrize(
+    ("side", "start_position", "size", "expected_side"),
+    [
+        ("A", "0.09", "0.20", PositionSide.SHORT),
+        ("B", "-0.09", "0.20", PositionSide.LONG),
+    ],
+)
+def test_sub_minimum_direct_flip_is_a_new_economic_lifecycle(
+    side: str,
+    start_position: str,
+    size: str,
+    expected_side: PositionSide,
+) -> None:
+    implied = derive_leader_post_position_from_fill(
+        fill_event(
+            coin="DUST",
+            dex="xyz",
+            side=side,
+            start_position=start_position,
+            size=size,
+            price="100",
+            direction="Long > Short" if side == "A" else "Short > Long",
+        )
+    )
+
+    assert implied.is_flip
+    assert implied.side_after == expected_side
+    assert _fill_is_economic_dust_reopen(
+        implied,
+        reference_price=Decimal("100"),
+        min_order_value=Decimal("10"),
+    )
+    assert _ignore_without_allocation_reason(
+        None,
+        implied,
+        allow_economic_dust_reopen=True,
+    ) is None
+
+
+@pytest.mark.parametrize(
     ("side", "start_position", "size", "price"),
     [
         # The add leaves the leader below the venue minimum.
@@ -1121,8 +1160,8 @@ def test_sub_minimum_same_side_increase_is_a_new_economic_lifecycle(
         ("B", "0.10", "1.90", "100"),
         # A reduce from dust is not a new lifecycle.
         ("A", "0.09", "0.01", "100"),
-        # Crossing through zero is a flip, not a same-side dust reopen.
-        ("A", "0.09", "0.20", "100"),
+        # A flip whose post-fill leg is still below the minimum is not actionable.
+        ("A", "0.09", "0.10", "100"),
     ],
 )
 def test_economic_dust_reopen_rejects_non_crossing_or_old_lifecycle_fills(
@@ -1638,6 +1677,31 @@ def test_released_dust_lifecycle_reopen_competes_as_new_open_and_loser_cannot_to
         is None
     )
 
+    direct_flip = derive_leader_post_position_from_fill(
+        fill_event(
+            coin="SCALED",
+            dex="xyz",
+            side="A",
+            start_position="0.09",
+            size="0.20",
+            price="100",
+            direction="Long > Short",
+        )
+    )
+    assert _fill_is_economic_dust_reopen(
+        direct_flip,
+        reference_price=Decimal("100"),
+        min_order_value=Decimal("10"),
+    )
+    assert (
+        _ignore_without_allocation_reason(
+            None,
+            direct_flip,
+            allow_economic_dust_reopen=True,
+        )
+        is None
+    )
+
     # If a different leader's earlier open has already won FCFS, both this
     # reopen candidate and every old-lifecycle reduce remain unable to affect it.
     winner = allocation_record(qty="2", notional="200", status="OPEN")
@@ -1651,6 +1715,14 @@ def test_released_dust_lifecycle_reopen_competes_as_new_open_and_loser_cannot_to
             winner,
             leader=leader(address=prior.leader_address, id=prior.leader_id),
             current_allocation=prior,
+        )
+        or ""
+    )
+    assert "MARKET_OWNER_BLOCKED" in (
+        _market_owner_blocker(
+            winner,
+            leader=leader(address=prior.leader_address, id=prior.leader_id),
+            current_allocation=None,
         )
         or ""
     )
@@ -2204,6 +2276,201 @@ def test_same_batch_close_then_reopen_keeps_lifecycle_boundary() -> None:
 
     assert selected == [close_short, open_long]
     assert skipped == []
+
+
+@pytest.mark.parametrize(
+    ("side", "start_position", "second_start", "flip_direction", "add_direction", "expected_side"),
+    [
+        ("A", "0.09", "-0.05", "Long > Short", "Open Short", PositionSide.SHORT),
+        ("B", "-0.09", "0.05", "Short > Long", "Open Long", PositionSide.LONG),
+    ],
+)
+def test_same_order_dust_flip_is_a_standalone_lifecycle_boundary(
+    side: str,
+    start_position: str,
+    second_start: str,
+    flip_direction: str,
+    add_direction: str,
+    expected_side: PositionSide,
+) -> None:
+    leader_addr = "0x" + "1" * 40
+    base = {
+        "coin": "xyz:DUST",
+        "side": side,
+        "oid": 991,
+        "hash": "0xdust-flip",
+        "px": "100",
+    }
+    flip = build_fill_event(
+        leader_addr,
+        {
+            **base,
+            "time": 1,
+            "tid": 1,
+            "sz": "0.14",
+            "startPosition": start_position,
+            "dir": flip_direction,
+        },
+        is_snapshot=False,
+    )
+    add_after_flip = build_fill_event(
+        leader_addr,
+        {
+            **base,
+            "time": 2,
+            "tid": 2,
+            "sz": "0.15",
+            "startPosition": second_start,
+            "dir": add_direction,
+        },
+        is_snapshot=False,
+    )
+
+    selected, skipped = _coalesce_same_batch_fills([flip, add_after_flip])
+    queued_selected, queued_skipped = _coalesce_queued_lifecycle_fills(selected)
+    flip_implied = derive_leader_post_position_from_fill(selected[0])
+    add_implied = derive_leader_post_position_from_fill(selected[1])
+
+    assert selected == [flip, add_after_flip]
+    assert skipped == []
+    assert queued_selected == selected
+    assert queued_skipped == []
+    assert flip_implied.is_flip
+    assert flip_implied.side_after == expected_side
+    assert flip_implied.size_after == Decimal("0.05")
+    assert not _fill_is_economic_dust_reopen(
+        flip_implied,
+        reference_price=Decimal("100"),
+        min_order_value=Decimal("10"),
+    )
+    assert add_implied.is_increase
+    assert add_implied.side_after == expected_side
+    assert add_implied.size_after == Decimal("0.20")
+    assert _fill_is_economic_dust_reopen(
+        add_implied,
+        reference_price=Decimal("100"),
+        min_order_value=Decimal("10"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("side", "start_position", "expected_side"),
+    [
+        ("B", "0.01", PositionSide.LONG),
+        ("A", "-0.01", PositionSide.SHORT),
+    ],
+)
+def test_same_order_dust_increases_can_coalesce_and_cross_minimum_once(
+    side: str,
+    start_position: str,
+    expected_side: PositionSide,
+) -> None:
+    leader_addr = "0x" + "1" * 40
+    sign = Decimal("1") if side == "B" else Decimal("-1")
+    first_after = Decimal(start_position) + sign * Decimal("0.04")
+    direction = "Open Long" if side == "B" else "Open Short"
+    base = {
+        "coin": "xyz:DUST",
+        "side": side,
+        "time": 1,
+        "oid": 992,
+        "hash": "0xdust-add",
+        "px": "100",
+        "dir": direction,
+    }
+    events = [
+        build_fill_event(
+            leader_addr,
+            {**base, "tid": 1, "sz": "0.04", "startPosition": start_position},
+            is_snapshot=False,
+        ),
+        build_fill_event(
+            leader_addr,
+            {**base, "tid": 2, "sz": "0.15", "startPosition": str(first_after)},
+            is_snapshot=False,
+        ),
+    ]
+
+    selected, skipped = _coalesce_same_batch_fills(events)
+    implied = derive_leader_post_position_from_fill(selected[0])
+
+    assert len(selected) == 1
+    assert skipped == [events[1]]
+    assert _coalesced_source_fill_ids(selected[0]) == [event.source_fill_id for event in events]
+    assert implied.is_increase
+    assert implied.side_after == expected_side
+    assert implied.size_after == Decimal("0.20")
+    assert _fill_is_economic_dust_reopen(
+        implied,
+        reference_price=Decimal("100"),
+        min_order_value=Decimal("10"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("side", "start_position", "close_direction", "open_direction", "expected_side"),
+    [
+        ("A", "0.09", "Close Long", "Open Short", PositionSide.SHORT),
+        ("B", "-0.09", "Close Short", "Open Long", PositionSide.LONG),
+    ],
+)
+def test_same_order_dust_full_close_then_open_preserves_new_lifecycle(
+    side: str,
+    start_position: str,
+    close_direction: str,
+    open_direction: str,
+    expected_side: PositionSide,
+) -> None:
+    leader_addr = "0x" + "1" * 40
+    base = {
+        "coin": "xyz:DUST",
+        "side": side,
+        "oid": 993,
+        "hash": "0xdust-close-open",
+        "px": "100",
+    }
+    close = build_fill_event(
+        leader_addr,
+        {
+            **base,
+            "time": 1,
+            "tid": 1,
+            "sz": "0.09",
+            "startPosition": start_position,
+            "dir": close_direction,
+        },
+        is_snapshot=False,
+    )
+    new_open = build_fill_event(
+        leader_addr,
+        {
+            **base,
+            "time": 2,
+            "tid": 2,
+            "sz": "0.20",
+            "startPosition": "0",
+            "dir": open_direction,
+        },
+        is_snapshot=False,
+    )
+
+    selected, skipped = _coalesce_same_batch_fills([close, new_open])
+    queued_selected, queued_skipped = _coalesce_queued_lifecycle_fills(selected)
+    close_implied = derive_leader_post_position_from_fill(selected[0])
+    open_implied = derive_leader_post_position_from_fill(selected[1])
+
+    assert selected == [close, new_open]
+    assert skipped == []
+    assert queued_selected == selected
+    assert queued_skipped == []
+    assert close_implied.is_close
+    assert "IGNORED_OLD_LIFECYCLE" in (
+        _ignore_without_allocation_reason(None, close_implied) or ""
+    )
+    assert open_implied.is_open
+    assert open_implied.start_position == Decimal("0")
+    assert open_implied.side_after == expected_side
+    assert _ignore_without_allocation_reason(None, open_implied) is None
 
 
 def test_queued_contiguous_partial_reduces_coalesce_to_one_submit_event() -> None:
@@ -2809,6 +3076,16 @@ def test_submit_guard_only_allows_open_action_to_acquire_from_flat() -> None:
             "market_ownership_economic_dust_reopen": True,
         },
     )
+    dust_flip_order = SimpleNamespace(
+        order_action="OPEN",
+        side="SELL",
+        position_side="SHORT",
+        reduce_only=False,
+        pre_trade_checklist={
+            "market_ownership_acquisition_required": True,
+            "market_ownership_economic_dust_reopen": True,
+        },
+    )
     new_open = SimpleNamespace(
         confidence="HIGH",
         is_open=True,
@@ -2827,6 +3104,15 @@ def test_submit_guard_only_allows_open_action_to_acquire_from_flat() -> None:
         is_flip=False,
         start_position=Decimal("200"),
     )
+    direct_dust_flip = SimpleNamespace(
+        confidence="HIGH",
+        is_open=False,
+        is_increase=False,
+        is_reduce=False,
+        is_close=False,
+        is_flip=True,
+        start_position=Decimal("0.09"),
+    )
 
     assert _order_intent_blockers(open_order, new_open, reduce_only=False) == []
     assert any(
@@ -2841,6 +3127,11 @@ def test_submit_guard_only_allows_open_action_to_acquire_from_flat() -> None:
             reduce_only=False,
         )
     )
+    assert _order_intent_blockers(
+        dust_flip_order,
+        direct_dust_flip,
+        reduce_only=False,
+    ) == []
     assert not any(
         "OWNERSHIP_ACQUISITION_GUARD" in blocker
         for blocker in _order_intent_blockers(increase_order, old_lifecycle_add, reduce_only=False)
@@ -10128,7 +10419,7 @@ def test_unresolved_new_market_metadata_remains_retryable() -> None:
     assert info.calls == 2
 
 
-def test_market_leverage_plan_clamps_legacy_isolated_override_to_two_x() -> None:
+def test_market_leverage_plan_clamps_legacy_isolated_override_to_three_x() -> None:
     engine = FillDrivenExecutionEngine(
         settings=settings(),
         info_client=NoopInfoClient(),
@@ -10159,7 +10450,7 @@ def test_market_leverage_plan_clamps_legacy_isolated_override_to_two_x() -> None
     )
 
     engine.market_leverage_plan_cache[("xyz", "XYZ:CL")] = build_hyperliquid_leverage_plan(
-        default_leverage=2,
+        default_leverage=3,
         coin_max_leverage=20,
         sz_decimals=3,
         asset_id=29,
@@ -10176,7 +10467,7 @@ def test_market_leverage_plan_clamps_legacy_isolated_override_to_two_x() -> None
 
     plan = asyncio.run(engine._load_market_leverage_plan(SequenceScalarSession([row]), market, position))
 
-    assert plan.effective_leverage == 2
+    assert plan.effective_leverage == 3
     assert plan.max_leverage == 20
     assert plan.sz_decimals == 3
 
@@ -10192,7 +10483,7 @@ def test_market_policy_uses_cross_market_maximum_without_network_io() -> None:
     )
 
 
-def test_market_policy_uses_two_x_for_isolated_only_market() -> None:
+def test_market_policy_uses_three_x_for_isolated_only_market() -> None:
     assert (
         _market_policy_effective_leverage(
             {
@@ -10204,7 +10495,23 @@ def test_market_policy_uses_two_x_for_isolated_only_market() -> None:
             canonical_coin_value="xyz:AMD",
             configured_default_leverage=50,
         )
-        == 2
+        == 3
+    )
+
+
+def test_market_policy_keeps_cashcat_at_one_x() -> None:
+    assert (
+        _market_policy_effective_leverage(
+            {
+                "maxLeverage": 3,
+                "szDecimals": 0,
+                "marginMode": "noCross",
+                "onlyIsolated": True,
+            },
+            canonical_coin_value="CASHCAT",
+            configured_default_leverage=50,
+        )
+        == 1
     )
 
 
@@ -10225,7 +10532,7 @@ def test_margin_check_uses_confirmed_market_target_not_global_or_market_maximum(
     )
 
 
-def test_margin_check_still_forces_isolated_market_to_two_x() -> None:
+def test_margin_check_still_forces_isolated_market_to_three_x() -> None:
     plan = SimpleNamespace(
         effective_leverage=20,
         max_leverage=20,
@@ -10238,7 +10545,7 @@ def test_margin_check_still_forces_isolated_market_to_two_x() -> None:
             required_margin_mode="ISOLATED",
             canonical_coin_value="xyz:AMD",
         )
-        == 2
+        == 3
     )
 
 
@@ -11200,7 +11507,7 @@ def test_stale_warmed_risk_cache_is_migrated_to_cross_market_maximum() -> None:
     assert order.pre_trade_checklist["follower_risk_setting_source"] == "exchange_update"
 
 
-def test_warm_risk_cache_rejects_legacy_isolated_and_cxmt_above_two_x() -> None:
+def test_warm_risk_cache_rejects_legacy_isolated_and_cxmt_above_three_x() -> None:
     engine = FillDrivenExecutionEngine(
         settings=settings(),
         info_client=NoopInfoClient(),
@@ -12116,7 +12423,7 @@ def test_submit_retry_does_not_reset_after_exchange_submit_started() -> None:
     assert order.status == "SUBMITTING"
 
 
-def test_submit_risk_settings_reconfirms_legacy_isolated_override_at_two_x() -> None:
+def test_submit_risk_settings_reconfirms_legacy_isolated_override_at_three_x() -> None:
     client = TimeoutExecutionClient()
     engine = FillDrivenExecutionEngine(
         settings=settings(),
@@ -12163,9 +12470,9 @@ def test_submit_risk_settings_reconfirms_legacy_isolated_override_at_two_x() -> 
 
     assert result.is_ok
     assert source == "exchange_update"
-    assert result.effective_leverage == 2
+    assert result.effective_leverage == 3
     assert result.actual_margin_mode == "ISOLATED"
-    assert client.leverage_updates == [{"coin": "xyz:CL", "leverage": 2, "is_cross": False}]
+    assert client.leverage_updates == [{"coin": "xyz:CL", "leverage": 3, "is_cross": False}]
 
 
 def test_submit_risk_settings_uses_planned_leverage_process_cache_without_db_read() -> None:

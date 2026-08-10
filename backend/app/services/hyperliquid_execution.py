@@ -41,8 +41,24 @@ WS_ACTION_RESPONSE_TIMEOUT_SECONDS = 5.0
 WS_ACTION_HEARTBEAT_SECONDS = 30.0
 WS_ACTION_REJECTION_COOLDOWN_SECONDS = 30.0
 WS_ACTION_NOT_SENT_COOLDOWN_SECONDS = 2.0
-ISOLATED_TARGET_LEVERAGE = 2
+ISOLATED_TARGET_LEVERAGE = 3
+ISOLATED_LEVERAGE_OVERRIDES = {"CASHCAT": 1}
 FORCED_ISOLATED_LEVERAGE_MARKETS = frozenset({"XYZ:CXMT"})
+
+
+def market_leverage_override(canonical_coin_value: str | None) -> int | None:
+    """Return a per-market leverage override without doing any I/O."""
+
+    parsed = parse_coin(str(canonical_coin_value or ""))
+    symbol = str(parsed.coin or canonical_coin_value or "").upper()
+    override = ISOLATED_LEVERAGE_OVERRIDES.get(symbol)
+    return int(override) if override is not None else None
+
+
+def isolated_target_leverage(canonical_coin_value: str | None) -> int:
+    """Return the isolated-only policy leverage without doing any I/O."""
+
+    return market_leverage_override(canonical_coin_value) or ISOLATED_TARGET_LEVERAGE
 
 
 class WebSocketActionNotSent(RuntimeError):
@@ -942,9 +958,13 @@ class HyperliquidRiskSettingsService:
     ) -> HyperliquidRiskSettingsResult:
         parsed = parse_coin(coin)
         venue_coin = parsed.canonical_coin
-        expected_leverage = (
-            ISOLATED_TARGET_LEVERAGE
-            if venue_coin.upper() in FORCED_ISOLATED_LEVERAGE_MARKETS
+        explicit_override = market_leverage_override(venue_coin)
+        expected_leverage = explicit_override or (
+            isolated_target_leverage(venue_coin)
+            if (
+                self.expected_margin_mode == "ISOLATED"
+                or venue_coin.upper() in FORCED_ISOLATED_LEVERAGE_MARKETS
+            )
             else self.expected_leverage
         )
         try:
