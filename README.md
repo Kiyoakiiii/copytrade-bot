@@ -101,6 +101,35 @@ Default mode is dry-run. Live execution requires all gates:
 
 No Binance API key is ever sent to the frontend. Session cookies are HTTPOnly, CSRF-protected, and API secrets are masked in logs.
 
+## Leader Balance Evaluation
+
+`scripts/leader_balance_evaluator.py` is the repeatable operator-side research
+tool for calibrating a leader's fixed account value. Given one or more public
+Hyperliquid addresses, it reconstructs fill-driven lifecycles, applies the
+10 USDC economic-dust rule, normalizes each lifecycle with Account Total at
+open, and measures account-level portfolio pressure drawdown. It never replaces
+portfolio risk with a worst loss from one coin.
+
+The default policy is a 20,000 USDC follower balance, approximately 7%
+individual portfolio pressure tail, 15% joint limit, and 10,000 USDC upward
+balance rounding. A single-candidate research run is:
+
+```bash
+python scripts/leader_balance_evaluator.py candidate=<PUBLIC_LEADER_ADDRESS>
+```
+
+Supplying several labelled addresses additionally validates net joint drawdown
+and the concurrent sum of each leader's own high-water drawdown. Existing or
+proposed values can be checked with repeated `--balance LABEL=VALUE` arguments.
+The Markdown output includes every material contributor to the maximum
+portfolio pressure interval, its raw PnL change, and Account Total when that
+lifecycle opened, so each recommendation remains auditable. `--output` saves
+the report and `--json-output` saves a machine-readable result.
+
+The evaluator only calls public Hyperliquid Info API endpoints. It does not
+import live backend settings, read private keys or API secrets, or modify
+production leader configuration.
+
 ## Project Structure
 
 ```text
@@ -129,6 +158,8 @@ copytrade-bot/
     dev-backend.sh
     dev-frontend.sh
     dry-run-tests.sh
+    leader_balance_evaluator.py
+    leader_loss_risk_report.py
     backup-postgres.sh
     restore-postgres.sh
   docker-compose.yml

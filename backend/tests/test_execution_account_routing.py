@@ -12,7 +12,7 @@ from app.services.low_latency_watcher import (
 )
 
 
-SUBACCOUNT = "<REDACTED_EVM_ADDRESS>"
+SUBACCOUNT = "0x" + "a" * 40
 
 
 def _market() -> MarketKey:

@@ -196,7 +196,7 @@ def _source_fill(
 ) -> SourceFill:
     return SourceFill(
         source_fill_id=source_id,
-        leader_address="<REDACTED_EVM_ADDRESS>",
+        leader_address="0x" + "1" * 36 + "aBcD",
         coin="TEST",
         canonical_coin="TEST",
         raw_coin="TEST",
@@ -356,7 +356,7 @@ def test_exchange_fills_are_contribution_source_of_truth_even_when_db_status_dis
 
 
 def test_performance_payload_exposes_suffix_and_full_public_address() -> None:
-    full_address = "<REDACTED_EVM_ADDRESS>"
+    full_address = "0x" + "1" * 36 + "aBcD"
     joined = NOW - timedelta(days=30)
     leader = LeaderConfig(
         id=9,

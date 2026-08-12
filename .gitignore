@@ -24,6 +24,11 @@ id_ed25519
 *.bak
 *.log
 backups/
+# Locally generated leader research contains public addresses and trading data.
+docs/leader_balance_evaluation*.md
+docs/leader_balance_evaluation*.json
+docs/leader_loss_risk_report*.md
+docs/leader_loss_risk_lifecycle_details*.csv
 *.pyc
 __pycache__/
 .pytest_cache/

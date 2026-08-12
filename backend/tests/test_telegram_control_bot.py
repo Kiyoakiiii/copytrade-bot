@@ -272,7 +272,7 @@ def test_network_upgrade_alert_is_narrow_and_contains_manual_action_details() ->
         severity="critical",
         event_type=HYPERLIQUID_NETWORK_UPGRADE_POST_ONLY_REJECTION,
         symbol="BABY",
-        leader_address="<REDACTED_EVM_ADDRESS>",
+        leader_address="0x" + "1" * 40,
         message="manual action required",
         metadata_json={
             "order_id": 8827,
@@ -301,7 +301,7 @@ def test_insufficient_collateral_alert_contains_actionable_values_and_masks_addr
         severity="critical",
         event_type=COPY_ORDER_INSUFFICIENT_COLLATERAL,
         symbol="xyz:DELL",
-        leader_address="<REDACTED_EVM_ADDRESS>",
+        leader_address="0x" + "2" * 40,
         message="insufficient available collateral for target delta",
         metadata_json={
             "order_id": 9134,
@@ -324,7 +324,7 @@ def test_insufficient_collateral_alert_contains_actionable_values_and_masks_addr
     assert "8b8e" in text
     assert "845.67" in text
     assert "20.09" in text
-    assert "4a80" in text
+    assert "2222" in text
     assert event.leader_address not in text
     assert "不会自动补单" in text
 
@@ -335,7 +335,7 @@ def test_leader_liquidation_alert_is_actionable_and_masks_address() -> None:
         severity="critical",
         event_type=LEADER_LIQUIDATION_DETECTED,
         symbol="CASHCAT",
-        leader_address="<REDACTED_EVM_ADDRESS>",
+        leader_address="0x" + "1" * 40,
         message="leader liquidation detected",
         metadata_json={
             "execution_account_suffix": "MAIN",
@@ -356,7 +356,7 @@ def test_leader_liquidation_alert_is_actionable_and_masks_address() -> None:
     assert "立即停止这个账户中该币种的自动跟单" in text
     assert "实际仓位归零前" in text
     assert "仓位归零后自动释放" in text
-    assert "9d42" in text
+    assert "1111" in text
     assert event.leader_address not in text
 
 
@@ -366,7 +366,7 @@ def test_execution_alert_dispatch_resumes_recipients_without_resending_completed
         severity="critical",
         event_type=HYPERLIQUID_NETWORK_UPGRADE_POST_ONLY_REJECTION,
         symbol="BABY",
-        leader_address="<REDACTED_EVM_ADDRESS>",
+        leader_address="0x" + "1" * 40,
         message="manual action required",
         metadata_json={
             "order_id": 8827,
