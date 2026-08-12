@@ -101,6 +101,23 @@ Default mode is dry-run. Live execution requires all gates:
 
 No Binance API key is ever sent to the frontend. Session cookies are HTTPOnly, CSRF-protected, and API secrets are masked in logs.
 
+### Repository privacy guard
+
+Real account addresses, public/private keys, transaction identifiers, tokens,
+and operator research data must never be committed. Enable the tracked local
+hooks once after cloning:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The pre-commit and commit-message hooks reject high-confidence sensitive
+literals without printing their values. GitHub CI independently scans every
+reachable blob and commit message, so bypassing a local hook does not bypass
+the repository policy. Use environment variables for runtime account settings,
+generated synthetic identifiers in tests, and ignored local files for leader
+research.
+
 ## Leader Balance Evaluation
 
 `scripts/leader_balance_evaluator.py` is the repeatable operator-side research

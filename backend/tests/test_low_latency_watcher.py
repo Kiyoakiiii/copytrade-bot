@@ -5295,7 +5295,7 @@ def test_runtime_coalesces_ten_close_fragments_from_same_leader_order() -> None:
         "side": "A",
         "time": 1780461427866,
         "oid": 454420427859,
-        "hash": "<REDACTED_32_BYTE_HEX_IDENTIFIER>",
+        "hash": "0x" + "a" * 64,
         "dir": "Close Long",
     }
     fills = [

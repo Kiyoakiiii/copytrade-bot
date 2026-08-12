@@ -1,0 +1,19 @@
+name: Privacy Scan
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  scan-history:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reject committed addresses, keys, and tokens
+        run: python3 scripts/check_git_privacy.py --history

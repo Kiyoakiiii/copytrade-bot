@@ -29,7 +29,7 @@ from app.services.telegram_control_bot import (
 def telegram_settings(**overrides) -> Settings:
     values = {
         "telegram_control_enabled": True,
-        "telegram_control_bot_token": "<REDACTED_TELEGRAM_TOKEN>",
+        "telegram_control_bot_token": "123456:" + "A" * 35,
         "telegram_control_allowed_user_ids": "12345",
     }
     values.update(overrides)

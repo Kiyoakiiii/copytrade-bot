@@ -234,7 +234,7 @@ def test_private_key_embedded_in_error_text_is_fully_redacted() -> None:
 
 
 def test_telegram_bot_token_embedded_in_url_is_fully_redacted() -> None:
-    token = "<REDACTED_TELEGRAM_TOKEN>"
+    token = "123456:" + "A" * 35
 
     redacted = redact_text(f"POST https://api.telegram.org/bot{token}/getUpdates failed")
 

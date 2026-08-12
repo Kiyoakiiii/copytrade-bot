@@ -492,7 +492,7 @@ def test_real_urnm_replay_does_not_become_ignored_baseline_position() -> None:
             "closedPnl": "0.0",
             "oid": 408315844823,
             "tid": 362146563475037,
-            "hash": "<REDACTED_32_BYTE_HEX_IDENTIFIER>",
+            "hash": "0x" + "a" * 64,
         },
         is_snapshot=False,
     )
@@ -538,7 +538,7 @@ def test_waiting_baseline_copies_real_open_from_flat_fill() -> None:
             "closedPnl": "0.0",
             "oid": 408315844823,
             "tid": 362146563475037,
-            "hash": "<REDACTED_32_BYTE_HEX_IDENTIFIER>",
+            "hash": "0x" + "a" * 64,
         },
         is_snapshot=False,
     )

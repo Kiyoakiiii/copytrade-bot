@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+
+exec python3 scripts/check_git_privacy.py --commit-message "$1"
