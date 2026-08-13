@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -374,6 +375,86 @@ def test_missing_position_requires_second_snapshot_before_close() -> None:
     assert row.active is False
     assert row.status == "CLOSED"
     assert row.closed_at == later
+
+
+def test_position_monitoring_marks_are_throttled_but_size_changes_are_immediate() -> None:
+    now = datetime(2026, 8, 13, 12, 0, 1, tzinfo=timezone.utc)
+    row = LatestAccountPosition(
+        role=FOLLOWER,
+        address="0x" + "1" * 40,
+        dex="",
+        coin="HYPE",
+        canonical_coin="HYPE",
+        side="LONG",
+        size=Decimal("2"),
+        entry_px=Decimal("40"),
+        mark_px=Decimal("41"),
+        mark_px_source="POSITION_MARK_PX",
+        leverage=Decimal("10"),
+        active=True,
+        status="OPEN",
+        last_update_at=now,
+    )
+    state = AccountState(
+        role=FOLLOWER,
+        address=row.address,
+        dex="",
+        dex_display_name="Hyperliquid",
+        account_label="Follower",
+        account_value=Decimal("1000"),
+        withdrawable=Decimal("900"),
+        total_ntl_pos=Decimal("84"),
+        total_raw_usd=None,
+        total_margin_used=Decimal("8.4"),
+        positions=[],
+        raw_payload_masked={},
+        source="FOLLOWER_CLEARINGHOUSE_WS",
+        updated_at=now + timedelta(seconds=1),
+        error_message=None,
+    )
+    mark_only = AccountPositionState(
+        dex="",
+        coin="HYPE",
+        canonical_coin="HYPE",
+        raw_coin="HYPE",
+        product_type="PERP",
+        side="LONG",
+        size=Decimal("2"),
+        notional=Decimal("84"),
+        entry_px=Decimal("40"),
+        mark_px=Decimal("42"),
+        mid_px=Decimal("42"),
+        mark_px_source="POSITION_MARK_PX",
+        position_opened_at=None,
+        open_time_source=None,
+        unrealized_pnl=Decimal("4"),
+        leverage=Decimal("10"),
+        margin_used=Decimal("8.4"),
+        liquidation_px=Decimal("20"),
+        raw_payload_masked={},
+    )
+
+    account_state_service._update_position_row(
+        row,
+        state=state,
+        position=mark_only,
+        position_opened_at=None,
+        open_time_source=None,
+    )
+    assert row.mark_px == Decimal("41")
+    assert row.last_update_at == now
+
+    changed_size = replace(mark_only, size=Decimal("3"), notional=Decimal("126"))
+    account_state_service._update_position_row(
+        row,
+        state=state,
+        position=changed_size,
+        position_opened_at=None,
+        open_time_source=None,
+    )
+    assert row.size == Decimal("3")
+    assert row.mark_px == Decimal("42")
+    assert row.last_update_at == state.updated_at
 
 
 def test_save_account_state_closes_duplicate_active_position_rows() -> None:

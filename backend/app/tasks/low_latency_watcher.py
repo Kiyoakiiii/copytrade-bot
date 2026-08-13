@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from typing import Iterable
+
+from sqlalchemy import select
+
 from app.core.config import Settings
 from app.db.session import (
     SessionLocal,
@@ -9,9 +13,68 @@ from app.db.session import (
 from app.services.hyperliquid import HyperliquidInfoClient
 from app.services.hyperliquid_execution import HyperliquidExecutionClient
 from app.services.low_latency_watcher import HyperliquidLowLatencyWatcher
+from app.models import LeaderConfig
+
+
+def _settings_with_explicit_execution_route(
+    settings: Settings,
+    route_addresses: Iterable[str],
+) -> Settings:
+    """Resolve the single explicit worker account from durable leader routes.
+
+    Docker Compose interpolation can lose a shell-only sub-account variable on
+    a later recreate. Leader routing is already persisted by the admin UI, so
+    it is the durable source of truth and avoids leaving the sub-account worker
+    in a restart loop after an otherwise safe deploy.
+    """
+
+    if not settings.low_latency_uses_explicit_leader_route():
+        return settings
+    routes = sorted(
+        {
+            str(address or "").strip().lower()
+            for address in route_addresses
+            if str(address or "").strip()
+        }
+    )
+    if len(routes) != 1:
+        raise RuntimeError(
+            "explicit leader route requires exactly one active execution account"
+        )
+    route = routes[0]
+    configured_route = str(
+        settings.hyperliquid_vault_address
+        or settings.hyperliquid_subaccount_address
+        or ""
+    ).strip().lower()
+    if configured_route and configured_route != route:
+        raise RuntimeError(
+            "configured explicit execution account conflicts with active leader routes"
+        )
+    if configured_route == route:
+        return settings
+    return settings.model_copy(update={"hyperliquid_subaccount_address": route})
+
+
+async def _resolve_explicit_execution_route(settings: Settings) -> Settings:
+    if not settings.low_latency_uses_explicit_leader_route():
+        return settings
+    async with SessionLocal() as db:
+        routes = (
+            await db.execute(
+                select(LeaderConfig.hyperliquid_vault_address)
+                .where(LeaderConfig.enabled.is_(True))
+                .where(LeaderConfig.deleted_at.is_(None))
+                .where(LeaderConfig.hyperliquid_vault_address.is_not(None))
+                .where(LeaderConfig.hyperliquid_vault_address != "")
+                .distinct()
+            )
+        ).scalars().all()
+    return _settings_with_explicit_execution_route(settings, routes)
 
 
 async def run_low_latency_watcher(settings: Settings) -> None:
+    settings = await _resolve_explicit_execution_route(settings)
     info_client = HyperliquidInfoClient(f"{settings.hyperliquid_execution_base_url()}/info")
     if settings.low_latency_uses_explicit_leader_route():
         execution_account = settings.hyperliquid_follower_account_address()

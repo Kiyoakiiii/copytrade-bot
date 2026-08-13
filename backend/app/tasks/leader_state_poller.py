@@ -45,6 +45,23 @@ _last_refresh_error: str | None = None
 MONITORING_STATE_STALE_FLOOR_SECONDS = 30
 
 
+def _background_info_client(settings: Settings, url: str) -> HyperliquidInfoClient:
+    return HyperliquidInfoClient(
+        url,
+        min_request_interval_seconds=max(
+            0.0,
+            float(
+                getattr(
+                    settings,
+                    "hyperliquid_background_info_min_interval_seconds",
+                    0.05,
+                )
+                or 0.0
+            ),
+        ),
+    )
+
+
 def monitoring_account_state_stale_seconds(settings: Settings) -> int:
     """Freshness window for cached UI snapshots, not live order validation.
 
@@ -66,8 +83,11 @@ def monitoring_account_state_stale_seconds(settings: Settings) -> int:
 
 async def run_leader_state_poller(settings: Settings, *, interval_seconds: int | None = None) -> None:
     interval_seconds = interval_seconds or settings.account_state_poll_seconds
-    leader_client = HyperliquidInfoClient(settings.hyperliquid_info_url)
-    follower_client = HyperliquidInfoClient(f"{settings.hyperliquid_execution_base_url()}/info")
+    leader_client = _background_info_client(settings, settings.hyperliquid_info_url)
+    follower_client = _background_info_client(
+        settings,
+        f"{settings.hyperliquid_execution_base_url()}/info",
+    )
     try:
         while True:
             tick_started_at = asyncio.get_running_loop().time()
@@ -101,8 +121,11 @@ async def ensure_recent_account_states(
             return {"refreshed": False, **freshness}
 
         started_at = datetime.now(timezone.utc)
-        leader_client = HyperliquidInfoClient(settings.hyperliquid_info_url)
-        follower_client = HyperliquidInfoClient(f"{settings.hyperliquid_execution_base_url()}/info")
+        leader_client = _background_info_client(settings, settings.hyperliquid_info_url)
+        follower_client = _background_info_client(
+            settings,
+            f"{settings.hyperliquid_execution_base_url()}/info",
+        )
         try:
             await poll_once(leader_client, follower_client=follower_client, settings=settings)
         except Exception as exc:
@@ -172,8 +195,11 @@ async def _run_scheduled_refresh(settings: Settings, *, max_age_seconds: int) ->
         freshness = await _account_state_freshness(settings, max_age_seconds=max_age_seconds)
         if not freshness["stale"]:
             return
-        leader_client = HyperliquidInfoClient(settings.hyperliquid_info_url)
-        follower_client = HyperliquidInfoClient(f"{settings.hyperliquid_execution_base_url()}/info")
+        leader_client = _background_info_client(settings, settings.hyperliquid_info_url)
+        follower_client = _background_info_client(
+            settings,
+            f"{settings.hyperliquid_execution_base_url()}/info",
+        )
         try:
             await poll_once(leader_client, follower_client=follower_client, settings=settings)
             _last_refresh_error = None

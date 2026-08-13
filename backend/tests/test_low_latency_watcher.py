@@ -4695,7 +4695,7 @@ def test_stream_trust_can_make_wall_clock_old_follower_state_actionable() -> Non
 def test_active_position_readiness_uses_same_per_dex_stream_trust_rule() -> None:
     old_state_at = datetime.now(timezone.utc) - timedelta(seconds=5)
     allocation_rows = [("xyz", "XYZ:CXMT", "CXMT", "LONG")]
-    position_rows = [("xyz", "XYZ:CXMT", "CXMT", "LONG", old_state_at)]
+    position_rows = [("xyz", "XYZ:CXMT", "CXMT", "LONG", old_state_at, old_state_at)]
     db = SequenceExecuteSession([allocation_rows, position_rows])
     watcher = HyperliquidLowLatencyWatcher(
         settings=settings(account_state_stale_seconds=2),
@@ -4760,6 +4760,56 @@ def test_active_position_readiness_uses_same_per_dex_stream_trust_rule() -> None
     )
     assert missing["ready"] is False
     assert missing["missing"] == ["xyz:XYZ:CXMT:LONG"]
+
+
+def test_critical_task_failure_stops_watcher_for_process_restart() -> None:
+    async def scenario() -> tuple[bool, BaseException | None]:
+        watcher = HyperliquidLowLatencyWatcher(
+            settings=settings(),
+            info_client=NoopInfoClient(),
+            execution_client=TimeoutExecutionClient(),
+            db_session_factory=FakeSessionFactory(),
+        )
+
+        async def fail() -> None:
+            raise RuntimeError("core loop failed")
+
+        await watcher._run_critical_task("probe", fail())
+        return watcher._stopped.is_set(), watcher._critical_task_failure
+
+    stopped, failure = asyncio.run(scenario())
+
+    assert stopped is True
+    assert isinstance(failure, RuntimeError)
+
+
+def test_idle_fill_worker_retires_without_removing_ingress_lock() -> None:
+    async def scenario() -> tuple[bool, bool, bool]:
+        watcher = HyperliquidLowLatencyWatcher(
+            settings=settings(fill_worker_idle_seconds=1),
+            info_client=NoopInfoClient(),
+            execution_client=TimeoutExecutionClient(),
+            db_session_factory=FakeSessionFactory(),
+        )
+        key = ("leader", "", "HYPE")
+        queue = asyncio.Queue()
+        ingress_lock = asyncio.Lock()
+        watcher._fill_queues[key] = queue
+        watcher._fill_ingress_locks[key] = ingress_lock
+        task = asyncio.create_task(watcher._fill_worker(key, queue))
+        watcher._fill_workers[key] = task
+        await asyncio.wait_for(task, timeout=1.5)
+        return (
+            key not in watcher._fill_workers,
+            key not in watcher._fill_queues,
+            watcher._fill_ingress_locks.get(key) is ingress_lock,
+        )
+
+    worker_removed, queue_removed, ingress_lock_preserved = asyncio.run(scenario())
+
+    assert worker_removed is True
+    assert queue_removed is True
+    assert ingress_lock_preserved is True
 
 
 def test_follower_subscription_uses_one_all_dexs_state_stream() -> None:

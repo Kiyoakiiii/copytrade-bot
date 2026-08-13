@@ -245,7 +245,20 @@ async def refresh_leader_performance(settings: Any) -> dict[str, Any]:
         "portfolio_cache_fallbacks": 0,
     }
 
-    info = HyperliquidInfoClient(settings.hyperliquid_info_url)
+    info = HyperliquidInfoClient(
+        settings.hyperliquid_info_url,
+        min_request_interval_seconds=max(
+            0.0,
+            float(
+                getattr(
+                    settings,
+                    "hyperliquid_background_info_min_interval_seconds",
+                    0.05,
+                )
+                or 0.0
+            ),
+        ),
+    )
     try:
         end_ms = int(now.timestamp() * 1000)
         actual_fills_by_order: dict[int, list[dict[str, Any]]] = {}

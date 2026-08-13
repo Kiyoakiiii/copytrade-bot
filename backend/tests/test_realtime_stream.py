@@ -3,7 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.api.dashboard import _position_with_live_price
-from app.api.stream import dashboard_data_version, sse_event
+from app.api.stream import _events_for_change, dashboard_data_version, sse_event
 from app.core.config import Settings
 from app.services.watcher_status import (
     watcher_active_leaders_by_scope,
@@ -56,6 +56,28 @@ def test_dashboard_data_version_changes_when_component_changes() -> None:
     first = dashboard_data_version({"orders": "1", "accounts": "1"})
     second = dashboard_data_version({"orders": "2", "accounts": "1"})
     assert first != second
+
+
+def test_dashboard_stream_initial_change_sends_only_one_snapshot() -> None:
+    snapshot = {"follower": {"positions": []}, "leaders": [], "recent_orders": []}
+    assert _events_for_change({"accounts", "orders"}, snapshot, initial=True) == [
+        ("dashboard_snapshot", snapshot)
+    ]
+
+
+def test_dashboard_stream_followup_change_sends_only_changed_components() -> None:
+    snapshot = {
+        "follower": {"positions": []},
+        "leaders": [],
+        "recent_orders": [{"id": 1}],
+        "latency": {"latest_event_to_ack_ms": 20},
+    }
+    events = _events_for_change({"orders"}, snapshot)
+    assert [event_type for event_type, _payload in events] == [
+        "orders_update",
+        "latency_update",
+    ]
+    assert all(event_type != "dashboard_snapshot" for event_type, _payload in events)
 
 
 def test_dashboard_watcher_subscriptions_remain_isolated_by_execution_account() -> None:

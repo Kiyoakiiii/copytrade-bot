@@ -314,8 +314,9 @@ def test_low_latency_run_does_not_block_ws_or_allocation_sync_on_warmup() -> Non
 
     assert "await self._warm_latency_caches()" not in source
     assert "self._schedule_background_task(self._warm_latency_caches())" in source
-    assert "asyncio.create_task(self._leader_fill_ws_loop())" in source
-    assert "asyncio.create_task(self._allocation_sync_loop())" in source
+    assert '"leader_fill_ws": self._leader_fill_ws_loop()' in source
+    assert '"allocation_sync": self._allocation_sync_loop()' in source
+    assert "self._run_critical_task(name, coro)" in source
 
 
 def test_allocation_sync_poll_interval_stays_below_stale_allocation_limit() -> None:

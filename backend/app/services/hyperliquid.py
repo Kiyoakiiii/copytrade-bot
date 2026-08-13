@@ -56,7 +56,13 @@ def fill_unique_id(leader_address: str, fill: dict[str, Any]) -> str:
 
 
 class HyperliquidInfoClient:
-    def __init__(self, info_url: str, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        info_url: str,
+        timeout: float = 10.0,
+        *,
+        min_request_interval_seconds: float = 0.0,
+    ) -> None:
         self._client = httpx.AsyncClient(timeout=timeout)
         self._info_url = info_url
         # Position refresh, leader backfill and metadata warmup share this
@@ -65,6 +71,12 @@ class HyperliquidInfoClient:
         self._request_slots = asyncio.Semaphore(2)
         self._rate_limit_guard = asyncio.Lock()
         self._retry_not_before = 0.0
+        self._request_spacing_guard = asyncio.Lock()
+        self._min_request_interval_seconds = max(
+            0.0,
+            float(min_request_interval_seconds),
+        )
+        self._last_request_started_at = 0.0
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -74,6 +86,7 @@ class HyperliquidInfoClient:
             response: httpx.Response | None = None
             for attempt in range(4):
                 await self._wait_for_rate_limit_backoff()
+                await self._wait_for_request_spacing()
                 response = await self._client.post(self._info_url, json=payload)
                 if response.status_code != 429 and response.status_code < 500:
                     response.raise_for_status()
@@ -91,6 +104,20 @@ class HyperliquidInfoClient:
                 if response.status_code != 429:
                     await asyncio.sleep(delay)
         raise RuntimeError("Hyperliquid info request retry loop exited unexpectedly")
+
+    async def _wait_for_request_spacing(self) -> None:
+        if self._min_request_interval_seconds <= 0:
+            return
+        async with self._request_spacing_guard:
+            now = asyncio.get_running_loop().time()
+            delay = (
+                self._last_request_started_at
+                + self._min_request_interval_seconds
+                - now
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._last_request_started_at = asyncio.get_running_loop().time()
 
     async def _wait_for_rate_limit_backoff(self) -> None:
         while True:

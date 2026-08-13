@@ -209,6 +209,7 @@ type DashboardRealtime = {
     ready: boolean;
     checks: Array<{ name: string; status: "OK" | "WARNING" | "BLOCKED"; message: string }>;
   };
+  state_refresh?: Record<string, unknown>;
 };
 
 export default function DashboardPage() {
@@ -216,6 +217,47 @@ export default function DashboardPage() {
   const [error, setError] = useState("");
   const [lastRefreshedAt, setLastRefreshedAt] = useState<string | null>(null);
   const realtime = useDashboardStream({
+    onEvent: (event) => {
+      if (event.event_type === "dashboard_snapshot" || event.event_type === "heartbeat") return;
+      setData((current) => {
+        if (!current) return current;
+        const payload = event.payload as any;
+        const next = { ...current, last_updated_at: event.server_time };
+        switch (event.event_type) {
+          case "follower_state_update":
+            return { ...next, follower: payload };
+          case "leader_state_update":
+            return { ...next, leaders: Array.isArray(payload) ? payload : [] };
+          case "orders_update":
+            return { ...next, recent_orders: Array.isArray(payload) ? payload : [] };
+          case "latency_update":
+            return { ...next, latency: payload ?? {} };
+          case "watcher_status_update":
+            return {
+              ...next,
+              runtime: payload ?? current.runtime,
+              state_refresh: payload?.state_refresh ?? current.state_refresh,
+            };
+          case "task_health_update":
+            return { ...next, state_refresh: payload ?? {} };
+          case "preflight_update":
+            return {
+              ...next,
+              small_live_start_checklist:
+                payload?.small_live_start_checklist ?? current.small_live_start_checklist,
+              preflight_blockers: payload?.preflight_blockers ?? current.preflight_blockers,
+            };
+          case "baseline_status_update":
+            return { ...next, baseline: payload ?? current.baseline };
+          case "allocation_status_update":
+            return { ...next, active_allocations: Array.isArray(payload) ? payload : [] };
+          default:
+            return next;
+        }
+      });
+      setLastRefreshedAt(new Date().toISOString());
+      setError("");
+    },
     onSnapshot: (payload) => {
       setData(payload as DashboardRealtime);
       setLastRefreshedAt(new Date().toISOString());

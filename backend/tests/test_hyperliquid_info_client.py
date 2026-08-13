@@ -74,3 +74,26 @@ def test_info_client_429_sets_one_shared_retry_deadline(monkeypatch) -> None:
     assert result == {"ok": True}
     assert calls == 2
     assert retry_deadline > 0
+
+
+def test_info_client_optional_request_spacing_serializes_background_burst() -> None:
+    async def scenario() -> tuple[int, float]:
+        client = HyperliquidInfoClient(
+            "https://example.test/info",
+            min_request_interval_seconds=0.02,
+        )
+        await client._client.aclose()
+        probe = ConcurrentProbeClient()
+        client._client = probe
+        started = asyncio.get_running_loop().time()
+        await asyncio.gather(
+            *(client.post_info({"type": "meta", "index": index}) for index in range(3))
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+        await client.close()
+        return probe.max_active, elapsed
+
+    max_active, elapsed = asyncio.run(scenario())
+
+    assert max_active == 1
+    assert elapsed >= 0.045

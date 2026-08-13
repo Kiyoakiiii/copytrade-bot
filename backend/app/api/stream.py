@@ -8,20 +8,11 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import text
 
 from app.api.dashboard import build_dashboard_realtime_payload
 from app.api.deps import AppSettings, current_user
 from app.db.session import SessionLocal
-from app.models import (
-    AppSetting,
-    ExecutionOrder,
-    LatestAccountPosition,
-    LatestAccountState,
-    LeaderConfig,
-    LeaderPositionAllocationRecord,
-    LeaderPositionBaseline,
-)
 from app.tasks.leader_state_poller import (
     account_state_cache_status,
     monitoring_account_state_stale_seconds,
@@ -30,7 +21,26 @@ from app.tasks.leader_state_poller import (
 router = APIRouter(tags=["stream"])
 
 HEARTBEAT_SECONDS = 5.0
-VERSION_POLL_SECONDS = 1.0
+VERSION_POLL_SECONDS = 2.0
+SNAPSHOT_CACHE_SECONDS = 5.0
+
+# Dashboard change detection used to calculate MAX(updated_at) on several
+# heavily-updated tables once per second, per browser.  PostgreSQL had to scan
+# roughly a gigabyte of heap pages for every pass.  The cumulative per-table
+# mutation counters are constant-size, require no application schema change,
+# and are sufficient for invalidating a monitoring snapshot.
+_DASHBOARD_COMPONENT_TABLES: dict[str, tuple[str, ...]] = {
+    "accounts": ("latest_account_states", "latest_account_positions"),
+    "orders": ("execution_orders",),
+    "leaders": ("leader_configs",),
+    "allocations": ("leader_position_allocations",),
+    "baseline": ("leader_position_baselines",),
+    "app_settings": ("app_settings",),
+}
+_snapshot_lock = asyncio.Lock()
+_snapshot_cache_version = ""
+_snapshot_cache_payload: dict[str, Any] | None = None
+_snapshot_cache_at = 0.0
 
 
 @router.get("/stream/dashboard")
@@ -69,17 +79,10 @@ async def _dashboard_event_generator(request: Request, settings: AppSettings):
         version = dashboard_data_version(components)
         now_monotonic = asyncio.get_running_loop().time()
         if version != last_version or (last_seen and last_seen != version):
-            async with SessionLocal() as db:
-                snapshot = await build_dashboard_realtime_payload(
-                    db=db,
-                    settings=settings,
-                    state_refresh=await account_state_cache_status(
-                        settings,
-                        max_age_seconds=monitoring_account_state_stale_seconds(settings),
-                    ),
-                )
+            initial = not last_components
+            snapshot = await _dashboard_snapshot(settings, version)
             changed = _changed_components(last_components, components)
-            for event_type, payload in _events_for_change(changed, snapshot):
+            for event_type, payload in _events_for_change(changed, snapshot, initial=initial):
                 yield sse_event(event_type=event_type, payload=payload, data_version=version)
             last_components = components
             last_version = version
@@ -98,35 +101,70 @@ async def _dashboard_event_generator(request: Request, settings: AppSettings):
 
 
 async def dashboard_component_versions() -> dict[str, str | None]:
+    relation_names = {
+        relation
+        for relations in _DASHBOARD_COMPONENT_TABLES.values()
+        for relation in relations
+    }
     async with SessionLocal() as db:
-        values = {
-            "accounts": await _max_updated_at(db, LatestAccountState.updated_at, LatestAccountPosition.updated_at),
-            "orders": await _max_updated_at(db, ExecutionOrder.updated_at, ExecutionOrder.created_at),
-            "leaders": await _max_updated_at(db, LeaderConfig.updated_at, LeaderConfig.created_at),
-            "allocations": await _max_updated_at(
-                db,
-                LeaderPositionAllocationRecord.updated_at,
-                LeaderPositionAllocationRecord.created_at,
-            ),
-            "baseline": await _max_updated_at(
-                db,
-                LeaderPositionBaseline.updated_at,
-                LeaderPositionBaseline.created_at,
-            ),
-            "app_settings": await _max_updated_at(db, AppSetting.updated_at),
-        }
-    return {key: _iso_or_none(value) for key, value in values.items()}
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT relname, n_tup_ins, n_tup_upd, n_tup_del, n_live_tup
+                    FROM pg_stat_user_tables
+                    WHERE schemaname = current_schema()
+                      AND relname = ANY(:relation_names)
+                    """
+                ),
+                {"relation_names": sorted(relation_names)},
+            )
+        ).mappings().all()
+    stats = {
+        str(row["relname"]): ":".join(
+            str(int(row[name] or 0))
+            for name in ("n_tup_ins", "n_tup_upd", "n_tup_del", "n_live_tup")
+        )
+        for row in rows
+    }
+    return {
+        component: "|".join(f"{relation}={stats.get(relation, 'missing')}" for relation in relations)
+        for component, relations in _DASHBOARD_COMPONENT_TABLES.items()
+    }
 
 
-async def _max_updated_at(db: Any, *columns: Any) -> datetime | None:
-    values: list[datetime] = []
-    for column in columns:
-        value = await db.scalar(select(func.max(column)))
-        if value is not None:
-            values.append(value)
-    if not values:
-        return None
-    return max(value if value.tzinfo else value.replace(tzinfo=timezone.utc) for value in values)
+async def _dashboard_snapshot(settings: AppSettings, version: str) -> dict[str, Any]:
+    """Build one snapshot per observed version and share it across SSE clients."""
+
+    global _snapshot_cache_at, _snapshot_cache_payload, _snapshot_cache_version
+    now = asyncio.get_running_loop().time()
+    if (
+        _snapshot_cache_payload is not None
+        and _snapshot_cache_version == version
+        and now - _snapshot_cache_at <= SNAPSHOT_CACHE_SECONDS
+    ):
+        return _snapshot_cache_payload
+    async with _snapshot_lock:
+        now = asyncio.get_running_loop().time()
+        if (
+            _snapshot_cache_payload is not None
+            and _snapshot_cache_version == version
+            and now - _snapshot_cache_at <= SNAPSHOT_CACHE_SECONDS
+        ):
+            return _snapshot_cache_payload
+        async with SessionLocal() as db:
+            payload = await build_dashboard_realtime_payload(
+                db=db,
+                settings=settings,
+                state_refresh=await account_state_cache_status(
+                    settings,
+                    max_age_seconds=monitoring_account_state_stale_seconds(settings),
+                ),
+            )
+        _snapshot_cache_payload = payload
+        _snapshot_cache_version = version
+        _snapshot_cache_at = asyncio.get_running_loop().time()
+        return payload
 
 
 def dashboard_data_version(components: dict[str, str | None]) -> str:
@@ -179,24 +217,22 @@ def _changed_components(previous: dict[str, str | None], current: dict[str, str 
     return {key for key, value in current.items() if previous.get(key) != value}
 
 
-def _events_for_change(changed: set[str], snapshot: dict[str, Any]) -> list[tuple[str, Any]]:
-    events: list[tuple[str, Any]] = [("dashboard_snapshot", snapshot)]
+def _events_for_change(
+    changed: set[str],
+    snapshot: dict[str, Any],
+    *,
+    initial: bool = False,
+) -> list[tuple[str, Any]]:
+    if initial:
+        return [("dashboard_snapshot", snapshot)]
+    events: list[tuple[str, Any]] = []
     if changed.intersection({"accounts", "leaders"}):
         events.append(("follower_state_update", snapshot.get("follower")))
         events.append(("leader_state_update", snapshot.get("leaders")))
         events.append(
             (
                 "positions_update",
-                {
-                    "follower": (snapshot.get("follower") or {}).get("positions") or [],
-                    "leaders": [
-                        {
-                            "leader": (leader.get("leader") or {}),
-                            "positions": leader.get("positions") or [],
-                        }
-                        for leader in snapshot.get("leaders") or []
-                    ],
-                },
+                {"changed": True},
             )
         )
     if "orders" in changed:
@@ -205,7 +241,15 @@ def _events_for_change(changed: set[str], snapshot: dict[str, Any]) -> list[tupl
     if "app_settings" in changed:
         events.append(("watcher_status_update", (snapshot.get("runtime") or {}) | {"state_refresh": snapshot.get("state_refresh")}))
         events.append(("task_health_update", snapshot.get("state_refresh") or {}))
-        events.append(("preflight_update", snapshot.get("small_live_start_checklist") or {}))
+        events.append(
+            (
+                "preflight_update",
+                {
+                    "small_live_start_checklist": snapshot.get("small_live_start_checklist") or {},
+                    "preflight_blockers": snapshot.get("preflight_blockers") or [],
+                },
+            )
+        )
     if "baseline" in changed:
         events.append(("baseline_status_update", snapshot.get("baseline") or {}))
     if "allocations" in changed:
@@ -224,11 +268,3 @@ def _stale_flags(payload: Any) -> dict[str, bool]:
     if isinstance(leaders, list):
         result["leaders"] = any(isinstance(item, dict) and bool(item.get("stale")) for item in leaders)
     return result
-
-
-def _iso_or_none(value: datetime | None) -> str | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.isoformat()

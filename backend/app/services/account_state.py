@@ -8,6 +8,12 @@ from typing import Any
 from sqlalchemy import select
 
 from app.models import LatestAccountPosition, LatestAccountState, RiskEvent
+
+MONITORING_PAYLOAD_UPDATE_SECONDS = 5.0
+_LOCAL_POSITION_PROJECTION_SOURCES = {
+    "LOCAL_FILL_PROJECTION",
+    "ORDER_RECOVERY_PROJECTION",
+}
 from app.services.hyperliquid_dex import canonical_coin, dex_display_name, parse_coin
 
 FOLLOWER = "FOLLOWER"
@@ -187,15 +193,24 @@ async def save_account_state(db: Any, state: AccountState) -> LatestAccountState
         )
         return row
 
+    monitoring_payload_due = _monitoring_payload_update_due(
+        stored_at,
+        incoming_at,
+    )
     row.dex = state.dex
-    row.dex_display_name = state.dex_display_name
-    row.account_label = state.account_label
-    row.account_value = state.account_value
-    row.withdrawable = state.withdrawable
-    row.total_ntl_pos = state.total_ntl_pos
-    row.total_raw_usd = state.total_raw_usd
-    row.total_margin_used = state.total_margin_used
-    row.raw_payload_masked = state.raw_payload_masked
+    if monitoring_payload_due or row.account_label is None:
+        # Mark prices and account summaries can change on every websocket
+        # heartbeat but are not used to authorize a fill.  Persist a bounded
+        # monitoring cadence while keeping the authoritative state freshness
+        # timestamp immediate for execution checks.
+        row.dex_display_name = state.dex_display_name
+        row.account_label = state.account_label
+        row.account_value = state.account_value
+        row.withdrawable = state.withdrawable
+        row.total_ntl_pos = state.total_ntl_pos
+        row.total_raw_usd = state.total_raw_usd
+        row.total_margin_used = state.total_margin_used
+        row.raw_payload_masked = state.raw_payload_masked
     row.source = _account_state_source(state.source)
     row.last_update_at = state.updated_at
     row.error_message = state.error_message
@@ -206,7 +221,9 @@ async def save_account_state(db: Any, state: AccountState) -> LatestAccountState
 
     existing_rows = (
         await db.execute(
-            select(LatestAccountPosition).where(LatestAccountPosition.account_state_id == row.id)
+            select(LatestAccountPosition)
+            .where(LatestAccountPosition.account_state_id == row.id)
+            .where(LatestAccountPosition.active.is_(True))
         )
     ).scalars().all()
     active_by_coin: dict[str, LatestAccountPosition] = {}
@@ -598,6 +615,13 @@ def _update_position_row(
     position_opened_at: datetime | None,
     open_time_source: str | None,
 ) -> None:
+    if not _position_payload_update_due(
+        row,
+        state=state,
+        position=position,
+        position_opened_at=position_opened_at,
+    ):
+        return
     row.role = state.role
     row.address = state.address
     row.dex = position.dex
@@ -627,6 +651,54 @@ def _update_position_row(
     row.first_seen_at = row.first_seen_at or position_opened_at or state.updated_at
     row.raw_payload_masked = position.raw_payload_masked
     row.last_update_at = state.updated_at
+
+
+def _monitoring_payload_update_due(
+    stored_at: datetime | None,
+    incoming_at: datetime | None,
+) -> bool:
+    if stored_at is None or incoming_at is None:
+        return True
+    bucket_seconds = max(1, int(MONITORING_PAYLOAD_UPDATE_SECONDS))
+    return int(stored_at.timestamp()) // bucket_seconds != int(incoming_at.timestamp()) // bucket_seconds
+
+
+def _position_payload_update_due(
+    row: LatestAccountPosition,
+    *,
+    state: AccountState,
+    position: AccountPositionState,
+    position_opened_at: datetime | None,
+) -> bool:
+    """Persist execution-relevant changes immediately; rate-limit marks/PnL."""
+
+    structural_values = (
+        (getattr(row, "role", None), state.role),
+        (getattr(row, "address", None), state.address),
+        (getattr(row, "dex", None), position.dex),
+        (getattr(row, "canonical_coin", None), position.canonical_coin),
+        (getattr(row, "side", None), position.side),
+        (getattr(row, "size", None), position.size),
+        (getattr(row, "entry_px", None), position.entry_px),
+        (getattr(row, "leverage", None), position.leverage),
+        (getattr(row, "active", None), True),
+        (str(getattr(row, "status", "") or "").upper(), "OPEN"),
+    )
+    if any(current != incoming for current, incoming in structural_values):
+        return True
+    if (
+        position_opened_at is not None
+        and _datetime_from_any(getattr(row, "position_opened_at", None)) != position_opened_at
+    ):
+        return True
+    stored_source = str(getattr(row, "mark_px_source", "") or "").upper()
+    incoming_source = str(position.mark_px_source or "").upper()
+    if stored_source in _LOCAL_POSITION_PROJECTION_SOURCES and incoming_source != stored_source:
+        return True
+    return _monitoring_payload_update_due(
+        _datetime_from_any(getattr(row, "last_update_at", None)),
+        _datetime_from_any(state.updated_at),
+    )
 
 
 def _close_position_row(row: LatestAccountPosition, *, now: datetime) -> None:

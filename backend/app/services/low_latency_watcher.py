@@ -6,7 +6,7 @@ import json
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -7371,6 +7371,8 @@ class HyperliquidLowLatencyWatcher:
         ] = {}
         self._fill_workers: dict[tuple[str, str, str], asyncio.Task] = {}
         self._queued_source_fill_ids: set[str] = set()
+        self._fill_queue_high_watermark = 0
+        self._fill_queue_alert_watermark = 0
         self._submit_queue_guard = asyncio.Lock()
         self._submit_queues: dict[str, asyncio.Queue[tuple[int, FillEvent]]] = {}
         self._submit_workers: dict[str, asyncio.Task] = {}
@@ -7401,6 +7403,13 @@ class HyperliquidLowLatencyWatcher:
             tuple[str, str]
         ] = set()
         self._liveness_stuck_signature: str | None = None
+        self._critical_task_failure: BaseException | None = None
+        self._processed_without_outcome_count = 0
+        self._processed_without_outcome_checked_at: datetime | None = None
+        self._unresolved_outcome_count = 0
+        self._unresolved_outcome_checked_at: datetime | None = None
+        self._task_status_stored_at: datetime | None = None
+        self._task_status_last_error: str | None = None
         self._writer_lease_connection: Any | None = None
         self._writer_lease_key = _writer_lease_key(
             self.settings.hyperliquid_follower_account_address() or "default"
@@ -7439,20 +7448,27 @@ class HyperliquidLowLatencyWatcher:
         await self._replay_unprocessed_fills_once()
         await self._resume_unstarted_orders_once()
         self._schedule_background_task(self._warm_latency_caches())
+        critical_tasks = {
+            "leader_fill_ws": self._leader_fill_ws_loop(),
+            "leader_liquidation_ws": self._leader_liquidation_ws_loop(),
+            "follower_ws": self._ws_loop(),
+            "leader_refresh": self._leader_refresh_loop(),
+            "price_poll": self._price_poll_loop(),
+            "follower_position_refresh": self._active_follower_position_refresh_loop(),
+            "account_abstraction_refresh": self._account_abstraction_refresh_loop(),
+            "allocation_sync": self._allocation_sync_loop(),
+            "durable_replay": self._durable_replay_loop(),
+            "leader_fill_backfill": self._leader_fill_backfill_retry_loop(),
+            "writer_lease_watch": self._writer_lease_watch_loop(),
+            "event_loop_lag_watch": self._event_loop_lag_watch_loop(),
+            "status": self._status_loop(),
+        }
         tasks = [
-            asyncio.create_task(self._leader_fill_ws_loop()),
-            asyncio.create_task(self._leader_liquidation_ws_loop()),
-            asyncio.create_task(self._ws_loop()),
-            asyncio.create_task(self._leader_refresh_loop()),
-            asyncio.create_task(self._price_poll_loop()),
-            asyncio.create_task(self._active_follower_position_refresh_loop()),
-            asyncio.create_task(self._account_abstraction_refresh_loop()),
-            asyncio.create_task(self._allocation_sync_loop()),
-            asyncio.create_task(self._durable_replay_loop()),
-            asyncio.create_task(self._leader_fill_backfill_retry_loop()),
-            asyncio.create_task(self._writer_lease_watch_loop()),
-            asyncio.create_task(self._event_loop_lag_watch_loop()),
-            asyncio.create_task(self._status_loop()),
+            asyncio.create_task(
+                self._run_critical_task(name, coro),
+                name=f"copytrade:{name}",
+            )
+            for name, coro in critical_tasks.items()
         ]
         try:
             await self._stopped.wait()
@@ -7464,6 +7480,36 @@ class HyperliquidLowLatencyWatcher:
             await self._cancel_fill_workers()
             await self._cancel_submit_workers()
             await self._release_writer_lease()
+        if self._critical_task_failure is not None:
+            failure = self._critical_task_failure
+            self._critical_task_failure = None
+            raise RuntimeError("critical low-latency watcher task stopped") from failure
+
+    async def _run_critical_task(self, name: str, coro: Any) -> None:
+        """Turn a silently-dead core loop into a supervised process restart."""
+
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._stopped.is_set():
+                return
+            self._critical_task_failure = self._critical_task_failure or exc
+            self.state.last_error = f"CRITICAL_TASK_FAILED:{name}:{redact_text(exc)[:160]}"
+            log.exception(
+                "low_latency_critical_task_failed",
+                task=name,
+                error=redact_text(exc),
+            )
+            self._stopped.set()
+        else:
+            if not self._stopped.is_set():
+                exc = RuntimeError(f"critical task returned unexpectedly: {name}")
+                self._critical_task_failure = self._critical_task_failure or exc
+                self.state.last_error = f"CRITICAL_TASK_STOPPED:{name}"
+                log.error("low_latency_critical_task_stopped", task=name)
+                self._stopped.set()
 
     async def _enable_discovered_perp_dexes(self) -> list[str]:
         configured = self.settings.enabled_hyperliquid_dex_list()
@@ -10734,6 +10780,19 @@ class HyperliquidLowLatencyWatcher:
                                 bool(ensure_persist_in_worker and fill_engine),
                             )
                         )
+                        queue_depth = queue.qsize()
+                        if queue_depth > self._fill_queue_high_watermark:
+                            self._fill_queue_high_watermark = queue_depth
+                        if (
+                            queue_depth >= 100
+                            and queue_depth >= max(100, self._fill_queue_alert_watermark * 2)
+                        ):
+                            self._fill_queue_alert_watermark = queue_depth
+                            log.warning(
+                                "low_latency_fill_queue_high_watermark",
+                                queue_key=":".join(key),
+                                queue_depth=queue_depth,
+                            )
                         queued_any = True
                     worker = self._fill_workers.get(key)
                     if worker is None or worker.done():
@@ -10766,7 +10825,25 @@ class HyperliquidLowLatencyWatcher:
         queue: asyncio.Queue[tuple[FillEvent, LeaderConfig, bool]],
     ) -> None:
         while not self._stopped.is_set():
-            first_event, first_leader, first_needs_persist = await queue.get()
+            try:
+                first_event, first_leader, first_needs_persist = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=max(
+                        1.0,
+                        float(
+                            getattr(self.settings, "fill_worker_idle_seconds", 60.0)
+                            or 60.0
+                        ),
+                    ),
+                )
+            except asyncio.TimeoutError:
+                async with self._fill_queue_guard:
+                    current = asyncio.current_task()
+                    if queue.empty() and self._fill_workers.get(key) is current:
+                        self._fill_workers.pop(key, None)
+                        self._fill_queues.pop(key, None)
+                        return
+                continue
             first_event = replace(
                 first_event,
                 fill_worker_started_at=datetime.now(timezone.utc),
@@ -11344,6 +11421,8 @@ class HyperliquidLowLatencyWatcher:
             worker.cancel()
         if workers:
             await asyncio.gather(*workers, return_exceptions=True)
+        self._fill_workers.clear()
+        self._fill_queues.clear()
 
     async def _cancel_submit_workers(self) -> None:
         workers = list(self._submit_workers.values())
@@ -11786,26 +11865,50 @@ class HyperliquidLowLatencyWatcher:
                     ExecutionOrder.status.in_(["PENDING_SUBMIT", "SUBMITTING", "UNKNOWN"])
                 )
             )
-            processed_without_outcome_count = int(
-                await db.scalar(
-                    select(func.count(SourceFill.id))
-                    .where(SourceFill.execution_account == self.execution_scope)
-                    .where(SourceFill.processed_at.is_not(None))
-                    .where(SourceFill.is_snapshot.is_(False))
-                    .where(
-                        ~select(SourceFillOutcome.id)
-                        .where(SourceFillOutcome.source_fill_id == SourceFill.source_fill_id)
-                        .exists()
+            # These are full-history integrity audits, not work-queue liveness
+            # checks.  Running both every status tick made their cost grow
+            # linearly with the immutable fill history.  Pending inbox/outbox
+            # queries above remain high-frequency and index-backed; the audits
+            # are cached and refreshed on an independent cadence.
+            processed_audit_interval = (
+                5.0 if self._processed_without_outcome_count else 30.0
+            )
+            if (
+                self._processed_without_outcome_checked_at is None
+                or (now - self._processed_without_outcome_checked_at).total_seconds()
+                >= processed_audit_interval
+            ):
+                self._processed_without_outcome_count = int(
+                    await db.scalar(
+                        select(func.count(SourceFill.id))
+                        .where(SourceFill.execution_account == self.execution_scope)
+                        .where(SourceFill.processed_at.is_not(None))
+                        .where(SourceFill.is_snapshot.is_(False))
+                        .where(
+                            ~select(SourceFillOutcome.id)
+                            .where(SourceFillOutcome.source_fill_id == SourceFill.source_fill_id)
+                            .exists()
+                        )
                     )
+                    or 0
                 )
-                or 0
-            )
-            unresolved_outcome_count = int(
-                await db.scalar(
-                    _unresolved_source_fill_outcomes_query(self.execution_scope)
+                self._processed_without_outcome_checked_at = now
+            processed_without_outcome_count = self._processed_without_outcome_count
+
+            unresolved_audit_interval = 60.0 if self._unresolved_outcome_count else 300.0
+            if (
+                self._unresolved_outcome_checked_at is None
+                or (now - self._unresolved_outcome_checked_at).total_seconds()
+                >= unresolved_audit_interval
+            ):
+                self._unresolved_outcome_count = int(
+                    await db.scalar(
+                        _unresolved_source_fill_outcomes_query(self.execution_scope)
+                    )
+                    or 0
                 )
-                or 0
-            )
+                self._unresolved_outcome_checked_at = now
+            unresolved_outcome_count = self._unresolved_outcome_count
             stuck_threshold_ms = int(
                 max(
                     1.0,
@@ -11992,7 +12095,18 @@ class HyperliquidLowLatencyWatcher:
                 "writer_lease_acquired": self._writer_lease_connection is not None,
                 "submit_database_pool_isolated": self._submit_database_pool_isolated,
                 "in_memory_fill_queue_count": len(self._queued_source_fill_ids),
+                "in_memory_fill_queue_high_watermark": self._fill_queue_high_watermark,
                 "in_memory_submit_queue_count": len(self._queued_submit_order_ids),
+                "processed_without_outcome_checked_at": (
+                    self._processed_without_outcome_checked_at.isoformat()
+                    if self._processed_without_outcome_checked_at
+                    else None
+                ),
+                "unresolved_fill_outcome_checked_at": (
+                    self._unresolved_outcome_checked_at.isoformat()
+                    if self._unresolved_outcome_checked_at
+                    else None
+                ),
                 "recent_submit_latency": recent_submit_latency,
                 "last_error": redact_text(self.state.last_error) if self.state.last_error else None,
                 "updated_at": now.isoformat(),
@@ -12010,49 +12124,57 @@ class HyperliquidLowLatencyWatcher:
                 )
             )
             await db.execute(stmt)
-            await store_task_status(
-                db,
-                task_name="low_latency_watcher"
-                if not self.execution_scope
-                else f"low_latency_watcher:{self.execution_scope}",
-                last_error=redact_text(self.state.last_error) if self.state.last_error else None,
-                metadata={
-                    "websocket_connected": self.state.websocket_connected,
-                    "ready_for_low_latency_live": ready,
-                    "active_leaders": active,
-                    "durable_inbox_pending_count": pending_fill_count,
-                    "durable_inbox_retrying_count": retrying_fill_count,
-                    "durable_inbox_oldest_age_ms": oldest_pending_fill_age_ms,
-                    "durable_inbox_stuck": durable_inbox_stuck,
-                    "durable_outbox_pending_submit_count": pending_submit_count,
-                    "durable_outbox_submitting_count": submitting_count,
-                    "durable_outbox_unknown_count": unknown_submit_count,
-                    "durable_outbox_oldest_age_ms": oldest_unresolved_order_age_ms,
-                    "durable_outbox_stuck": durable_outbox_stuck,
-                    "durable_pipeline_liveness_ready": liveness_ready,
-                    "processed_without_outcome_count": processed_without_outcome_count,
-                    "unresolved_fill_outcome_count": unresolved_outcome_count,
-                    "writer_lease_acquired": self._writer_lease_connection is not None,
-                    "event_loop_lag_ms": self.state.event_loop_lag_ms,
-                    "max_event_loop_lag_ms": self.state.max_event_loop_lag_ms,
-                    "durable_replay_scan_count": self.state.durable_replay_scan_count,
-                    "durable_order_resume_scan_count": self.state.durable_order_resume_scan_count,
-                    "durable_replay_idle_wait_count": self.state.durable_replay_idle_wait_count,
-                    "background_cycles_deferred_for_hot_path": self.state.background_cycles_deferred_for_hot_path,
-                    "recent_submit_latency": recent_submit_latency,
-                },
+            current_error = (
+                redact_text(self.state.last_error) if self.state.last_error else None
             )
-            await store_task_status(
-                db,
-                task_name="price_cache_updater",
-                last_error=(
-                    redact_text(self.state.last_error)
-                    if not price_fresh and self.state.last_error
-                    else None
-                ),
-                metadata={"dex_price_cache_status": price_status},
+            task_status_due = (
+                self._task_status_stored_at is None
+                or (now - self._task_status_stored_at).total_seconds() >= 30.0
+                or current_error != self._task_status_last_error
             )
+            if task_status_due:
+                await store_task_status(
+                    db,
+                    task_name="low_latency_watcher"
+                    if not self.execution_scope
+                    else f"low_latency_watcher:{self.execution_scope}",
+                    last_error=current_error,
+                    metadata={
+                        "websocket_connected": self.state.websocket_connected,
+                        "ready_for_low_latency_live": ready,
+                        "active_leaders": active,
+                        "durable_inbox_pending_count": pending_fill_count,
+                        "durable_inbox_retrying_count": retrying_fill_count,
+                        "durable_inbox_oldest_age_ms": oldest_pending_fill_age_ms,
+                        "durable_inbox_stuck": durable_inbox_stuck,
+                        "durable_outbox_pending_submit_count": pending_submit_count,
+                        "durable_outbox_submitting_count": submitting_count,
+                        "durable_outbox_unknown_count": unknown_submit_count,
+                        "durable_outbox_oldest_age_ms": oldest_unresolved_order_age_ms,
+                        "durable_outbox_stuck": durable_outbox_stuck,
+                        "durable_pipeline_liveness_ready": liveness_ready,
+                        "processed_without_outcome_count": processed_without_outcome_count,
+                        "unresolved_fill_outcome_count": unresolved_outcome_count,
+                        "writer_lease_acquired": self._writer_lease_connection is not None,
+                        "event_loop_lag_ms": self.state.event_loop_lag_ms,
+                        "max_event_loop_lag_ms": self.state.max_event_loop_lag_ms,
+                        "durable_replay_scan_count": self.state.durable_replay_scan_count,
+                        "durable_order_resume_scan_count": self.state.durable_order_resume_scan_count,
+                        "durable_replay_idle_wait_count": self.state.durable_replay_idle_wait_count,
+                        "background_cycles_deferred_for_hot_path": self.state.background_cycles_deferred_for_hot_path,
+                        "recent_submit_latency": recent_submit_latency,
+                    },
+                )
+                await store_task_status(
+                    db,
+                    task_name="price_cache_updater",
+                    last_error=(current_error if not price_fresh else None),
+                    metadata={"dex_price_cache_status": price_status},
+                )
             await db.commit()
+            if task_status_due:
+                self._task_status_stored_at = now
+                self._task_status_last_error = current_error
 
     async def _store_starting_status(self) -> None:
         now = datetime.now(timezone.utc)
@@ -12178,6 +12300,11 @@ class HyperliquidLowLatencyWatcher:
                     LatestAccountPosition.coin,
                     LatestAccountPosition.side,
                     LatestAccountPosition.last_update_at,
+                    LatestAccountState.last_update_at,
+                )
+                .join(
+                    LatestAccountState,
+                    LatestAccountState.id == LatestAccountPosition.account_state_id,
                 )
                 .where(LatestAccountPosition.role == FOLLOWER)
                 .where(LatestAccountPosition.address == follower)
@@ -12185,13 +12312,16 @@ class HyperliquidLowLatencyWatcher:
             )
         ).all()
         positions_by_key: dict[tuple[str, str, str], datetime | None] = {}
-        for dex, canonical, coin, side, last_update_at in position_rows:
+        for dex, canonical, coin, side, last_update_at, state_last_update_at in position_rows:
             key = (
                 str(dex or "").lower(),
                 str(canonical or coin or "").upper(),
                 str(side or "").upper(),
             )
-            updated_at = _datetime_or_none(last_update_at)
+            updated_at = _latest_datetime(
+                _datetime_or_none(last_update_at),
+                _datetime_or_none(state_last_update_at),
+            )
             current = positions_by_key.get(key)
             positions_by_key[key] = _latest_datetime(current, updated_at)
         stale_seconds = float(getattr(self.settings, "account_state_stale_seconds", 2) or 2)
@@ -12552,12 +12682,17 @@ def _aggregate_order_segment(events: list[FillEvent], indexes: list[int]) -> tup
     raw_total_size = sum(abs(event.size) for event in segment)
     raw_total_notional = sum(abs(event.price * event.size) for event in segment)
     total_size = _effective_segment_size(segment, raw_total_size)
-    total_notional = (
-        raw_total_notional * total_size / raw_total_size
-        if raw_total_size > 0 and total_size > 0
-        else raw_total_notional
-    )
-    vwap = total_notional / total_size if total_size > 0 else representative.price
+    # Do not inherit process-global Decimal precision from unrelated analytics
+    # modules.  The synthetic fill must be byte-for-byte deterministic because
+    # it feeds sizing, durable outcomes and retry reconstruction.
+    with localcontext() as decimal_context:
+        decimal_context.prec = 28
+        total_notional = (
+            raw_total_notional * total_size / raw_total_size
+            if raw_total_size > 0 and total_size > 0
+            else raw_total_notional
+        )
+        vwap = total_notional / total_size if total_size > 0 else representative.price
     start_position = _order_segment_start_position(segment)
 
     raw = dict(representative.raw or {})

@@ -15,8 +15,8 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     database_url: str = "postgresql+asyncpg://postgres/copytrade"
-    database_pool_size: int = 20
-    database_max_overflow: int = 20
+    database_pool_size: int = 12
+    database_max_overflow: int = 4
     database_pool_timeout_seconds: float = 5.0
     database_lock_timeout_seconds: float = 2.0
     # The dedicated watcher keeps submit transactions off its maintenance DB
@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     # checkout pre-ping on every fill; durable pre-send retry remains the
     # authority for recovering a genuinely stale connection.
     low_latency_submit_database_pool_size: int = 8
-    low_latency_submit_database_max_overflow: int = 8
+    low_latency_submit_database_max_overflow: int = 4
     redis_url: str = "redis://redis:6379/0"
 
     binance_api_key: SecretStr | None = None
@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     # the same snapshot.  Discovery never runs in the order-submit hot path.
     enable_all_hyperliquid_perp_dexes: bool = True
     hyperliquid_perp_dex_discovery_timeout_seconds: float = 3.0
+    # Read-only pollers and analytics use modest request pacing to avoid
+    # shared-IP 429 bursts. The execution watcher deliberately leaves this at
+    # zero on its own clients, so the fill-to-order hot path is unaffected.
+    hyperliquid_background_info_min_interval_seconds: float = 0.1
     default_hyperliquid_dex: str = ""
     enable_xyz_dex: bool = True
     xyz_dex_name: str = "xyz"
@@ -97,8 +101,9 @@ class Settings(BaseSettings):
     durable_fill_retry_max_seconds: float = 5.0
     durable_fill_replay_batch_size: int = 1000
     durable_pipeline_stuck_seconds: float = 10.0
-    watcher_status_refresh_seconds: float = 2.0
+    watcher_status_refresh_seconds: float = 5.0
     max_parallel_order_submits_per_market: int = 8
+    fill_worker_idle_seconds: float = 60.0
     leader_fill_reconcile_seconds: float = 15.0
     hyperliquid_risk_settings_ttl_seconds: int = 300
     market_meta_miss_refresh_cooldown_seconds: float = 0.25
