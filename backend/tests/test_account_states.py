@@ -878,24 +878,21 @@ def test_account_state_payload_hides_closed_positions_by_default() -> None:
     assert payload["positions"][0]["closedAt"] == now.isoformat()
 
 
-def test_frontend_operational_pages_use_realtime_stream_fallback() -> None:
+def test_frontend_operational_pages_use_low_frequency_db_snapshots() -> None:
     candidates = [Path(__file__).resolve().parents[2], Path(__file__).resolve().parents[1]]
     root = next((item for item in candidates if (item / "frontend/src/app").exists()), None)
     if root is None:
         pytest.skip("frontend source is not included in this backend-only test image")
-    realtime_source = (root / "frontend/src/lib/realtime.ts").read_text()
-    assert "new EventSource" in realtime_source
-    assert "fallbackMs = options.fallbackMs ?? 1000" in realtime_source
     for path in [
         root / "frontend/src/app/dashboard/page.tsx",
         root / "frontend/src/app/leaders/[id]/page.tsx",
         root / "frontend/src/app/leaders/page.tsx",
-        root / "frontend/src/app/orders/page.tsx",
-        root / "frontend/src/app/preflight/page.tsx",
     ]:
         text = path.read_text()
-        assert "useDashboardStream" in text
-        assert "useRealtimeFallbackPolling" in text
+        assert "useDashboardStream" not in text
+        assert "useRealtimeFallbackPolling" not in text
+        assert "document.visibilityState" in text
+        assert "setInterval" in text
     leaders_page = (root / "frontend/src/app/leaders/page.tsx").read_text()
     assert "/account-states/leaders?compact=true" in leaders_page
-    assert "LEADER_OVERVIEW_REALTIME_MIN_INTERVAL_MS = 15_000" in leaders_page
+    assert "LEADER_OVERVIEW_REFRESH_INTERVAL_MS = 60_000" in leaders_page

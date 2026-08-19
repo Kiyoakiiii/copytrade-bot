@@ -1,0 +1,11 @@
+[Unit]
+Description=Restore Tailscale/WARP coexistence rules after network changes
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Unit=tailscale-warp-direct.service
+
+[Install]
+WantedBy=timers.target

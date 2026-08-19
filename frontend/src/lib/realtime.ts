@@ -101,7 +101,7 @@ export function useDashboardStream(options: UseDashboardStreamOptions = {}): Rea
     connected,
     lastEventAt,
     lastUpdatedAgeMs,
-    message: connected ? "Realtime stream connected" : "Realtime stream disconnected, using 1s polling fallback",
+    message: connected ? "Realtime stream connected" : "Realtime stream disconnected, using low-frequency polling fallback",
   };
 }
 
@@ -110,8 +110,8 @@ export function useRealtimeFallbackPolling(
   load: () => void | Promise<void>,
   options: { fallbackMs?: number; reconcileMs?: number } = {},
 ) {
-  const fallbackMs = options.fallbackMs ?? 1000;
-  const reconcileMs = options.reconcileMs ?? 45000;
+  const fallbackMs = options.fallbackMs ?? 30000;
+  const reconcileMs = options.reconcileMs ?? 120000;
   const loadRef = useRef(load);
   useEffect(() => {
     loadRef.current = load;

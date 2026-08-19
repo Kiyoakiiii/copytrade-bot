@@ -38,11 +38,121 @@ from app.services.watcher_status import (
     watcher_statuses_by_scope,
 )
 from app.tasks.leader_state_poller import (
+    account_state_cache_status,
     monitoring_account_state_stale_seconds,
-    schedule_account_state_refresh_if_stale,
 )
 
 router = APIRouter(prefix="/account-states", tags=["account-states"])
+
+
+@router.get("/followers")
+async def follower_account_states(
+    _: CurrentUser,
+    db: DbSession,
+    settings: AppSettings,
+):
+    """Return every configured follower account without exchange I/O.
+
+    Main and subaccount state is already persisted by their dedicated watchers.
+    This endpoint only assembles those database snapshots for the operator UI,
+    so a dashboard refresh never enters either order-submit hot path.
+    """
+
+    # This combined dashboard endpoint is deliberately read-only. Dedicated
+    # watcher processes already persist fresh snapshots for every execution
+    # account, so a browser refresh must never schedule exchange network I/O.
+    cache_status = await account_state_cache_status(settings)
+    main_address = str(
+        settings.hyperliquid_account_address
+        or settings.hyperliquid_signer_address()
+        or ""
+    ).strip().lower()
+    subaccounts = [
+        address
+        for address in settings.hyperliquid_execution_subaccount_address_list()
+        if address and address != main_address
+    ]
+    configured = [
+        ("", main_address or None, "MAIN", "Main account"),
+        *[
+            (address, address, "SUBACCOUNT", f"Subaccount · {address[-4:]}")
+            for address in subaccounts
+        ],
+    ]
+    status_keys = [
+        "watcher_status" if not scope else f"watcher_status:{scope}"
+        for scope, _, _, _ in configured
+    ]
+    status_rows = (
+        await db.execute(select(AppSetting).where(AppSetting.key.in_(status_keys)))
+    ).scalars().all()
+    statuses = {
+        row.key: row.value if isinstance(row.value, dict) else {}
+        for row in status_rows
+    }
+
+    result: list[dict[str, Any]] = []
+    for scope, address, account_type, label in configured:
+        status_key = "watcher_status" if not scope else f"watcher_status:{scope}"
+        watcher = statuses.get(status_key, {})
+        if not address:
+            result.append(
+                {
+                    "execution_scope": scope,
+                    "account_type": account_type,
+                    "account_label": label,
+                    "address": None,
+                    "positions": [],
+                    "dex_states": [],
+                    "stale": True,
+                    "error_message": "account address is not configured",
+                    "watcher_running": bool(watcher.get("low_latency_watcher_running")),
+                    "watcher_ready": bool(watcher.get("ready_for_low_latency_live")),
+                    "active_leaders": watcher.get("active_leaders") or [],
+                    "refresh_in_progress": bool(cache_status.get("refresh_in_progress")),
+                }
+            )
+            continue
+
+        abstraction = await load_account_abstraction_state(
+            db,
+            role=FOLLOWER,
+            address=address,
+        )
+        dex_states = await _account_state_payloads_for_address(
+            db,
+            role=FOLLOWER,
+            address=address,
+            settings=settings,
+            extra_for_each={"configured": True},
+            account_abstraction=abstraction,
+        )
+        primary = next(
+            (item for item in dex_states if str(item.get("dex") or "") == ""),
+            dex_states[0] if dex_states else {},
+        )
+        positions = [
+            position
+            for item in dex_states
+            for position in item.get("positions", [])
+        ]
+        result.append(
+            {
+                **primary,
+                "execution_scope": scope,
+                "account_type": account_type,
+                "account_label": label,
+                "address": address,
+                "positions": positions,
+                "dex_states": dex_states,
+                "watcher_running": bool(watcher.get("low_latency_watcher_running")),
+                "watcher_ready": bool(watcher.get("ready_for_low_latency_live")),
+                "active_leaders": watcher.get("active_leaders") or [],
+                "refresh_in_progress": bool(cache_status.get("refresh_in_progress")),
+                **_account_abstraction_fields(abstraction, dex=""),
+            }
+        )
+    return result
 
 
 @router.get("/follower")
@@ -52,7 +162,7 @@ async def follower_account_state(
     settings: AppSettings,
     include_closed: bool = Query(False),
 ):
-    refresh_status = await schedule_account_state_refresh_if_stale(settings)
+    refresh_status = await account_state_cache_status(settings)
     address = settings.hyperliquid_follower_account_address()
     if not address:
         return {
@@ -166,10 +276,6 @@ async def leader_account_states(
     include_closed: bool = Query(False),
     compact: bool = Query(True),
 ):
-    await schedule_account_state_refresh_if_stale(
-        settings,
-        max_age_seconds=monitoring_account_state_stale_seconds(settings),
-    )
     leaders = (await db.execute(active_leaders_statement())).scalars().all()
     return await _leader_state_payloads(
         db,
@@ -188,10 +294,6 @@ async def leader_account_state(
     settings: AppSettings,
     include_closed: bool = Query(False),
 ):
-    await schedule_account_state_refresh_if_stale(
-        settings,
-        max_age_seconds=monitoring_account_state_stale_seconds(settings),
-    )
     leader = await db.get(LeaderConfig, leader_id)
     if not leader:
         raise HTTPException(status_code=404, detail="leader not found")

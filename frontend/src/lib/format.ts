@@ -48,6 +48,64 @@ export function formatPrice(value: string | number | null | undefined): string {
   return formatDecimal(value, { maximumFractionDigits: 4 });
 }
 
+export function formatExactDecimal(value: string | number | null | undefined): string {
+  if (value === null || value === undefined || value === "") return "--";
+  // Price snapshots arrive as fixed-scale decimal strings. Trim only
+  // insignificant fractional zeroes; never convert through Number, which
+  // could round valid low-order digits.
+  const raw = String(value).trim();
+  const match = raw.match(/^([+-]?)(\d+)(?:\.(\d*))?([eE][+-]?\d+)?$/);
+  if (!match) return raw;
+  const [, sign, integer, fraction = "", exponent = ""] = match;
+  const significantFraction = fraction.replace(/0+$/, "");
+  const normalized = significantFraction
+    ? `${integer}.${significantFraction}${exponent}`
+    : `${integer}${exponent}`;
+  return sign === "-" && /^0(?:[eE][+-]?\d+)?$/.test(normalized) ? normalized : `${sign}${normalized}`;
+}
+
+export function numericOrNull(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function profitLossClass(value: unknown): string {
+  const parsed = numericOrNull(value);
+  if (parsed === null || parsed === 0) return "text-ink";
+  return parsed > 0 ? "text-emerald-600" : "text-danger";
+}
+
+export function formatProfitLossMoney(value: unknown): string {
+  const parsed = numericOrNull(value);
+  if (parsed === null) return "--";
+  return `${parsed < 0 ? "-" : ""}$${formatNotional(Math.abs(parsed))}`;
+}
+
+export function formatProfitLossPercent(value: unknown): string {
+  const parsed = numericOrNull(value);
+  if (parsed === null) return "--";
+  return `${parsed < 0 ? "-" : ""}${formatNotional(Math.abs(parsed))}%`;
+}
+
+export function formatProfitLossBps(value: unknown): string {
+  const parsed = numericOrNull(value);
+  if (parsed === null) return "--";
+  return `${parsed < 0 ? "-" : ""}${formatNotional(Math.abs(parsed))}bps`;
+}
+
+export function formatLossMoney(value: unknown): string {
+  const parsed = numericOrNull(value);
+  if (parsed === null) return "--";
+  return parsed === 0 ? "$0" : `-$${formatNotional(Math.abs(parsed))}`;
+}
+
+export function formatLossPercent(value: unknown): string {
+  const parsed = numericOrNull(value);
+  if (parsed === null) return "--";
+  return parsed === 0 ? "0%" : `-${formatNotional(Math.abs(parsed))}%`;
+}
+
 export function formatQuantity(value: string | number | null | undefined): string {
   return formatDecimal(value, { maximumFractionDigits: 8 });
 }

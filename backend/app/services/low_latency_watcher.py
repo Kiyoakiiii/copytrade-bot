@@ -160,8 +160,15 @@ FILL_OUTCOME_MIN_NOTIONAL_EXEMPT = "MIN_NOTIONAL_EXEMPT"
 FILL_OUTCOME_SUBMISSION_UNKNOWN = "SUBMISSION_UNKNOWN"
 FILL_OUTCOME_MANUAL_REVIEW = "MANUAL_REVIEW"
 FILL_OUTCOME_NO_ACTION_REQUIRED = "NO_ACTION_REQUIRED"
+UNSUPPORTED_SPOT_FILL_REASON = (
+    "UNSUPPORTED_SPOT_FILL: Hyperliquid spot fills are outside the perpetual copy scope"
+)
 EMERGENCY_KILL_SWITCH_ERROR = "EMERGENCY_KILL_SWITCH: copy trading disabled before exchange submit"
 MANUAL_MARKET_OWNER_BLOCKED = "MANUAL_MARKET_OWNER_BLOCKED"
+DELETED_LEADER_MANUAL_TAKEOVER_REASON = (
+    "leader disabled/deleted while its follower allocation still existed; "
+    "the remaining follower position is manual-owned until actual flat"
+)
 LEADER_FILL_BACKFILL_PAGE_SIZE = 2000
 LEADER_FILL_BACKFILL_OVERLAP_MS = 1000
 LEADER_FILL_BACKFILL_RETRY_BASE_SECONDS = 1.0
@@ -1392,6 +1399,21 @@ def parse_fill_to_market_key(fill: dict[str, Any], *, default_dex: str = "") -> 
     )
 
 
+def _is_hyperliquid_spot_fill(fill: FillEvent) -> bool:
+    """Identify Hyperliquid spot fills before perp metadata resolution.
+
+    Leader ``userFills`` combines perpetual and spot executions. Hyperliquid
+    represents spot markets as numeric ``@<index>`` names (for example
+    ``@334``), while default and HIP-3 perpetual fills use coin names or
+    ``dex:coin``. Sending an ``@`` market through the perpetual asset resolver
+    can never succeed and would otherwise leave a durable FIFO head retrying
+    forever.
+    """
+
+    raw_coin = str(fill.market.raw_coin or (fill.raw or {}).get("coin") or "").strip()
+    return raw_coin.startswith("@") and raw_coin[1:].isdigit()
+
+
 class FillDrivenExecutionEngine:
     def __init__(
         self,
@@ -1637,6 +1659,46 @@ class FillDrivenExecutionEngine:
         minimum_tradeable_notional = Decimal(
             str(self.settings.hyperliquid_min_order_value_usd)
         )
+
+        # Hyperliquid emits spot and perpetual executions on the same
+        # ``userFills`` subscription. This engine intentionally copies
+        # perpetual positions only. Give every spot fill a durable terminal
+        # outcome before any perpetual metadata/price/account dependency, so
+        # it cannot livelock the FIFO queue or be mistaken for a missed perp
+        # order.
+        if _is_hyperliquid_spot_fill(fill):
+            implied = derive_leader_post_position_from_fill(fill)
+            side = implied.side_after
+            dependency_free_at = datetime.now(timezone.utc)
+            return await self._record_lifecycle_ignored_order(
+                db,
+                fill=fill,
+                leader=leader,
+                reason=UNSUPPORTED_SPOT_FILL_REASON,
+                target_side_hint=side,
+                leader_position_notional=implied.notional_after_estimate,
+                leader_entry_px=implied.entry_px,
+                leader_account_value=_configured_leader_account_value(leader),
+                follower_account_value=None,
+                dedupe_started_at=dedupe_started_at,
+                dedupe_done_at=dedupe_done_at,
+                debounce_started_at=debounce_started_at,
+                debounce_released_at=debounce_released_at,
+                lock_wait_started_at=lock_wait_started_at,
+                lock_acquired_at=lock_acquired_at,
+                ws_received_at=ws_received_at,
+                decision_started_at=decision_started_at,
+                account_cache_read_at=dependency_free_at,
+                account_cache_read_done_at=dependency_free_at,
+                price_cache_read_at=dependency_free_at,
+                price_cache_read_done_at=dependency_free_at,
+                action="IGNORED_SPOT_FILL",
+                lifecycle_gate="UNSUPPORTED_SPOT_FILL",
+                checklist_details={
+                    "copy_scope": "PERPETUALS_ONLY",
+                    "follower_order_submitted": False,
+                },
+            )
 
         # Ownership acquisition has a deliberately dependency-free fast gate.
         # Once a market is released, an unrelated leader's add/reduce/close/flip
@@ -8550,6 +8612,129 @@ class HyperliquidLowLatencyWatcher:
             synced += 1
         return synced, skipped
 
+    async def _activate_deleted_leader_manual_takeover_guard(
+        self,
+        db: Any,
+        *,
+        allocation: LeaderPositionAllocationRecord,
+        observed_at: datetime,
+    ) -> LeaderPositionAllocationRecord | None:
+        """Atomically transfer a deleted leader's market to manual ownership.
+
+        Closing the allocation without a guard makes a still-open follower
+        position look like a free market.  Another leader could then acquire
+        the coin before the operator manually closes the detached position.
+        The durable guard is installed under the same market transaction lock
+        as final order validation and is released only after authoritative
+        follower state proves the actual position flat.
+        """
+
+        canonical_coin = str(
+            allocation.canonical_coin or allocation.hyperliquid_coin or ""
+        ).upper()
+        if not canonical_coin:
+            raise RuntimeError(
+                "deleted leader allocation cannot be detached without a canonical coin"
+            )
+        dex = str(allocation.dex or "").lower()
+        parsed = parse_coin(canonical_coin, default_dex=dex)
+        market = MarketKey(
+            dex=dex,
+            coin=parsed.coin,
+            canonical_coin=canonical_coin,
+            raw_coin=canonical_coin,
+            asset_id=None,
+            venue_symbol=canonical_coin,
+        )
+        if isinstance(db, AsyncSession):
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(:market_key)"),
+                {"market_key": _market_transaction_key(market, self.execution_scope)},
+            )
+            # The fill path takes the market advisory lock before locking the
+            # allocation row. Keep the identical order here so a config change
+            # racing a fill cannot create a lock inversion. Refresh after the
+            # advisory lock so an allocation changed by the winner is never
+            # detached using the stale object returned by the initial scan.
+            locked_allocation = await db.scalar(
+                select(LeaderPositionAllocationRecord)
+                .where(LeaderPositionAllocationRecord.id == allocation.id)
+                .where(LeaderPositionAllocationRecord.status != "CLOSED")
+                .with_for_update()
+                .execution_options(populate_existing=True)
+                .limit(1)
+            )
+            if locked_allocation is None:
+                return None
+            allocation = locked_allocation
+            if self.engine.pending_intents.has_pending_allocation(allocation):
+                return None
+
+        expected_side = _position_side_or_none(allocation.position_side)
+        expected_qty = abs(Decimal(allocation.allocated_qty or 0))
+
+        if isinstance(db, AsyncSession):
+            row = await db.scalar(
+                _follower_market_guard_query(
+                    market,
+                    execution_scope=self.execution_scope,
+                ).with_for_update()
+            )
+            if row is None:
+                row = FollowerMarketGuard(
+                    execution_account=self.execution_scope,
+                    execution_venue=ExecutionVenue.HYPERLIQUID.value,
+                    dex=dex,
+                    canonical_coin=canonical_coin,
+                    position_version=1,
+                    active=True,
+                    reason=DELETED_LEADER_MANUAL_TAKEOVER_REASON,
+                    observed_at=observed_at,
+                    reconciled_at=None,
+                    expected_position_side=(
+                        expected_side.value if expected_side is not None else None
+                    ),
+                    expected_position_qty=expected_qty,
+                    expected_position_relation=MANUAL_FILL_POSITION_EXACT,
+                    # Allocation ownership is detached in this transaction;
+                    # no later fill checkpoint is needed before the guard can
+                    # track the now-unmanaged actual position.
+                    position_change_confirmed_at=observed_at,
+                )
+                db.add(row)
+            else:
+                row.position_version = int(row.position_version or 0) + 1
+                row.active = True
+                row.reason = DELETED_LEADER_MANUAL_TAKEOVER_REASON
+                row.observed_at = observed_at
+                row.reconciled_at = None
+                row.expected_position_side = (
+                    expected_side.value if expected_side is not None else None
+                )
+                row.expected_position_qty = expected_qty
+                row.expected_position_relation = MANUAL_FILL_POSITION_EXACT
+                row.position_change_confirmed_at = observed_at
+                row.updated_at = observed_at
+            await db.flush()
+            position_version = int(row.position_version or 0)
+        else:
+            # Lightweight unit-test/session adapters do not persist ORM rows,
+            # but the in-memory fail-closed behavior remains testable.
+            existing = self.manual_position_guard.active_entry(market)
+            position_version = int(existing.position_version if existing else 0) + 1
+
+        self.manual_position_guard.mark(
+            market,
+            reason=DELETED_LEADER_MANUAL_TAKEOVER_REASON,
+            observed_at=observed_at,
+            position_version=position_version,
+            expected_position_side=expected_side,
+            expected_position_qty=expected_qty,
+            expected_position_relation=MANUAL_FILL_POSITION_EXACT,
+            position_change_confirmed_at=observed_at,
+        )
+        return allocation
+
     async def _close_deleted_or_disabled_leader_allocations(self, db: Any) -> tuple[int, int]:
         rows = (
             await db.execute(
@@ -8563,7 +8748,6 @@ class HyperliquidLowLatencyWatcher:
                 .where(LeaderPositionAllocationRecord.venue_account == self.execution_scope)
                 .where(LeaderPositionAllocationRecord.status != "CLOSED")
                 .where(or_(LeaderConfig.enabled.is_(False), LeaderConfig.deleted_at.is_not(None)))
-                .with_for_update(of=LeaderPositionAllocationRecord)
                 .execution_options(populate_existing=True)
             )
         ).all()
@@ -8583,6 +8767,19 @@ class HyperliquidLowLatencyWatcher:
             if self.engine.pending_intents.has_pending_allocation(allocation):
                 skipped += 1
                 continue
+            before_qty = Decimal(allocation.allocated_qty or 0)
+            before_notional = Decimal(allocation.allocated_notional or 0)
+            locked_allocation = await self._activate_deleted_leader_manual_takeover_guard(
+                db,
+                allocation=allocation,
+                observed_at=now,
+            )
+            if locked_allocation is None:
+                skipped += 1
+                continue
+            allocation = locked_allocation
+            # Re-read these values from the row locked after the market lock;
+            # a concurrent fill may have changed them after the initial scan.
             before_qty = Decimal(allocation.allocated_qty or 0)
             before_notional = Decimal(allocation.allocated_notional or 0)
             allocation.allocated_qty = Decimal("0")
@@ -8616,9 +8813,13 @@ class HyperliquidLowLatencyWatcher:
                     before_qty=before_qty,
                     after_qty=Decimal("0"),
                     metadata_json=_json_safe({
-                        "reason": "leader disabled/deleted; allocation detached from copy lifecycle",
+                        "reason": (
+                            "leader disabled/deleted; allocation detached from copy lifecycle "
+                            "and transferred to durable manual market ownership until actual flat"
+                        ),
                         "leader_enabled": leader_enabled,
                         "leader_deleted_at": _iso_or_none(leader_deleted_at),
+                        "manual_market_guard_active": True,
                     }),
                 )
             )
@@ -8628,7 +8829,10 @@ class HyperliquidLowLatencyWatcher:
                     event_type="DELETED_LEADER_ALLOCATION_CLOSED",
                     symbol=allocation.canonical_coin,
                     leader_address=allocation.leader_address,
-                    message="deleted/disabled leader allocation closed so it cannot remain stale or own a market",
+                    message=(
+                        "deleted/disabled leader allocation closed; remaining follower "
+                        "position is manual-owned until actual flat"
+                    ),
                     metadata_json=_json_safe({
                         "allocation_id": allocation.id,
                         "leader_id": allocation.leader_id,
@@ -8639,6 +8843,7 @@ class HyperliquidLowLatencyWatcher:
                         "before_notional": str(before_notional),
                         "leader_enabled": leader_enabled,
                         "leader_deleted_at": _iso_or_none(leader_deleted_at),
+                        "manual_market_guard_active": True,
                     }),
                 )
             )

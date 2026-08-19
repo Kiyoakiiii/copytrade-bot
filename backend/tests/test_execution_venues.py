@@ -1798,6 +1798,60 @@ def test_primed_sdk_market_metadata_builds_hip3_exchange_without_info_requests(m
         asyncio.run(client.close())
 
 
+@pytest.mark.parametrize(
+    ("dex", "asset_offset", "old_coin", "new_coin"),
+    [
+        ("", 0, "OLD", "NEW"),
+        ("xyz", 750000, "xyz:OLD", "xyz:NEW"),
+        ("flx", 880000, "flx:OLD", "flx:NEW"),
+    ],
+)
+def test_refreshed_sdk_market_metadata_updates_existing_exchange_for_new_market(
+    dex,
+    asset_offset,
+    old_coin,
+    new_coin,
+) -> None:
+    class FakeInfo:
+        def __init__(self) -> None:
+            self.coin_to_asset = {old_coin: asset_offset}
+            self.name_to_coin = {old_coin: old_coin}
+            self.asset_to_sz_decimals = {asset_offset: 2}
+
+        def name_to_asset(self, name):
+            return self.coin_to_asset[name]
+
+    class FakeExchange:
+        def __init__(self) -> None:
+            self.info = FakeInfo()
+
+    client = HyperliquidExecutionClient(
+        info_url="https://api.hyperliquid.xyz/info",
+        private_key="0x" + "1" * 64,
+        account_address="0x" + "2" * 40,
+        network="mainnet",
+    )
+    exchange = FakeExchange()
+    client._exchange_cache[dex] = exchange
+    client._sdk_coin_name_cache[(dex, new_coin.upper())] = new_coin
+
+    client.prime_sdk_market_metadata(
+        dex=dex,
+        meta={
+            "universe": [
+                {"name": old_coin, "szDecimals": 2, "maxLeverage": 10},
+                {"name": new_coin, "szDecimals": 3, "maxLeverage": 5},
+            ]
+        },
+        asset_offset=asset_offset,
+    )
+
+    assert _resolve_sdk_asset_id(exchange, new_coin) == asset_offset + 1
+    assert exchange.info.name_to_coin[new_coin] == new_coin
+    assert exchange.info.asset_to_sz_decimals[asset_offset + 1] == 3
+    assert client._sdk_coin_name_cache[(dex, new_coin.upper())] == new_coin
+
+
 def test_hyperliquid_execution_client_submit_slot_is_shared_across_clients(monkeypatch) -> None:
     import threading
 

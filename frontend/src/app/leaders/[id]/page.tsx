@@ -9,7 +9,6 @@ import { LeaderPerformanceDetailPanel, type SingleLeaderPerformance } from "@/co
 import { apiFetch } from "@/lib/api";
 import { copyStatusTone, effectiveCopyReason, effectiveCopyStatus, effectiveCopyable } from "@/lib/copyStatus";
 import { leaderDisplayLabel } from "@/lib/leaderIdentity";
-import { useDashboardStream, useRealtimeFallbackPolling } from "@/lib/realtime";
 import {
   formatAge as formatAgeLabel,
   formatDateTime as formatDateTimeLabel,
@@ -17,7 +16,9 @@ import {
   formatNotional,
   formatOpenTimeLabel,
   formatPrice,
+  formatProfitLossMoney,
   formatQuantity,
+  profitLossClass,
 } from "@/lib/format";
 
 type LeaderDetail = {
@@ -160,18 +161,13 @@ export default function LeaderDetailPage() {
     }
   }
 
-  const realtime = useDashboardStream({
-    onEvent: (event) => {
-      if (["leader_state_update", "positions_update", "baseline_status_update", "allocation_status_update"].includes(event.event_type)) {
-        load();
-      }
-    },
-  });
-
   useEffect(() => {
-    load({ includePerformance: true });
+    void load({ includePerformance: true });
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void load();
+    }, 60_000);
+    return () => window.clearInterval(timer);
   }, [params.id]);
-  useRealtimeFallbackPolling(realtime, load);
 
   return (
     <AppShell>
@@ -182,9 +178,7 @@ export default function LeaderDetailPage() {
             <span className="text-xs text-slate-500">
               {lastRefreshedAt ? `Refreshed ${formatDateTime(lastRefreshedAt)}` : "Waiting for first refresh"}
             </span>
-            <span className={realtime.connected ? "rounded-md border border-green-200 bg-green-50 px-2 py-1 text-xs text-accent" : "rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-warn"}>
-              realtime mode: {realtime.mode}
-            </span>
+            <span className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-600">DB snapshot · 60s</span>
             <button className="btn btn-muted" type="button" onClick={() => load({ includePerformance: true })}>
               <RefreshCw className="h-4 w-4" />
               Refresh
@@ -258,7 +252,7 @@ export default function LeaderDetailPage() {
                       <td className="px-4 py-3">{formatPrice(item.entry_px)}</td>
                       <td className={item.mark_price_stale ? "px-4 py-3 text-warn" : "px-4 py-3"}>{formatPrice(item.mark_px)}</td>
                       <td className="px-4 py-3">{formatPrice(item.mid_px)}</td>
-                      <td className="px-4 py-3">{formatNotional(item.unrealized_pnl)}</td>
+                      <td className={`px-4 py-3 font-medium ${profitLossClass(item.unrealized_pnl)}`}>{formatProfitLossMoney(item.unrealized_pnl)}</td>
                       <td className="px-4 py-3">{formatOpenTime(item)}</td>
                       <td className="px-4 py-3">{formatDateTime(item.updated_at)}</td>
                       <td className={effectiveCopyable(item) ? "px-4 py-3 text-accent" : "px-4 py-3 text-danger"}>{String(effectiveCopyable(item))}</td>

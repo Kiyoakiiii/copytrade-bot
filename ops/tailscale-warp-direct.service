@@ -1,0 +1,8 @@
+[Unit]
+Description=Keep Tailscale UDP direct connectivity ahead of Cloudflare WARP
+After=network-online.target tailscaled.service warp-svc.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ensure-tailscale-warp-direct

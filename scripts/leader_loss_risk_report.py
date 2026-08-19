@@ -10,9 +10,11 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import fcntl
 import hashlib
 import json
 import math
+import os
 import statistics
 import sys
 import time
@@ -36,6 +38,10 @@ UNDERWATER_USD_THRESHOLD = Decimal("-1")
 FOUR_HOURS_MS = 4 * 60 * 60 * 1000
 FILL_PAGE_SIZE = 2000
 FUNDING_PAGE_SIZE = 500
+# A very active leader can exceed twelve fill pages inside only a few weeks.
+# Keep a finite guard against a broken/non-advancing upstream response, but do
+# not silently truncate an otherwise healthy paginated history at 24k fills.
+MAX_FILL_PAGES = 80
 
 def dec(value: Any, default: Decimal = ZERO) -> Decimal:
     try:
@@ -111,16 +117,73 @@ class PublicInfoClient:
     def __init__(self, cache_dir: Path, *, pause_seconds: float = 0.10) -> None:
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.pause_seconds = pause_seconds
+        configured_pause = _environment_float("COPYTRADE_PUBLIC_INFO_MIN_INTERVAL_SECONDS")
+        self.pause_seconds = max(pause_seconds, configured_pause or 0.0)
+        self.max_network_requests = _environment_int("COPYTRADE_PUBLIC_INFO_MAX_REQUESTS")
+        self.shared_rate_state = os.getenv("COPYTRADE_PUBLIC_INFO_RATE_STATE", "").strip()
+        self._network_requests = 0
         self._last_request = 0.0
+
+    def _request_interval(self, payload: dict[str, Any]) -> float:
+        """Pace research by endpoint weight instead of one huge fixed delay.
+
+        Hyperliquid charges large history pages and candle snapshots more than
+        ordinary Info requests.  A short endpoint-aware interval keeps a full
+        first-time analysis reasonably fast while reserving headroom for the
+        live bot on the same host/IP.
+        """
+
+        request_type = str(payload.get("type") or "")
+        if request_type == "userFillsByTime":
+            # A full 2,000-fill response can consume roughly 120 weight.
+            return max(self.pause_seconds, 8.0)
+        if request_type in {"userFunding", "userNonFundingLedgerUpdates"}:
+            return max(self.pause_seconds, 3.0)
+        if request_type == "candleSnapshot":
+            return max(self.pause_seconds, 2.0)
+        return self.pause_seconds
+
+    def _reserve_network_request(self, payload: dict[str, Any]) -> None:
+        if self.max_network_requests is not None and self._network_requests >= self.max_network_requests:
+            raise RuntimeError(
+                "public Info API request budget reached; cached progress was preserved, "
+                "so retry the research job later to continue without a request burst"
+            )
+        interval = self._request_interval(payload)
+        if self.shared_rate_state:
+            state_path = Path(self.shared_rate_state)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            with state_path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                handle.seek(0)
+                try:
+                    last_request_wall = float(handle.read().strip() or "0")
+                except ValueError:
+                    last_request_wall = 0.0
+                now = time.time()
+                reserved_at = max(now, last_request_wall + interval)
+                handle.seek(0)
+                handle.truncate()
+                handle.write(str(reserved_at))
+                handle.flush()
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            # Never sleep while holding the cross-process lock.  A cancelled
+            # evaluator may waste at most its own reserved slot, but cannot
+            # strand every later research job behind a sleeping file lock.
+            delay = reserved_at - now
+            if delay > 0:
+                time.sleep(delay)
+        else:
+            elapsed = time.monotonic() - self._last_request
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
+            self._last_request = time.monotonic()
+        self._network_requests += 1
 
     def post(self, payload: dict[str, Any], cache_key: str) -> Any:
         cache_path = self.cache_dir / f"{cache_key}.json"
         if cache_path.exists():
             return json.loads(cache_path.read_text(encoding="utf-8"))
-        elapsed = time.monotonic() - self._last_request
-        if elapsed < self.pause_seconds:
-            time.sleep(self.pause_seconds - elapsed)
         data = json.dumps(payload, separators=(",", ":")).encode()
         request = urllib.request.Request(
             INFO_URL,
@@ -131,9 +194,11 @@ class PublicInfoClient:
         error: Exception | None = None
         for attempt in range(6):
             try:
+                # In research mode this is a persistent, cross-job gate. Every
+                # retry consumes budget and receives its own time slot too.
+                self._reserve_network_request(payload)
                 with urllib.request.urlopen(request, timeout=40) as response:
                     result = json.loads(response.read().decode())
-                self._last_request = time.monotonic()
                 cache_path.write_text(
                     json.dumps(result, ensure_ascii=False, separators=(",", ":")),
                     encoding="utf-8",
@@ -143,6 +208,41 @@ class PublicInfoClient:
                 error = exc
                 time.sleep(min(8.0, 0.5 * (2**attempt)))
         raise RuntimeError(f"public info request failed for {cache_key}: {error}")
+
+
+def _environment_float(name: str) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def _environment_int(name: str) -> int | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def public_history_cache_namespace(root: Path, cutoff_ms: int, address: str) -> Path:
+    """Return an address-private cache path shared by all research models."""
+
+    digest = hashlib.sha256(address.strip().lower().encode("ascii")).hexdigest()[:24]
+    path = root / str(cutoff_ms) / digest
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    return path
 
 
 def fill_key(fill: dict[str, Any]) -> str:
@@ -313,7 +413,7 @@ def fetch_fills(client: PublicInfoClient, suffix: str, address: str, end_ms: int
     unique: dict[str, dict[str, Any]] = {}
     start_ms = 0
     saturated = False
-    for page_number in range(12):
+    for page_number in range(MAX_FILL_PAGES):
         page = client.post(
             {
                 "type": "userFillsByTime",
@@ -338,7 +438,7 @@ def fetch_fills(client: PublicInfoClient, suffix: str, address: str, end_ms: int
             start_ms += 1
         if len(unique) >= 10_000:
             saturated = True
-        if page_number == 11:
+        if page_number == MAX_FILL_PAGES - 1:
             saturated = True
     fills = sorted(
         unique.values(),
@@ -468,40 +568,20 @@ def _account_value_points(data: dict[str, Any] | None) -> list[tuple[int, Decima
     )
 
 
-def _combined_account_value_points(
-    spot_points: list[tuple[int, Decimal]],
-    perp_points: list[tuple[int, Decimal]],
-) -> list[tuple[int, Decimal]]:
-    """Recreate the UI Account Total Value series: Spot + Perpetual.
-
-    Corresponding portfolio and perp charts normally share timestamps.  Older
-    down-sampled histories can omit a point from one component, so evaluate
-    that component on its adjacent chart samples instead of silently dropping
-    the other component from the account-total denominator.
-    """
-
-    if not spot_points:
-        return perp_points
-    if not perp_points:
-        return spot_points
-    timestamps = sorted({time_ms for time_ms, _ in spot_points} | {time_ms for time_ms, _ in perp_points})
-    return [
-        (
-            timestamp,
-            linear_point_value(spot_points, timestamp) + linear_point_value(perp_points, timestamp),
-        )
-        for timestamp in timestamps
-    ]
-
-
 def total_account_samples(portfolio: dict[str, Any]) -> list[tuple[int, Decimal]]:
-    """Merge UI Account Total Value history, preferring denser recent periods."""
+    """Merge UI Account Total history, preferring denser recent periods.
+
+    Hyperliquid's non-``perp`` portfolio windows already contain whole-account
+    value.  The corresponding ``perp*`` windows are a component view, not an
+    additional balance.  Adding both would count perpetual equity twice.
+    """
 
     merged: dict[int, Decimal] = {}
     for period in ("allTime", "month", "week", "day"):
-        spot_points = _account_value_points(portfolio.get(period))
-        perp_points = _account_value_points(portfolio.get(_perp_period(period)))
-        for timestamp, value in _combined_account_value_points(spot_points, perp_points):
+        total_points = _account_value_points(portfolio.get(period))
+        if not total_points:
+            total_points = _account_value_points(portfolio.get(_perp_period(period)))
+        for timestamp, value in total_points:
             if value > ZERO:
                 merged[timestamp] = value
     return sorted(merged.items())
@@ -561,10 +641,11 @@ def linear_point_value(points: list[tuple[int, Decimal]], at_ms: int) -> Decimal
 class CapitalNormalizer:
     """Estimate total leader equity without leaking transfers across time.
 
-    Account Total Value is Spot plus Perpetual. Public ledger rows locate
-    deposits/withdrawals/transfers precisely. Raw perp lifecycle PnL supplies
-    the high-frequency trading path, while the residual between official chart
-    samples accounts for spot PnL and any unmodeled component.
+    Hyperliquid's ordinary portfolio windows are Account Total; ``perp*`` is
+    the perpetual component. Public ledger rows locate deposits, withdrawals,
+    and transfers precisely. Raw perp lifecycle PnL supplies the high-frequency
+    trading path, while the residual between official chart samples accounts
+    for spot PnL and any unmodeled component.
     """
 
     def __init__(
@@ -589,6 +670,7 @@ class CapitalNormalizer:
             running += amount
             self.flow_prefix.append(running)
         self.raw_perp_curve = raw_perp_curve
+        self.raw_perp_times = [item[0] for item in self.raw_perp_curve]
 
         self.samples = raw_samples
         self.discarded_account_samples = 0
@@ -607,13 +689,21 @@ class CapitalNormalizer:
             )
         # Later, denser period histories can duplicate an all-time timestamp.
         self.residual_points = sorted(dict(residuals).items())
+        self.residual_times = [item[0] for item in self.residual_points]
 
-        spot_latest = _account_value_points(portfolio.get("allTime"))
+        total_latest = _account_value_points(portfolio.get("allTime"))
         perp_latest = _account_value_points(portfolio.get("perpAllTime"))
-        self.current_spot_account_value = spot_latest[-1][1] if spot_latest else ZERO
-        self.current_perp_account_value = perp_latest[-1][1] if perp_latest else ZERO
+        if not total_latest:
+            total_latest = perp_latest
         self.current_total_account_value = (
-            self.current_spot_account_value + self.current_perp_account_value
+            total_latest[-1][1] if total_latest else ZERO
+        )
+        total_timestamp = total_latest[-1][0] if total_latest else 0
+        self.current_perp_account_value = (
+            linear_point_value(perp_latest, total_timestamp) if perp_latest else ZERO
+        )
+        self.current_spot_account_value = (
+            self.current_total_account_value - self.current_perp_account_value
         )
         self.capital_reconciliation_error = (
             abs(self.samples[-1][1] - self.current_total_account_value) if self.samples else ZERO
@@ -628,10 +718,31 @@ class CapitalNormalizer:
         return self.flow_prefix[index] if index >= 0 else ZERO
 
     def value_at(self, at_ms: int) -> Decimal:
+        raw_index = bisect.bisect_right(self.raw_perp_times, at_ms) - 1
+        raw_value = (
+            self.raw_perp_curve[raw_index][1] if raw_index >= 0 else ZERO
+        )
+        residual_index = bisect.bisect_left(self.residual_times, at_ms)
+        if not self.residual_points:
+            residual_value = ZERO
+        elif residual_index <= 0:
+            residual_value = self.residual_points[0][1]
+        elif residual_index >= len(self.residual_points):
+            residual_value = self.residual_points[-1][1]
+        else:
+            left_time, left_value = self.residual_points[residual_index - 1]
+            right_time, right_value = self.residual_points[residual_index]
+            if right_time <= left_time:
+                residual_value = left_value
+            else:
+                fraction = Decimal(at_ms - left_time) / Decimal(
+                    right_time - left_time
+                )
+                residual_value = left_value + (right_value - left_value) * fraction
         return (
             self.external_capital_at(at_ms)
-            + step_curve_value(self.raw_perp_curve, at_ms)
-            + linear_point_value(self.residual_points, at_ms)
+            + raw_value
+            + residual_value
         )
 
     def nearest_sample_gap_days(self, at_ms: int) -> float | None:
@@ -1902,8 +2013,8 @@ def render_report(
         "",
         "1. 从 Hyperliquid 官方 `userFillsByTime` 拉取非聚合成交；先按 coin、order id、时间、方向与 side 合并同一订单在同一时刻的 exchange fragments，再使用权威 `startPosition` 重建仓位链。资本估值使用 leader 精确归零链；风险统计另按机器人的实际可跟语义重建：模拟 follower 剩余名义仓位低于 10U 时在该次减仓价格全平，leader 灰尘期间保持空仓，后续从灰尘增加到至少10U时按当时Account Total作为全新生命周期。反手同样拆为旧方向关闭和新方向开启。",
         "2. Spot fill（`@index`、`TOKEN/USDC` 及没有 Long/Short 方向语义的成交）全部排除，只研究机器人会复制的永续市场。",
-        "3. 本金严格使用 Hyperliquid 页面显示的 Account Total Value 口径：同一时点的 Spot `allTime/month/week/day.accountValueHistory` 加上 Perpetual `perpAllTime/perpMonth/perpWeek/perpDay.accountValueHistory`。绝不再把 Spot 分项单独当作总本金。近期 day/week/month 采样覆盖 allTime 的粗采样。",
-        "4. `userNonFundingLedgerUpdates` 用于把入金、出金、外部转账和奖励领取定位到精确时间；账户内部 spot/perp/DEX 转移不改变 Account Total。每次生成还会校验最新 `Account Total = Spot + Perpetual`。",
+        "3. 本金严格使用 Hyperliquid 页面显示的 Account Total Value 口径：普通 `allTime/month/week/day.accountValueHistory` 已经是总账户价值；`perpAllTime/perpMonth/perpWeek/perpDay` 只是其中的永续分项，绝不重复相加。近期 day/week/month 采样覆盖 allTime 的粗采样。",
+        "4. `userNonFundingLedgerUpdates` 用于把入金、出金、外部转账和奖励领取定位到精确时间；账户内部 spot/perp/DEX 转移不改变 Account Total。现货分项按 `Account Total - Perpetual` 推导，并校验分项恒等式。",
         "5. 每个生命周期使用开仓前一毫秒估算的 leader 总账户权益，固定缩放系数为 `20,000 / leader_equity_at_open`。后续加仓、减仓和平仓沿用该系数，只看仓位比例；不会因同一笔浮亏降低了 leader 权益而把该亏损二次放大。",
         "6. fill 自带的 `closedPnl` 与 `fee` 逐笔计入；`userFunding` 按 coin 和持仓时间归入对应生命周期。maker rebate 若为负 fee，会自然增加净值。",
         "7. 持仓期间估值使用官方 4h K 线。完整落在同一持仓状态内的 K 线使用 high/low 计算最大不利波动，使用 close 计算连续扛亏时间；生命周期边界所在的不完整 K 线只使用真实 fill 价格，避免把开仓前或平仓后的极端价算进去。",

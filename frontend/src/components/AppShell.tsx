@@ -3,9 +3,9 @@ import type { ReactNode } from "react";
 
 export function AppShell({ children }: { children: ReactNode }) {
   return (
-    <div className="flex min-h-screen bg-slate-100">
+    <div className="min-h-screen bg-[#eef2f7] lg:flex">
       <Nav />
-      <main className="min-w-0 flex-1 p-5 lg:p-6">{children}</main>
+      <main className="min-w-0 flex-1 px-4 py-5 sm:px-6 lg:px-8 lg:py-7">{children}</main>
     </div>
   );
 }

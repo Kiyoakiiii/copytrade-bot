@@ -1921,7 +1921,32 @@ class HyperliquidExecutionClient:
         dex_name = str(dex or "").lower()
         if not isinstance(meta, dict) or not isinstance(meta.get("universe"), list):
             return
-        self._sdk_market_metadata[dex_name] = (dict(meta), max(0, int(asset_offset)))
+        normalized_offset = max(0, int(asset_offset))
+        self._sdk_market_metadata[dex_name] = (dict(meta), normalized_offset)
+
+        # A force-refreshed metadata snapshot can discover a market after the
+        # SDK Exchange object for this DEX has already been constructed.  The
+        # prepared snapshot above is only consulted while constructing a new
+        # Exchange, so updating it alone leaves the live object's
+        # ``coin_to_asset`` map stale and signing fails before any request can
+        # be sent.  Patch the already-warmed object in place as well.  This is
+        # local-only work: no extra request or latency is added for ordinary
+        # fills, and a durable pending order can retry safely with the newly
+        # installed asset id.
+        exchange = self._exchange_cache.get(dex_name)
+        if exchange is None:
+            return
+        _apply_sdk_market_asset_offset(
+            exchange,
+            meta=meta,
+            asset_offset=normalized_offset,
+        )
+        self._sdk_coin_name_cache = {
+            key: value
+            for key, value in self._sdk_coin_name_cache.items()
+            if key[0] != dex_name
+        }
+        self._prime_sdk_coin_name_cache(exchange, dex_name)
 
     @staticmethod
     def manual_order_record(*, coin: str, side: str, source_type: str, dex: str = "") -> dict[str, str]:

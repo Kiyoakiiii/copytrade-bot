@@ -1,28 +1,19 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { Plus, Power, RefreshCw, Save, Trash2 } from "lucide-react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, Plus, Power, RefreshCw, Save, Settings2, Trash2, UsersRound, WalletCards, X } from "lucide-react";
 import { AppShell } from "@/components/AppShell";
 import { Header } from "@/components/Header";
 import { LeaderPerformanceOverviewPanel, type LeaderPerformanceOverview } from "@/components/LeaderPerformance";
+import { ResearchLab } from "@/components/ResearchLab";
 import { apiFetch } from "@/lib/api";
-import { copyStatusTone, effectiveCopyReason, effectiveCopyStatus, effectiveCopyable } from "@/lib/copyStatus";
-import { leaderDisplayLabel } from "@/lib/leaderIdentity";
-import { useDashboardStream, useRealtimeFallbackPolling } from "@/lib/realtime";
-import {
-  formatAge as formatAgeLabel,
-  formatDateTime as formatDateTimeLabel,
-  formatDisplayValue,
-  formatNotional,
-  formatOpenTimeLabel,
-  formatPrice,
-  formatQuantity,
-} from "@/lib/format";
+import { formatAge, formatDateTime, formatNotional } from "@/lib/format";
+import { leaderAddressSuffix } from "@/lib/leaderIdentity";
 
 type AllowedMode = "ALL_COINS" | "CUSTOM_LIST";
 
-type ExecutionAccountOption = {
+type ExecutionAccount = {
   route_value: string;
   account_address: string | null;
   account_type: "MAIN" | "SUBACCOUNT";
@@ -47,885 +38,208 @@ type Leader = {
   max_total_notional: string | null;
   preferred_venue: string;
   fallback_venue: string;
-  enabled_venues: string[];
   hyperliquid_vault_address: string | null;
   watcher_status: string;
   last_state_update: string | null;
   positions_loaded: boolean;
   current_allocations_count: number;
   open_allocations_notional: string;
-  baseline_rows_count: number;
   waiting_until_flat_count: number;
 };
 
-type LeaderEdit = {
-  enabled: boolean;
+type LeaderState = {
+  leader: { id: number };
+  account_value: string | null;
+  total_ntl_pos: string | null;
+  data_age_ms: number | null;
+  stale: boolean;
+  error_message: string | null;
+  position_count?: number;
+  positions: Array<{ coin: string; canonical_coin?: string | null; side: string; notional: string | null }>;
+};
+
+type Edit = {
   copy_multiplier: string;
   fixed_account_value: string;
+  route: string;
   allowed_mode: AllowedMode;
   allowed_symbols: string;
   blocked_symbols: string;
   max_notional_per_trade: string;
   max_total_notional: string;
-  preferred_venue: string;
-  fallback_venue: string;
-  hyperliquid_vault_address: string;
 };
 
-type LeaderAccountState = {
-  address: string | null;
-  dex?: string | null;
-  dex_display_name?: string | null;
-  account_value: string | null;
-  account_value_used_for_sizing?: string | null;
-  account_value_source?: string | null;
-  account_abstraction_mode?: string | null;
-  balance_source?: string | null;
-  available_collateral_used_for_margin_check?: string | null;
-  withdrawable: string | null;
-  total_ntl_pos: string | null;
-  data_age_ms: number | null;
-  stale: boolean;
-  error_message: string | null;
-  positions: Array<{
-    dex?: string | null;
-    dex_display_name?: string | null;
-    coin: string;
-    canonical_coin?: string | null;
-    product_type?: string | null;
-    side: string;
-    size: string | null;
-    notional: string | null;
-    entry_px: string | null;
-    mark_px: string | null;
-    mid_px?: string | null;
-    mark_price_stale?: boolean | null;
-    open_time?: string | null;
-    first_seen_at?: string | null;
-    open_time_source?: string | null;
-    updated_at?: string | null;
-    data_age_ms?: number | null;
-    unrealized_pnl?: string | null;
-    copyable?: boolean;
-    coin_allowed?: boolean;
-    venue_route?: string | null;
-    copy_reason?: string;
-    copy_status?: string | null;
-    last_copy_order_display_status?: string | null;
-    last_copy_order_reason?: string | null;
-    baseline_status?: string | null;
-    baseline_id?: number | null;
-  }>;
-  position_count?: number;
-  dex_states?: LeaderAccountState[];
-  leader: { id: number };
-};
-
-const LEADER_OVERVIEW_REALTIME_MIN_INTERVAL_MS = 15_000;
+type NewLeader = Edit & { address: string };
+const EMPTY_NEW: NewLeader = { address: "", copy_multiplier: "1", fixed_account_value: "", route: "", allowed_mode: "ALL_COINS", allowed_symbols: "", blocked_symbols: "", max_notional_per_trade: "", max_total_notional: "" };
+const LEADER_OVERVIEW_REFRESH_INTERVAL_MS = 60_000;
 
 export default function LeadersPage() {
   const [leaders, setLeaders] = useState<Leader[]>([]);
-  const [executionAccounts, setExecutionAccounts] = useState<ExecutionAccountOption[]>([]);
-  const [accountStates, setAccountStates] = useState<Record<number, LeaderAccountState>>({});
+  const [accounts, setAccounts] = useState<ExecutionAccount[]>([]);
+  const [states, setStates] = useState<Record<number, LeaderState>>({});
+  const [edits, setEdits] = useState<Record<number, Edit>>({});
   const [performance, setPerformance] = useState<LeaderPerformanceOverview | null>(null);
-  const [edits, setEdits] = useState<Record<number, LeaderEdit>>({});
-  const [address, setAddress] = useState("");
-  const [replaceAddress, setReplaceAddress] = useState("");
-  const [replaceFixedAccountValue, setReplaceFixedAccountValue] = useState("");
-  const [replaceExecutionAccount, setReplaceExecutionAccount] = useState("");
-  const [multiplier, setMultiplier] = useState("0.1");
-  const [fixedAccountValue, setFixedAccountValue] = useState("");
-  const [executionAccount, setExecutionAccount] = useState("");
-  const [allowedMode, setAllowedMode] = useState<AllowedMode>("ALL_COINS");
-  const [allowedSymbols, setAllowedSymbols] = useState("");
-  const [blockedSymbols, setBlockedSymbols] = useState("");
-  const [preferredVenue, setPreferredVenue] = useState("HYPERLIQUID");
-  const [fallbackVenue, setFallbackVenue] = useState("NONE");
-  const [maxPerTrade, setMaxPerTrade] = useState("");
-  const [maxTotal, setMaxTotal] = useState("");
+  const [newLeader, setNewLeader] = useState<NewLeader>(EMPTY_NEW);
+  const [showAdd, setShowAdd] = useState(false);
   const [showDeleted, setShowDeleted] = useState(false);
-  const [error, setError] = useState("");
+  const [accountFilter, setAccountFilter] = useState("ALL");
   const [busy, setBusy] = useState<number | "new" | null>(null);
-  const [lastSavedLeaderId, setLastSavedLeaderId] = useState<number | null>(null);
-  const [lastRefreshedAt, setLastRefreshedAt] = useState<string | null>(null);
-  const realtimeRefreshTimerRef = useRef<number | null>(null);
-  const realtimeRefreshRunningRef = useRef(false);
-  const realtimeRefreshQueuedRef = useRef(false);
-  const realtimeRefreshLastStartedAtRef = useRef(0);
-  const saveFeedbackTimerRef = useRef<number | null>(null);
+  const [saved, setSaved] = useState<number | null>(null);
+  const [error, setError] = useState("");
+  const [lastRefreshed, setLastRefreshed] = useState<string | null>(null);
+  const refreshRunning = useRef(false);
 
-  async function load(options?: { preserveEdits?: boolean; includePerformance?: boolean }) {
-    setError("");
-    const [rows, accounts, executionAccountOptions, performancePayload] = await Promise.all([
-      apiFetch<Leader[]>(`/leaders?include_deleted=${showDeleted ? "true" : "false"}`),
-      apiFetch<LeaderAccountState[]>("/account-states/leaders?compact=true").catch(() => []),
-      apiFetch<ExecutionAccountOption[]>("/leaders/execution-accounts"),
-      options?.includePerformance
-        ? apiFetch<LeaderPerformanceOverview>("/leaders/performance").catch(() => null)
-        : Promise.resolve(undefined),
-    ]);
-    setLeaders(rows);
-    setExecutionAccounts(executionAccountOptions);
-    setAccountStates(Object.fromEntries(accounts.map((item) => [item.leader.id, item])));
-    if (performancePayload !== undefined) setPerformance(performancePayload);
-    setEdits((current) => {
-      const nextDefaults = Object.fromEntries(rows.map((leader) => [leader.id, editFromLeader(leader)]));
-      if (!options?.preserveEdits) return nextDefaults;
-      return Object.fromEntries(
-        rows.map((leader) => [leader.id, current[leader.id] ?? nextDefaults[leader.id]])
-      );
-    });
-    setLastRefreshedAt(new Date().toISOString());
+  async function load(options: { preserveEdits?: boolean; performance?: boolean } = {}) {
+    if (refreshRunning.current) return;
+    refreshRunning.current = true;
+    try {
+      const [leaderRows, accountRows, stateRows, performancePayload] = await Promise.all([
+        apiFetch<Leader[]>(`/leaders?include_deleted=${showDeleted ? "true" : "false"}`),
+        apiFetch<ExecutionAccount[]>("/leaders/execution-accounts"),
+        apiFetch<LeaderState[]>("/account-states/leaders?compact=true").catch(() => []),
+        options.performance ? apiFetch<LeaderPerformanceOverview>("/leaders/performance").catch(() => null) : Promise.resolve(undefined),
+      ]);
+      setLeaders(leaderRows);
+      setAccounts(accountRows);
+      setStates(Object.fromEntries(stateRows.map((state) => [state.leader.id, state])));
+      setEdits((current) => Object.fromEntries(leaderRows.map((leader) => [leader.id, options.preserveEdits && current[leader.id] ? current[leader.id] : editFrom(leader)])));
+      if (performancePayload !== undefined) setPerformance(performancePayload);
+      setLastRefreshed(new Date().toISOString());
+      setError("");
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      refreshRunning.current = false;
+    }
   }
-
-  function scheduleRealtimeRefresh(delayMs = 750) {
-    realtimeRefreshQueuedRef.current = true;
-    if (realtimeRefreshRunningRef.current || realtimeRefreshTimerRef.current !== null) return;
-    const elapsedSinceLastRefresh = Date.now() - realtimeRefreshLastStartedAtRef.current;
-    const throttledDelayMs = Math.max(
-      delayMs,
-      LEADER_OVERVIEW_REALTIME_MIN_INTERVAL_MS - elapsedSinceLastRefresh,
-    );
-    realtimeRefreshTimerRef.current = window.setTimeout(async () => {
-      realtimeRefreshTimerRef.current = null;
-      if (!realtimeRefreshQueuedRef.current || realtimeRefreshRunningRef.current) return;
-      realtimeRefreshQueuedRef.current = false;
-      realtimeRefreshRunningRef.current = true;
-      realtimeRefreshLastStartedAtRef.current = Date.now();
-      try {
-        await load({ preserveEdits: true });
-      } catch (err) {
-        setError(errorMessage(err));
-      } finally {
-        realtimeRefreshRunningRef.current = false;
-        // Collapse an event burst into one trailing refresh. The leaders page
-        // must never fan out one request set per SSE event or reconnect-poll tick.
-        if (realtimeRefreshQueuedRef.current) scheduleRealtimeRefresh(0);
-      }
-    }, Math.max(0, throttledDelayMs));
-  }
-
-  const realtime = useDashboardStream({
-    onEvent: (event) => {
-      if (["leader_state_update", "positions_update", "baseline_status_update", "allocation_status_update"].includes(event.event_type)) {
-        scheduleRealtimeRefresh();
-      }
-    },
-  });
 
   useEffect(() => {
-    load({ includePerformance: true }).catch((err) => setError(errorMessage(err)));
+    void load({ performance: true });
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void load({ preserveEdits: true, performance: true });
+    }, LEADER_OVERVIEW_REFRESH_INTERVAL_MS);
+    return () => window.clearInterval(timer);
   }, [showDeleted]);
-  useEffect(() => () => {
-    if (realtimeRefreshTimerRef.current !== null) window.clearTimeout(realtimeRefreshTimerRef.current);
-    if (saveFeedbackTimerRef.current !== null) window.clearTimeout(saveFeedbackTimerRef.current);
-  }, []);
-  useRealtimeFallbackPolling(realtime, () => scheduleRealtimeRefresh(0));
 
-  async function submit(event: FormEvent) {
+  async function addLeader(event: FormEvent) {
     event.preventDefault();
-    setBusy("new");
-    setError("");
+    setBusy("new"); setError("");
     try {
-      await apiFetch<Leader>("/leaders", {
-        method: "POST",
-        body: JSON.stringify({
-          leader_address: address,
-          copy_multiplier: decimalInputValue(multiplier),
-          fixed_account_value: decimalInputValue(fixedAccountValue),
-          allowed_symbols: allowedMode === "ALL_COINS" ? null : splitList(allowedSymbols),
-          blocked_symbols: splitList(blockedSymbols),
-          preferred_venue: preferredVenue,
-          fallback_venue: fallbackVenue,
-          enabled_venues: enabledVenues(preferredVenue),
-          max_notional_per_trade: emptyDecimalToNull(maxPerTrade),
-          max_total_notional: emptyDecimalToNull(maxTotal),
-          hyperliquid_vault_address: executionAccount.trim() || null
-        })
-      });
-      setAddress("");
-      setFixedAccountValue("");
-      setExecutionAccount("");
-      setAllowedMode("ALL_COINS");
-      setAllowedSymbols("");
-      setBlockedSymbols("");
-      setMaxPerTrade("");
-      setMaxTotal("");
-      await load();
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function replaceActiveLeader(event: FormEvent) {
-    event.preventDefault();
-    const confirmed = window.confirm("Replace all active leaders in the selected execution account. The other account is untouched, and existing copied positions are not closed automatically.");
-    if (!confirmed) return;
-    setBusy("new");
-    setError("");
-    try {
-      await apiFetch<Leader>("/leaders/replace-active", {
-        method: "POST",
-        body: JSON.stringify({
-          leader_address: replaceAddress,
-          fixed_account_value: decimalInputValue(replaceFixedAccountValue),
-          hyperliquid_vault_address: replaceExecutionAccount || null
-        })
-      });
-      setReplaceAddress("");
-      setReplaceFixedAccountValue("");
-      setReplaceExecutionAccount("");
-      await load();
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(null);
-    }
+      await apiFetch("/leaders", { method: "POST", body: JSON.stringify(payloadFromNew(newLeader)) });
+      setNewLeader(EMPTY_NEW); setShowAdd(false);
+      await load({ performance: true });
+    } catch (err) { setError(message(err)); } finally { setBusy(null); }
   }
 
   async function saveLeader(leader: Leader) {
-    const edit = edits[leader.id];
-    if (!edit) return;
-    setBusy(leader.id);
-    setError("");
+    const edit = edits[leader.id]; if (!edit) return;
+    setBusy(leader.id); setError("");
     try {
-      const savedLeader = await apiFetch<Leader>(`/leaders/${leader.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({
-          enabled: edit.enabled,
-          copy_multiplier: decimalInputValue(edit.copy_multiplier),
-          fixed_account_value: decimalInputValue(edit.fixed_account_value),
-          allowed_symbols: edit.allowed_mode === "ALL_COINS" ? null : splitList(edit.allowed_symbols),
-          blocked_symbols: splitList(edit.blocked_symbols),
-          preferred_venue: edit.preferred_venue,
-          fallback_venue: edit.fallback_venue,
-          enabled_venues: enabledVenues(edit.preferred_venue),
-          max_notional_per_trade: emptyDecimalToNull(edit.max_notional_per_trade),
-          max_total_notional: emptyDecimalToNull(edit.max_total_notional),
-          hyperliquid_vault_address: edit.hyperliquid_vault_address.trim() || null
-        })
-      });
-      // PATCH already returns the committed server representation. Apply it
-      // directly so Save does not wait for the unrelated 1.8MB account-state
-      // and performance refreshes before re-enabling the button.
-      setLeaders((current) => current.map((item) => item.id === savedLeader.id ? savedLeader : item));
-      setEdits((current) => ({ ...current, [savedLeader.id]: editFromLeader(savedLeader) }));
-      setLastRefreshedAt(new Date().toISOString());
-      setLastSavedLeaderId(savedLeader.id);
-      if (saveFeedbackTimerRef.current !== null) window.clearTimeout(saveFeedbackTimerRef.current);
-      saveFeedbackTimerRef.current = window.setTimeout(() => {
-        setLastSavedLeaderId((current) => current === savedLeader.id ? null : current);
-      }, 3000);
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(null);
-    }
+      const row = await apiFetch<Leader>(`/leaders/${leader.id}`, { method: "PATCH", body: JSON.stringify(payloadFromEdit(edit)) });
+      setLeaders((current) => current.map((item) => item.id === row.id ? row : item));
+      setEdits((current) => ({ ...current, [row.id]: editFrom(row) }));
+      setSaved(row.id); window.setTimeout(() => setSaved((value) => value === row.id ? null : value), 2_500);
+    } catch (err) { setError(message(err)); } finally { setBusy(null); }
   }
 
-  async function toggleLeader(leader: Leader) {
-    setBusy(leader.id);
-    setError("");
-    try {
-      await apiFetch<Leader>(`/leaders/${leader.id}/${leader.enabled && !leader.deleted_at ? "disable" : "enable"}`, {
-        method: "POST",
-        body: "{}"
-      });
-      await load();
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(null);
-    }
+  async function toggle(leader: Leader) {
+    setBusy(leader.id); setError("");
+    try { await apiFetch(`/leaders/${leader.id}/${leader.enabled && !leader.deleted_at ? "disable" : "enable"}`, { method: "POST", body: "{}" }); await load(); }
+    catch (err) { setError(message(err)); } finally { setBusy(null); }
   }
 
-  async function deleteLeader(leader: Leader) {
-    const confirmed = window.confirm("删除后将停止复制该 leader 的新交易，但不会自动平掉已有仓位。");
-    if (!confirmed) return;
-    setBusy(leader.id);
-    setError("");
-    try {
-      await apiFetch<Leader>(`/leaders/${leader.id}`, {
-        method: "DELETE",
-        body: JSON.stringify({ delete_reason: "deleted from Leaders page" })
-      });
-      await load();
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(null);
-    }
+  async function remove(leader: Leader) {
+    if (!window.confirm("Delete this leader? Existing copied positions are not closed automatically.")) return;
+    setBusy(leader.id); setError("");
+    try { await apiFetch(`/leaders/${leader.id}`, { method: "DELETE", body: JSON.stringify({ delete_reason: "deleted from Leader Desk" }) }); await load({ performance: true }); }
+    catch (err) { setError(message(err)); } finally { setBusy(null); }
   }
 
-  const activeCount = useMemo(
-    () => leaders.filter((leader) => leader.enabled && !leader.deleted_at).length,
-    [leaders]
-  );
+  const visible = useMemo(() => leaders.filter((leader) => accountFilter === "ALL" || route(leader.hyperliquid_vault_address) === accountFilter), [leaders, accountFilter]);
+  const enabled = leaders.filter((leader) => leader.enabled && !leader.deleted_at).length;
 
   return (
     <AppShell>
-      <Header
-        title="Leaders"
-        right={
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-slate-500">
-              {lastRefreshedAt ? `Refreshed ${formatDate(lastRefreshedAt)}` : "Waiting for first refresh"}
-            </span>
-            <span className={realtime.connected ? "rounded-md border border-green-200 bg-green-50 px-2 py-1 text-xs text-accent" : "rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-warn"}>
-              realtime mode: {realtime.mode}
-            </span>
-            <label className="flex h-10 items-center gap-2 rounded-md border border-line bg-white px-3 text-sm text-slate-600">
-              <input type="checkbox" checked={showDeleted} onChange={(e) => setShowDeleted(e.target.checked)} />
-              Show deleted
-            </label>
-            <button className="btn btn-muted" type="button" onClick={() => load({ includePerformance: true }).catch((err) => setError(errorMessage(err)))}>
-              <RefreshCw className="h-4 w-4" />
-              Refresh
-            </button>
-          </div>
-        }
-      />
-      {error ? <div className="mb-4 text-sm text-danger">{error}</div> : null}
+      <Header eyebrow="Configuration" title="Leader Desk" subtitle="Assign leaders to an execution account and change sizing without digging through diagnostic pages." right={<><span className="status-pill border-slate-200 bg-slate-50 text-slate-600">DB snapshot · 60s</span><button className="btn btn-muted" type="button" onClick={() => void load({ performance: true })}><RefreshCw className="h-4 w-4" />Refresh</button><button className="btn btn-primary" type="button" onClick={() => setShowAdd(true)}><Plus className="h-4 w-4" />Add leader</button></>} />
+      {error ? <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-danger">{error}</div> : null}
 
-      <LeaderPerformanceOverviewPanel data={performance} />
+      <div className="mb-6"><LeaderPerformanceOverviewPanel data={performance} /></div>
 
-      <section className="panel mb-4 p-4 text-sm">
-        <div className="grid gap-3 md:grid-cols-4">
-          <Metric label="Source of truth" value="Database" />
-          <Metric label="Enabled leaders" value={String(activeCount)} />
-          <Metric label="Runtime updates" value="Coalesced realtime refresh" />
-          <Metric label="Allowed coins" value="ALL_COINS by default" />
+      <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <Summary icon={<UsersRound />} label="Enabled leaders" value={String(enabled)} detail={`${leaders.length} visible configs`} />
+        <Summary icon={<WalletCards />} label="Execution routes" value={String(accounts.length)} detail={`${accounts.filter((account) => account.watcher_running).length} watchers online`} />
+        <Summary icon={<Settings2 />} label="Sizing model" value="Account ratio" detail="Increases and reductions follow position ratio" />
+        <Summary icon={<RefreshCw />} label="Last synchronized" value={formatDateTime(lastRefreshed)} detail="Read-only database snapshot" />
+      </div>
+
+      <section className="panel mb-5 overflow-hidden">
+        <div className="flex flex-col gap-3 border-b border-line px-5 py-4 lg:flex-row lg:items-center lg:justify-between">
+          <div><h2 className="section-title">Account assignment</h2><p className="section-copy">Main and subaccount watchers remain completely isolated.</p></div>
+          <div className="flex flex-wrap gap-2"><FilterButton active={accountFilter === "ALL"} onClick={() => setAccountFilter("ALL")}>All · {leaders.length}</FilterButton>{accounts.map((account) => <FilterButton key={account.route_value || "main"} active={accountFilter === route(account.route_value)} onClick={() => setAccountFilter(route(account.route_value))}>{account.account_type === "MAIN" ? "Main" : `Sub · ${account.account_address?.slice(-4)}`} · {leaders.filter((leader) => route(leader.hyperliquid_vault_address) === route(account.route_value)).length}</FilterButton>)}</div>
         </div>
-        <p className="mt-3 text-slate-600">
-          Add leader addresses here. The optional .env bootstrap seed is only for first import when the database is empty. All coins means all enabled Hyperliquid DEX markets, including XYZ / TradFi markets.
-        </p>
-        <p className="mt-2 text-slate-600">
-          Account value used is fixed per leader and sizes only a new position lifecycle. Copy multiplier scales that initial account-risk ratio; later increases and reductions follow position-size ratios.
-        </p>
-        <div className="mt-4 grid gap-3 md:grid-cols-2">
-          {executionAccounts.map((account) => (
-            <div key={account.account_type === "MAIN" ? "main" : account.route_value} className="rounded-md border border-line bg-panel px-3 py-2">
-              <div className="flex items-center justify-between gap-3">
-                <span className="font-medium text-ink">{account.label}</span>
-                <span className={account.watcher_running ? "text-accent" : "text-warn"}>
-                  worker {account.watcher_running ? "running" : "not running"}
-                </span>
-              </div>
-              <div className="mt-1 break-all font-mono text-xs text-slate-500">{account.account_address ?? "Address unavailable"}</div>
-              <div className="mt-1 text-xs text-slate-500">Active leaders: {account.active_leaders.length}</div>
-            </div>
-          ))}
+        <div className="grid gap-px bg-line lg:grid-cols-2">
+          {accounts.map((account) => <AccountStrip key={account.route_value || "main"} account={account} leaders={leaders.filter((leader) => route(leader.hyperliquid_vault_address) === route(account.route_value))} />)}
         </div>
       </section>
 
-      <form onSubmit={replaceActiveLeader} className="panel mb-4 grid gap-3 p-4 md:grid-cols-[minmax(220px,1fr)_220px_minmax(260px,1fr)_auto]">
-        <input className="field" value={replaceAddress} onChange={(e) => setReplaceAddress(e.target.value)} placeholder="New leader address 0x..." required />
-        <input
-          className="field"
-          inputMode="decimal"
-          value={replaceFixedAccountValue}
-          onChange={(e) => setReplaceFixedAccountValue(e.target.value)}
-          placeholder="Account value used (USDC)"
-          required
-        />
-        <ExecutionAccountSelect
-          value={replaceExecutionAccount}
-          options={executionAccounts}
-          onChange={setReplaceExecutionAccount}
-          ariaLabel="Execution account for replacement"
-        />
-        <button className="btn btn-danger" type="submit" disabled={busy === "new"}>
-          <RefreshCw className="h-4 w-4" />
-          Replace in this account
-        </button>
-      </form>
+      {showAdd ? <AddLeaderPanel value={newLeader} accounts={accounts} busy={busy === "new"} onChange={(patch) => setNewLeader((current) => ({ ...current, ...patch }))} onClose={() => setShowAdd(false)} onSubmit={addLeader} /> : null}
 
-      <form onSubmit={submit} className="panel mb-4 grid gap-3 p-4 lg:grid-cols-[minmax(220px,1.5fr)_130px_180px_150px_minmax(180px,1fr)]">
-        <input className="field" value={address} onChange={(e) => setAddress(e.target.value)} placeholder="Leader address 0x..." required />
-        <input className="field" value={multiplier} onChange={(e) => setMultiplier(e.target.value)} placeholder="0.1" />
-        <input
-          className="field"
-          inputMode="decimal"
-          value={fixedAccountValue}
-          onChange={(e) => setFixedAccountValue(e.target.value)}
-          placeholder="Account value used (USDC)"
-          required
-        />
-        <select className="field" value={allowedMode} onChange={(e) => setAllowedMode(e.target.value as AllowedMode)}>
-          <option value="ALL_COINS">All coins</option>
-          <option value="CUSTOM_LIST">Custom allowlist</option>
-        </select>
-        <input
-          className="field"
-          value={allowedSymbols}
-          onChange={(e) => setAllowedSymbols(e.target.value)}
-          placeholder={allowedMode === "ALL_COINS" ? "All enabled DEX markets" : "canonical coins, e.g. xyz:HYUNDAI"}
-          disabled={allowedMode === "ALL_COINS"}
-        />
-        <input className="field" value={blockedSymbols} onChange={(e) => setBlockedSymbols(e.target.value)} placeholder="blocked coins, optional" />
-        <ExecutionAccountSelect
-          value={executionAccount}
-          options={executionAccounts}
-          onChange={setExecutionAccount}
-          ariaLabel="Execution account for new leader"
-        />
-        <select className="field" value={preferredVenue} onChange={(e) => setPreferredVenue(e.target.value)}>
-          <option value="HYPERLIQUID">HYPERLIQUID</option>
-          <option value="BINANCE">BINANCE</option>
-          <option value="AUTO">AUTO</option>
-        </select>
-        <select className="field" value={fallbackVenue} onChange={(e) => setFallbackVenue(e.target.value)}>
-          <option value="NONE">NONE</option>
-          <option value="BINANCE">BINANCE</option>
-          <option value="HYPERLIQUID">HYPERLIQUID</option>
-        </select>
-        <input
-          className="field"
-          inputMode="decimal"
-          value={maxPerTrade}
-          onChange={(e) => setMaxPerTrade(e.target.value)}
-          placeholder="max per-coin position USDC"
-        />
-        <input
-          className="field"
-          inputMode="decimal"
-          value={maxTotal}
-          onChange={(e) => setMaxTotal(e.target.value)}
-          placeholder="max total notional USDC"
-        />
-        <button className="btn btn-primary" type="submit" disabled={busy === "new"}>
-          <Plus className="h-4 w-4" />
-          Add
-        </button>
-      </form>
-
-      <div className="space-y-4">
-        {leaders.length ? (
-          leaders.map((leader) => (
-            <LeaderRow
-              key={leader.id}
-              leader={leader}
-              accountState={accountStates[leader.id]}
-              edit={edits[leader.id] ?? editFromLeader(leader)}
-              executionAccounts={executionAccounts}
-              busy={busy === leader.id}
-              saved={lastSavedLeaderId === leader.id}
-              onEdit={(patch) => setEdits((current) => ({ ...current, [leader.id]: { ...(current[leader.id] ?? editFromLeader(leader)), ...patch } }))}
-              onSave={() => saveLeader(leader)}
-              onToggle={() => toggleLeader(leader)}
-              onDelete={() => deleteLeader(leader)}
-            />
-          ))
-        ) : (
-          <section className="panel p-4 text-sm text-slate-500">No leaders configured</section>
-        )}
+      <div className="mb-6 space-y-3">
+        <div className="flex items-center justify-between"><div><h2 className="section-title">Leader configuration</h2><p className="section-copy">Multiplier and fixed balance are always visible; less common controls stay in Advanced.</p></div><label className="flex items-center gap-2 text-xs text-slate-500"><input type="checkbox" checked={showDeleted} onChange={(event) => setShowDeleted(event.target.checked)} />Show deleted</label></div>
+        {visible.map((leader) => <LeaderCard key={leader.id} leader={leader} account={accountFor(accounts, leader.hyperliquid_vault_address)} state={states[leader.id]} edit={edits[leader.id] ?? editFrom(leader)} busy={busy === leader.id} saved={saved === leader.id} accounts={accounts} onEdit={(patch) => setEdits((current) => ({ ...current, [leader.id]: { ...(current[leader.id] ?? editFrom(leader)), ...patch } }))} onSave={() => void saveLeader(leader)} onToggle={() => void toggle(leader)} onDelete={() => void remove(leader)} />)}
+        {!visible.length ? <div className="panel p-8 text-center text-sm text-slate-500">No leaders in this account filter.</div> : null}
       </div>
+
+      <ResearchLab />
     </AppShell>
   );
 }
 
-function LeaderRow({
-  leader,
-  accountState,
-  edit,
-  executionAccounts,
-  busy,
-  saved,
-  onEdit,
-  onSave,
-  onToggle,
-  onDelete
-}: {
-  leader: Leader;
-  accountState?: LeaderAccountState;
-  edit: LeaderEdit;
-  executionAccounts: ExecutionAccountOption[];
-  busy: boolean;
-  saved: boolean;
-  onEdit: (patch: Partial<LeaderEdit>) => void;
-  onSave: () => void;
-  onToggle: () => void;
-  onDelete: () => void;
-}) {
-  const appliedBlockedSymbols = leader.blocked_symbols ?? [];
-  const blockedSymbolsHaveUnsavedChanges = !sameSymbolSet(
-    appliedBlockedSymbols,
-    splitList(edit.blocked_symbols),
-  );
-  const appliedExecutionAccount = executionAccountForRoute(
-    executionAccounts,
-    leader.hyperliquid_vault_address ?? "",
-  );
-
-  return (
-    <section className="panel overflow-hidden">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
-        <div className="min-w-0">
-          <div className="text-sm font-semibold text-ink">{leaderDisplayLabel(leader.leader_address)}</div>
-          <div className="mt-1 break-all font-mono text-xs text-slate-500">{leader.leader_address}</div>
-          <div className="mt-1 flex flex-wrap gap-2 text-xs">
-            <StatusText label={leader.deleted_at ? "deleted" : leader.enabled ? "enabled" : "disabled"} tone={leader.deleted_at ? "danger" : leader.enabled ? "ok" : "warn"} />
-            <StatusText label={`watcher ${leader.watcher_status}`} tone={leader.watcher_status === "active" ? "ok" : leader.watcher_status === "disabled" ? "warn" : "danger"} />
-            <StatusText label={appliedExecutionAccount.label} tone={appliedExecutionAccount.account_type === "MAIN" ? "ok" : "warn"} />
-            <StatusText label={leader.allowed_coins_mode} tone={leader.allowed_coins_mode === "ALL_COINS" ? "ok" : "warn"} />
-          </div>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <button className="btn btn-muted" type="button" onClick={onToggle} disabled={busy} title={leader.enabled && !leader.deleted_at ? "Disable" : "Enable"}>
-            <Power className="h-4 w-4" />
-            {leader.enabled && !leader.deleted_at ? "Disable" : "Enable"}
-          </button>
-          <Link className="btn btn-muted" href={`/leaders/${leader.id}`}>
-            Details
-          </Link>
-          <button className="btn btn-muted" type="button" onClick={onSave} disabled={busy} title="Save">
-            <Save className="h-4 w-4" />
-            {busy ? "Saving..." : saved ? "Saved" : "Save"}
-          </button>
-          <button className="btn btn-danger" type="button" onClick={onDelete} disabled={busy || Boolean(leader.deleted_at)} title="Delete">
-            <Trash2 className="h-4 w-4" />
-            Delete
-          </button>
-        </div>
+function LeaderCard({ leader, account, state, edit, busy, saved, accounts, onEdit, onSave, onToggle, onDelete }: { leader: Leader; account: ExecutionAccount; state?: LeaderState; edit: Edit; busy: boolean; saved: boolean; accounts: ExecutionAccount[]; onEdit: (patch: Partial<Edit>) => void; onSave: () => void; onToggle: () => void; onDelete: () => void }) {
+  const dirty = JSON.stringify(edit) !== JSON.stringify(editFrom(leader));
+  const active = leader.enabled && !leader.deleted_at;
+  return <article className={`panel overflow-hidden ${!active ? "opacity-80" : ""}`}>
+    <div className="flex flex-col gap-4 px-5 py-4 xl:flex-row xl:items-center xl:justify-between">
+      <div className="min-w-0 xl:w-[32%]"><div className="flex flex-wrap items-center gap-2"><span className="font-mono text-base font-semibold text-ink">{leaderAddressSuffix(leader.leader_address)}</span><Status value={leader.deleted_at ? "DELETED" : leader.enabled ? "ENABLED" : "DISABLED"} /><Status value={leader.watcher_status} /></div><div className="mt-1 break-all font-mono text-[11px] text-slate-400">{leader.leader_address}</div><div className="mt-2 flex items-center gap-2 text-xs text-slate-500"><WalletCards className="h-3.5 w-3.5" />{account.label}<span>·</span><span>{state?.positions?.length ?? 0} positions</span><span>·</span><span className={state?.stale ? "text-warn" : "text-accent"}>{formatAge(state?.data_age_ms)}</span></div></div>
+      <div className="grid flex-1 gap-3 sm:grid-cols-2 xl:max-w-[560px]">
+        <label className="space-y-1"><span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Multiplier</span><div className="relative"><input className="field pr-8 font-semibold" inputMode="decimal" value={edit.copy_multiplier} onChange={(event) => onEdit({ copy_multiplier: event.target.value })} /><span className="absolute right-3 top-2.5 text-sm text-slate-400">×</span></div></label>
+        <label className="space-y-1"><span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Fixed leader balance</span><input className="field font-semibold" inputMode="decimal" value={edit.fixed_account_value} onChange={(event) => onEdit({ fixed_account_value: event.target.value })} /></label>
       </div>
-
-      <div className="grid gap-3 p-4 text-sm md:grid-cols-4">
-        <Metric label="Last state update" value={formatDate(leader.last_state_update)} />
-        <Metric label="Positions loaded" value={String(leader.positions_loaded)} />
-        <Metric label="Allocations" value={String(leader.current_allocations_count)} />
-        <Metric label="Open notional" value={leader.open_allocations_notional} />
-        <Metric label="Ignored existing" value={String(leader.waiting_until_flat_count)} />
-        <Metric label="Baseline rows" value={String(leader.baseline_rows_count)} />
-        <Metric label="Account value used" value={leader.fixed_account_value ?? "--"} />
-        <Metric
-          label="Execution account"
-          value={`${appliedExecutionAccount.label}${appliedExecutionAccount.account_address ? ` · ${appliedExecutionAccount.account_address}` : ""}`}
-        />
-        <Metric label="Position notional" value={accountState?.total_ntl_pos ?? "--"} />
-        <Metric label="State age" value={formatAge(accountState?.data_age_ms)} />
-        <Metric label="Default / xyz positions" value={`${dexPositionCount(accountState, "")} / ${dexPositionCount(accountState, "xyz")}`} />
-      </div>
-      {accountState?.error_message ? <div className="border-t border-line px-4 py-3 text-sm text-danger">{accountState.error_message}</div> : null}
-      {accountState?.positions.length ? (
-        <table className="data-table border-t text-xs">
-          <thead className="bg-panel text-slate-500">
-            <tr>
-              <th className="px-4 py-2">Coin</th>
-              <th className="px-4 py-2">DEX</th>
-              <th className="px-4 py-2">Product</th>
-              <th className="px-4 py-2">Side</th>
-              <th className="px-4 py-2">Size</th>
-              <th className="px-4 py-2">Notional</th>
-              <th className="px-4 py-2">Entry Price</th>
-              <th className="px-4 py-2">Mark Price</th>
-              <th className="px-4 py-2">Mid Price</th>
-              <th className="px-4 py-2">PnL</th>
-              <th className="px-4 py-2">Open Time</th>
-              <th className="px-4 py-2">Updated</th>
-              <th className="px-4 py-2">Copy</th>
-              <th className="px-4 py-2">Copy Status</th>
-              <th className="px-4 py-2">Route</th>
-            </tr>
-          </thead>
-          <tbody>
-            {accountState.positions.map((position) => (
-              <tr key={`${position.dex ?? ""}-${position.canonical_coin ?? position.coin}-${position.side}`} className="border-t border-line">
-                <td className="px-4 py-2 font-mono">{position.canonical_coin ?? position.coin}</td>
-                <td className="px-4 py-2">{position.dex_display_name ?? position.dex ?? "Hyperliquid"}</td>
-                <td className="px-4 py-2">{position.product_type ?? "unknown"}</td>
-                <td className="px-4 py-2">{position.side}</td>
-                <td className="px-4 py-2">{formatQuantity(position.size)}</td>
-                <td className="px-4 py-2">{formatNotional(position.notional)}</td>
-                <td className="px-4 py-2">{formatPrice(position.entry_px)}</td>
-                <td className={position.mark_price_stale ? "px-4 py-2 text-warn" : "px-4 py-2"}>{formatPrice(position.mark_px)}</td>
-                <td className="px-4 py-2">{formatPrice(position.mid_px)}</td>
-                <td className="px-4 py-2">{formatNotional(position.unrealized_pnl)}</td>
-                <td className="px-4 py-2">{formatOpenTime(position)}</td>
-                <td className="px-4 py-2">{formatDate(position.updated_at ?? null)}</td>
-                <td className={effectiveCopyable(position) ? "px-4 py-2 text-accent" : "px-4 py-2 text-danger"}>{String(effectiveCopyable(position))}</td>
-                <td className="px-4 py-2">
-                  <div className={copyStatusTone(effectiveCopyStatus(position)) === "danger" ? "text-danger" : copyStatusTone(effectiveCopyStatus(position)) === "warn" ? "text-warn" : "text-accent"}>{humanLabel(effectiveCopyStatus(position))}</div>
-                  {effectiveCopyReason(position) ? <div className="max-w-[220px] truncate text-[11px] text-slate-500">{effectiveCopyReason(position)}</div> : null}
-                </td>
-                <td className="px-4 py-2">{position.venue_route ?? "--"}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      ) : null}
-
-      <div className="grid gap-3 border-t border-line p-4 text-sm lg:grid-cols-4">
-        <label className="space-y-1">
-          <span className="text-xs text-slate-500">Enabled</span>
-          <select className="field" value={String(edit.enabled)} onChange={(e) => onEdit({ enabled: e.target.value === "true" })} disabled={Boolean(leader.deleted_at)}>
-            <option value="true">true</option>
-            <option value="false">false</option>
-          </select>
-        </label>
-        <label className="space-y-1">
-          <span className="text-xs text-slate-500">Copy multiplier</span>
-          <input className="field" value={edit.copy_multiplier} onChange={(e) => onEdit({ copy_multiplier: e.target.value })} />
-        </label>
-        <label className="space-y-1">
-          <span className="text-xs text-slate-500">Account value used (USDC)</span>
-          <input
-            className="field"
-            inputMode="decimal"
-            value={edit.fixed_account_value}
-            onChange={(e) => onEdit({ fixed_account_value: e.target.value })}
-            required
-          />
-        </label>
-        <label className="space-y-1">
-          <span className="text-xs text-slate-500">preferred_venue</span>
-          <select className="field" value={edit.preferred_venue} onChange={(e) => onEdit({ preferred_venue: e.target.value })}>
-            <option value="HYPERLIQUID">HYPERLIQUID</option>
-            <option value="BINANCE">BINANCE</option>
-            <option value="AUTO">AUTO</option>
-          </select>
-        </label>
-        <label className="space-y-1">
-          <span className="text-xs text-slate-500">fallback</span>
-          <select className="field" value={edit.fallback_venue} onChange={(e) => onEdit({ fallback_venue: e.target.value })}>
-            <option value="NONE">NONE</option>
-            <option value="BINANCE">BINANCE</option>
-            <option value="HYPERLIQUID">HYPERLIQUID</option>
-          </select>
-        </label>
-        <label className="space-y-1 lg:col-span-2">
-          <span className="text-xs text-slate-500">Execution account (disable before changing)</span>
-          <ExecutionAccountSelect
-            value={edit.hyperliquid_vault_address}
-            options={executionAccounts}
-            onChange={(value) => onEdit({ hyperliquid_vault_address: value })}
-            disabled={leader.enabled && !leader.deleted_at}
-            ariaLabel={`Execution account for ${leader.leader_address}`}
-          />
-          <div className="break-all font-mono text-[11px] text-slate-500">
-            {executionAccountForRoute(executionAccounts, edit.hyperliquid_vault_address).account_address ?? "Main account address unavailable"}
-          </div>
-        </label>
-        <label className="space-y-1">
-          <span className="text-xs text-slate-500">allowed coins mode</span>
-          <select className="field" value={edit.allowed_mode} onChange={(e) => onEdit({ allowed_mode: e.target.value as AllowedMode })}>
-            <option value="ALL_COINS">All coins</option>
-            <option value="CUSTOM_LIST">Custom allowlist</option>
-          </select>
-        </label>
-        <label className="space-y-1">
-          <span className="text-xs text-slate-500">allowed coins</span>
-          <input
-            className="field"
-            value={edit.allowed_symbols}
-            onChange={(e) => onEdit({ allowed_symbols: e.target.value })}
-            placeholder={edit.allowed_mode === "ALL_COINS" ? "All enabled DEX markets" : "canonical coins, e.g. xyz:HYUNDAI"}
-            disabled={edit.allowed_mode === "ALL_COINS"}
-          />
-        </label>
-        <label className="space-y-1">
-          <span className="text-xs text-slate-500">blocked coins</span>
-          <input className="field" value={edit.blocked_symbols} onChange={(e) => onEdit({ blocked_symbols: e.target.value })} placeholder="optional" />
-        </label>
-        <div className="space-y-1 lg:col-span-4">
-          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
-            <span>Currently applied blocked coins ({appliedBlockedSymbols.length})</span>
-            <span className={blockedSymbolsHaveUnsavedChanges ? "text-warn" : "text-accent"}>
-              {blockedSymbolsHaveUnsavedChanges ? "Unsaved changes" : "Saved and applied"}
-            </span>
-          </div>
-          <div className="min-h-10 rounded-md border border-line bg-panel px-3 py-2">
-            {appliedBlockedSymbols.length ? (
-              <div className="flex flex-wrap gap-1.5">
-                {appliedBlockedSymbols.map((symbol) => (
-                  <span key={symbol} className="rounded border border-line bg-surface px-2 py-1 font-mono text-xs text-ink">
-                    {symbol}
-                  </span>
-                ))}
-              </div>
-            ) : (
-              <span className="text-xs text-slate-500">No blocked coins are currently applied.</span>
-            )}
-          </div>
-        </div>
-        <label className="space-y-1">
-          <span className="text-xs text-slate-500">max per-coin position USDC</span>
-          <input
-            className="field"
-            inputMode="decimal"
-            value={edit.max_notional_per_trade}
-            onChange={(e) => onEdit({ max_notional_per_trade: e.target.value })}
-            placeholder="blank = no cap"
-          />
-        </label>
-        <label className="space-y-1">
-          <span className="text-xs text-slate-500">max total notional USDC</span>
-          <input
-            className="field"
-            inputMode="decimal"
-            value={edit.max_total_notional}
-            onChange={(e) => onEdit({ max_total_notional: e.target.value })}
-            placeholder="blank = no cap"
-          />
-        </label>
-        <div className="space-y-1 lg:col-span-2">
-          <div className="text-xs text-slate-500">delete status</div>
-          <div className="min-h-10 rounded-md border border-line bg-panel px-3 py-2 text-sm text-slate-600">
-            {leader.deleted_at ? `${formatDate(leader.deleted_at)} ${leader.delete_reason ?? ""}` : "not deleted"}
-          </div>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function ExecutionAccountSelect({
-  value,
-  options,
-  onChange,
-  disabled = false,
-  ariaLabel,
-}: {
-  value: string;
-  options: ExecutionAccountOption[];
-  onChange: (value: string) => void;
-  disabled?: boolean;
-  ariaLabel: string;
-}) {
-  const normalizedValue = value.trim().toLowerCase();
-  const known = options.some((option) => option.route_value === normalizedValue);
-  return (
-    <select
-      className="field font-mono"
-      value={normalizedValue}
-      onChange={(event) => onChange(event.target.value)}
-      disabled={disabled}
-      aria-label={ariaLabel}
-    >
-      {!options.length ? <option value="">Main account</option> : null}
-      {options.map((option) => (
-        <option key={option.account_type === "MAIN" ? "main" : option.route_value} value={option.route_value}>
-          {option.label} · {option.account_address ?? "address unavailable"}
-        </option>
-      ))}
-      {!known && normalizedValue ? (
-        <option value={normalizedValue}>Unconfigured route · {normalizedValue}</option>
-      ) : null}
-    </select>
-  );
-}
-
-function executionAccountForRoute(
-  options: ExecutionAccountOption[],
-  route: string,
-): ExecutionAccountOption {
-  const normalized = route.trim().toLowerCase();
-  return options.find((option) => option.route_value === normalized) ?? {
-    route_value: normalized,
-    account_address: normalized || null,
-    account_type: normalized ? "SUBACCOUNT" : "MAIN",
-    label: normalized ? `Unconfigured account · ${normalized.slice(-4)}` : "Main account",
-    watcher_running: false,
-    watcher_ready: false,
-    active_leaders: [],
-  };
-}
-
-function editFromLeader(leader: Leader): LeaderEdit {
-  return {
-    enabled: leader.enabled,
-    // Form values must remain machine-parseable. Display formatting inserts
-    // thousands separators (for example 70000 -> "70,000"), which Decimal
-    // fields in the API correctly reject when the whole leader card is saved.
-    copy_multiplier: numericInputValue(leader.copy_multiplier),
-    fixed_account_value: numericInputValue(leader.fixed_account_value),
-    allowed_mode: leader.allowed_coins_mode,
-    allowed_symbols: (leader.allowed_symbols ?? []).join(","),
-    blocked_symbols: (leader.blocked_symbols ?? []).join(","),
-    max_notional_per_trade: leader.max_notional_per_trade ?? "",
-    max_total_notional: leader.max_total_notional ?? "",
-    preferred_venue: leader.preferred_venue,
-    fallback_venue: leader.fallback_venue,
-    hyperliquid_vault_address: leader.hyperliquid_vault_address ?? ""
-  };
-}
-
-function numericInputValue(value: string | number | null | undefined): string {
-  if (value === null || value === undefined) return "";
-  return decimalInputValue(String(value));
-}
-
-function decimalInputValue(value: string): string {
-  return value.replaceAll(",", "").trim();
-}
-
-function splitList(value: string): string[] {
-  return value.split(",").map((item) => item.trim()).filter(Boolean);
-}
-
-function sameSymbolSet(left: string[], right: string[]): boolean {
-  const normalize = (values: string[]) =>
-    [...new Set(values.map((value) => value.trim().toLowerCase()).filter(Boolean))].sort();
-  const normalizedLeft = normalize(left);
-  const normalizedRight = normalize(right);
-  return normalizedLeft.length === normalizedRight.length
-    && normalizedLeft.every((value, index) => value === normalizedRight[index]);
-}
-
-function emptyDecimalToNull(value: string): string | null {
-  const normalized = decimalInputValue(value);
-  return normalized || null;
-}
-
-function enabledVenues(preferred: string): string[] {
-  return preferred === "AUTO" ? ["HYPERLIQUID", "BINANCE"] : [preferred];
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : "Request failed";
-}
-
-function formatDate(value: string | null): string {
-  return formatDateTimeLabel(value);
-}
-
-function formatAge(value: number | null | undefined): string {
-  return formatAgeLabel(value);
-}
-
-function formatOpenTime(position: LeaderAccountState["positions"][number]): string {
-  return formatOpenTimeLabel(position);
-}
-
-function dexPositionCount(state: LeaderAccountState | undefined, dex: string): number {
-  const dexState = state?.dex_states?.find((item) => (item.dex ?? "") === dex);
-  return dexState?.position_count ?? dexState?.positions.length ?? 0;
-}
-
-function humanLabel(value: string | null | undefined): string {
-  if (!value) return "--";
-  return value
-    .toLowerCase()
-    .replaceAll("_", " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
-function Metric({ label, value }: { label: string; value: string | null | undefined }) {
-  return (
-    <div className="mini-card">
-      <div className="mini-label">{label}</div>
-      <div className="mini-value">{formatDisplayValue(value)}</div>
+      <div className="flex shrink-0 flex-wrap gap-2"><button className="btn btn-muted" type="button" onClick={onToggle} disabled={busy}><Power className="h-4 w-4" />{active ? "Disable" : "Enable"}</button><button className={`btn ${dirty ? "btn-primary" : "btn-muted"}`} type="button" onClick={onSave} disabled={busy || Boolean(leader.deleted_at)}><Save className="h-4 w-4" />{busy ? "Saving" : saved ? "Saved" : dirty ? "Save changes" : "Saved"}</button></div>
     </div>
-  );
+    <details className="group border-t border-line">
+      <summary className="flex cursor-pointer list-none items-center justify-between px-5 py-3 text-xs font-semibold text-slate-600 hover:bg-slate-50"><span className="flex items-center gap-2"><Settings2 className="h-4 w-4" />Advanced routing and market controls</span><ChevronDown className="h-4 w-4 transition group-open:rotate-180" /></summary>
+      <div className="grid gap-3 border-t border-line bg-slate-50/60 p-5 md:grid-cols-2 xl:grid-cols-4">
+        <Field label="Execution account"><AccountSelect value={edit.route} accounts={accounts} disabled={active} onChange={(value) => onEdit({ route: value })} /></Field>
+        <Field label="Allowed coins"><select className="field" value={edit.allowed_mode} onChange={(event) => onEdit({ allowed_mode: event.target.value as AllowedMode })}><option value="ALL_COINS">All markets</option><option value="CUSTOM_LIST">Custom allowlist</option></select></Field>
+        <Field label="Allowed symbols"><input className="field" value={edit.allowed_symbols} disabled={edit.allowed_mode === "ALL_COINS"} onChange={(event) => onEdit({ allowed_symbols: event.target.value })} placeholder="BTC,ETH,xyz:…" /></Field>
+        <Field label="Blocked symbols"><input className="field" value={edit.blocked_symbols} onChange={(event) => onEdit({ blocked_symbols: event.target.value })} placeholder="ACE,HMSTR,…" /></Field>
+        <Field label="Max per-coin position"><input className="field" inputMode="decimal" value={edit.max_notional_per_trade} onChange={(event) => onEdit({ max_notional_per_trade: event.target.value })} placeholder="No cap" /></Field>
+        <Field label="Max total notional"><input className="field" inputMode="decimal" value={edit.max_total_notional} onChange={(event) => onEdit({ max_total_notional: event.target.value })} placeholder="No cap" /></Field>
+        <div className="md:col-span-2"><div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Applied blocked coins · {leader.blocked_symbols.length}</div><div className="mt-1.5 flex min-h-10 flex-wrap gap-1.5 rounded-lg border border-line bg-white p-2">{leader.blocked_symbols.length ? leader.blocked_symbols.map((coin) => <span key={coin} className="rounded-md border border-line bg-slate-50 px-2 py-1 font-mono text-[11px] text-slate-600">{coin}</span>) : <span className="p-1 text-xs text-slate-400">None</span>}</div></div>
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line px-5 py-3"><div className="flex gap-5 text-xs text-slate-500"><span>Leader equity <strong className="text-ink">${formatNotional(state?.account_value)}</strong></span><span>Open allocation <strong className="text-ink">${formatNotional(leader.open_allocations_notional)}</strong></span><span>Waiting flat <strong className="text-ink">{leader.waiting_until_flat_count}</strong></span></div><div className="flex gap-2"><Link className="btn btn-muted" href={`/leaders/${leader.id}`}>Full details</Link><button className="btn btn-danger" type="button" onClick={onDelete} disabled={busy || Boolean(leader.deleted_at)}><Trash2 className="h-4 w-4" />Delete</button></div></div>
+    </details>
+  </article>;
 }
 
-function StatusText({ label, tone }: { label: string; tone: "ok" | "warn" | "danger" }) {
-  const color =
-    tone === "ok"
-      ? "border-teal-200 bg-teal-50 text-accent"
-      : tone === "warn"
-      ? "border-amber-200 bg-amber-50 text-warn"
-      : "border-red-200 bg-red-50 text-danger";
-  return <span className={`status-pill ${color}`}>{label}</span>;
+function AddLeaderPanel({ value, accounts, busy, onChange, onClose, onSubmit }: { value: NewLeader; accounts: ExecutionAccount[]; busy: boolean; onChange: (patch: Partial<NewLeader>) => void; onClose: () => void; onSubmit: (event: FormEvent) => void }) {
+  return <section className="panel mb-5 overflow-hidden border-teal-200"><div className="flex items-center justify-between border-b border-line bg-teal-50 px-5 py-4"><div><h2 className="section-title">Add a leader</h2><p className="section-copy">The watcher captures a baseline before the leader becomes active.</p></div><button type="button" onClick={onClose} className="grid h-8 w-8 place-items-center rounded-lg hover:bg-white"><X className="h-4 w-4" /></button></div><form onSubmit={onSubmit} className="p-5"><div className="grid gap-3 lg:grid-cols-[1.6fr_0.65fr_0.9fr_1fr]"><Field label="Public address"><input className="field font-mono" value={value.address} onChange={(event) => onChange({ address: event.target.value })} placeholder="0x…" pattern="0x[0-9a-fA-F]{40}" required /></Field><Field label="Multiplier"><input className="field" inputMode="decimal" value={value.copy_multiplier} onChange={(event) => onChange({ copy_multiplier: event.target.value })} required /></Field><Field label="Fixed balance"><input className="field" inputMode="decimal" value={value.fixed_account_value} onChange={(event) => onChange({ fixed_account_value: event.target.value })} placeholder="USDC" required /></Field><Field label="Execution account"><AccountSelect value={value.route} accounts={accounts} onChange={(route) => onChange({ route })} /></Field></div><details className="group mt-4 rounded-lg border border-line"><summary className="flex cursor-pointer list-none items-center justify-between px-4 py-3 text-xs font-semibold text-slate-600">Optional market controls<ChevronDown className="h-4 w-4 transition group-open:rotate-180" /></summary><div className="grid gap-3 border-t border-line bg-slate-50 p-4 md:grid-cols-2 xl:grid-cols-4"><Field label="Allowed mode"><select className="field" value={value.allowed_mode} onChange={(event) => onChange({ allowed_mode: event.target.value as AllowedMode })}><option value="ALL_COINS">All markets</option><option value="CUSTOM_LIST">Custom allowlist</option></select></Field><Field label="Allowed symbols"><input className="field" value={value.allowed_symbols} disabled={value.allowed_mode === "ALL_COINS"} onChange={(event) => onChange({ allowed_symbols: event.target.value })} /></Field><Field label="Blocked symbols"><input className="field" value={value.blocked_symbols} onChange={(event) => onChange({ blocked_symbols: event.target.value })} /></Field><Field label="Max per coin"><input className="field" value={value.max_notional_per_trade} onChange={(event) => onChange({ max_notional_per_trade: event.target.value })} /></Field></div></details><div className="mt-4 flex justify-end gap-2"><button className="btn btn-muted" type="button" onClick={onClose}>Cancel</button><button className="btn btn-primary" type="submit" disabled={busy}>{busy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}{busy ? "Adding" : "Add and enable"}</button></div></form></section>;
 }
+
+function AccountStrip({ account, leaders }: { account: ExecutionAccount; leaders: Leader[] }) { return <div className="bg-white px-5 py-4"><div className="flex items-start justify-between"><div><div className="flex items-center gap-2 text-sm font-semibold text-ink">{account.account_type === "MAIN" ? "Main account" : `Subaccount · ${account.account_address?.slice(-4)}`}<Status value={account.watcher_ready ? "ONLINE" : account.watcher_running ? "STARTING" : "OFFLINE"} /></div><div className="mt-1 break-all font-mono text-[10px] text-slate-400">{account.account_address ?? "Not configured"}</div></div><WalletCards className="h-4 w-4 text-accent" /></div><div className="mt-3 flex flex-wrap gap-1.5">{leaders.map((leader) => <span key={leader.id} className="rounded-md border border-line bg-slate-50 px-2 py-1 font-mono text-[11px] font-semibold text-slate-600">{leaderAddressSuffix(leader.leader_address)}</span>)}{!leaders.length ? <span className="text-xs text-slate-400">No leaders assigned</span> : null}</div></div>; }
+function Summary({ icon, label, value, detail }: { icon: React.ReactNode; label: string; value: string; detail: string }) { return <div className="metric-card"><div className="mb-3 flex h-8 w-8 items-center justify-center rounded-lg bg-teal-50 text-accent">{icon}</div><div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">{label}</div><div className="mt-1 text-lg font-semibold text-ink">{value}</div><div className="mt-1 text-xs text-slate-500">{detail}</div></div>; }
+function Status({ value }: { value: string }) { const upper = value.toUpperCase(); const cls = ["READY", "ONLINE", "ENABLED", "ACTIVE"].some((item) => upper.includes(item)) ? "border-teal-200 bg-teal-50 text-accent" : ["DELETED", "OFFLINE", "ERROR", "NOT_SUBSCRIBED"].some((item) => upper.includes(item)) ? "border-red-200 bg-red-50 text-danger" : "border-amber-200 bg-amber-50 text-warn"; return <span className={`status-pill ${cls}`}>{human(value)}</span>; }
+function FilterButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) { return <button type="button" onClick={onClick} className={`h-8 rounded-lg border px-3 text-xs font-semibold transition ${active ? "border-accent bg-teal-50 text-accent" : "border-line bg-white text-slate-500 hover:border-slate-300"}`}>{children}</button>; }
+function Field({ label, children }: { label: string; children: React.ReactNode }) { return <label className="space-y-1.5"><span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">{label}</span>{children}</label>; }
+function AccountSelect({ value, accounts, onChange, disabled = false }: { value: string; accounts: ExecutionAccount[]; onChange: (value: string) => void; disabled?: boolean }) { return <select className="field" value={route(value)} onChange={(event) => onChange(event.target.value)} disabled={disabled}>{accounts.map((account) => <option key={account.route_value || "main"} value={route(account.route_value)}>{account.label} · {account.account_address ?? "unavailable"}</option>)}</select>; }
+function editFrom(leader: Leader): Edit { return { copy_multiplier: clean(leader.copy_multiplier), fixed_account_value: clean(leader.fixed_account_value), route: route(leader.hyperliquid_vault_address), allowed_mode: leader.allowed_coins_mode, allowed_symbols: (leader.allowed_symbols ?? []).join(","), blocked_symbols: (leader.blocked_symbols ?? []).join(","), max_notional_per_trade: clean(leader.max_notional_per_trade), max_total_notional: clean(leader.max_total_notional) }; }
+function payloadFromEdit(edit: Edit) { return { copy_multiplier: clean(edit.copy_multiplier), fixed_account_value: clean(edit.fixed_account_value), hyperliquid_vault_address: route(edit.route) || null, allowed_symbols: edit.allowed_mode === "ALL_COINS" ? null : list(edit.allowed_symbols), blocked_symbols: list(edit.blocked_symbols), preferred_venue: "HYPERLIQUID", fallback_venue: "NONE", enabled_venues: ["HYPERLIQUID"], max_notional_per_trade: nullable(edit.max_notional_per_trade), max_total_notional: nullable(edit.max_total_notional) }; }
+function payloadFromNew(value: NewLeader) { return { leader_address: value.address.trim(), enabled: true, ...payloadFromEdit(value) }; }
+function accountFor(accounts: ExecutionAccount[], value: string | null | undefined): ExecutionAccount { return accounts.find((account) => route(account.route_value) === route(value)) ?? { route_value: route(value), account_address: value || null, account_type: value ? "SUBACCOUNT" : "MAIN", label: value ? `Unconfigured · ${value.slice(-4)}` : "Main account", watcher_running: false, watcher_ready: false, active_leaders: [] }; }
+function route(value: string | null | undefined): string { return String(value ?? "").trim().toLowerCase(); }
+function clean(value: string | number | null | undefined): string { return String(value ?? "").replaceAll(",", "").trim(); }
+function nullable(value: string): string | null { return clean(value) || null; }
+function list(value: string): string[] { return value.split(/[,\s]+/).map((item) => item.trim()).filter(Boolean); }
+function message(error: unknown): string { return error instanceof Error ? error.message : "Request failed"; }
+function human(value: string): string { return value.toLowerCase().replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()); }

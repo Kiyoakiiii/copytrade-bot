@@ -10,14 +10,18 @@ The fixed methodology is:
 1. Rebuild public perp fills into position lifecycles.
 2. Apply the bot's economic-dust rule (a follower remainder below 10 USDC is
    flat; a later material add is a new lifecycle).
-3. Normalize each lifecycle with the leader Account Total immediately before
-   that lifecycle opened.  Adds/reductions retain that denominator.
-4. Combine every lifecycle on one time axis and calculate account-level
-   portfolio pressure drawdown, including complete 4h candle adverse extremes.
-5. Recommend ``current Account Total * historical tail / target tail`` and
-   round upward.  Multiplier is deliberately outside this calibration.
-6. When several leaders are supplied, validate both net joint drawdown and the
-   concurrent sum of each leader's own high-water drawdown.
+3. Rebuild the raw account-level portfolio pressure path, including complete
+   4h candle adverse extremes and simultaneous multi-coin exposure.
+4. Estimate position elasticity from daily opening Account Total versus daily
+   peak gross exposure, using a robust central slope and conservative upper
+   slope instead of assuming fixed-dollar or fully proportional sizing.
+5. Stress the recent gross-exposure regime with the historical worst
+   peak-to-pressure loss per dollar of block peak exposure. Recommend the
+   greater of observed raw drawdown and this elasticity/regime stress divided
+   by the target tail, then round upward. Multiplier remains outside calibration.
+6. Retain full equity normalization as a diagnostic upper case only. When
+   several leaders are supplied, validate time-aligned raw joint drawdown under
+   the actually applied fixed balances.
 """
 
 from __future__ import annotations
@@ -47,6 +51,14 @@ class LeaderInput:
     label: str
     address: str
 
+    def __post_init__(self) -> None:
+        """Reject malformed programmatic inputs before capital reconstruction."""
+
+        address = self.address.strip().lower()
+        if not ADDRESS_RE.fullmatch(address):
+            raise ValueError("invalid public address")
+        object.__setattr__(self, "address", address)
+
 
 @dataclass
 class PressurePath:
@@ -65,6 +77,54 @@ class DrawdownResult:
     trough_by_leader: dict[str, Decimal]
 
 
+@dataclass(frozen=True)
+class DailyExposureObservation:
+    day_start_ms: int
+    opening_equity: Decimal
+    peak_gross_notional: Decimal
+
+
+@dataclass(frozen=True)
+class ExposurePosition:
+    market: str
+    direction: str
+    gross_notional: Decimal
+
+
+@dataclass(frozen=True)
+class ExposurePeak:
+    time_ms: int
+    gross_notional: Decimal
+    positions: tuple[ExposurePosition, ...]
+
+
+@dataclass(frozen=True)
+class ExposureRiskModel:
+    beta: Decimal
+    beta_upper: Decimal
+    observation_count: int
+    reference_capital: Decimal
+    recent_average_gross: Decimal
+    prior_average_gross: Decimal
+    recent_peak_gross: Decimal
+    recent_peak_ms: int
+    recent_peak_positions: tuple[ExposurePosition, ...]
+    prior_peak_gross: Decimal
+    historical_peak_gross: Decimal
+    historical_peak_ms: int
+    historical_peak_positions: tuple[ExposurePosition, ...]
+    historical_p95_gross: Decimal
+    fitted_upper_gross: Decimal
+    projected_peak_gross: Decimal
+    peak_limit_gross: Decimal
+    worst_loss_per_peak_gross: Decimal
+    regime_scale_factor: Decimal
+    observed_raw_drawdown: Decimal
+    elasticity_regime_drawdown: Decimal
+    projected_raw_drawdown: Decimal
+    projected_component: str
+
+
 @dataclass
 class Evaluation:
     leader: LeaderInput
@@ -81,6 +141,9 @@ class Evaluation:
     max_capital_sample_gap_days: float | None
     drawdown: DrawdownResult
     historical_tail_pct: Decimal
+    equity_normalized_drawdown: DrawdownResult
+    equity_normalized_tail_pct: Decimal
+    exposure_model: ExposureRiskModel
     theoretical_balance: Decimal
     recommended_balance: Decimal
     recommended_tail_pct: Decimal
@@ -158,12 +221,418 @@ def recommend_balance(
     return theoretical, recommendation, resulting_tail
 
 
+def recommend_balance_for_projected_loss(
+    projected_raw_loss: Decimal,
+    target_tail_pct: Decimal,
+    *,
+    round_to: Decimal,
+    headroom_pct: Decimal = ZERO,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Calibrate a fixed leader denominator from a projected raw loss.
+
+    With multiplier deliberately excluded, a 20k follower and a leader fixed
+    balance ``B`` have the same percentage loss as ``raw_loss / B``.  Current
+    Account Total therefore does not belong in this final conversion; it is
+    used only by the exposure model that projects how large future leader
+    positions may become.
+    """
+
+    if min(projected_raw_loss, target_tail_pct, round_to) <= ZERO:
+        raise ValueError("projected-loss balance inputs must be positive")
+    if headroom_pct < ZERO:
+        raise ValueError("headroom cannot be negative")
+    target_fraction = target_tail_pct / Decimal("100")
+    theoretical = projected_raw_loss / target_fraction
+    padded = theoretical * (Decimal("1") + headroom_pct / Decimal("100"))
+    recommendation = round_up(padded, round_to)
+    resulting_tail = projected_raw_loss / recommendation * Decimal("100")
+    return theoretical, recommendation, resulting_tail
+
+
 def step_value(points: dict[int, Decimal], timestamp: int) -> Decimal:
     if not points:
         return ZERO
     times = sorted(points)
     index = bisect.bisect_right(times, timestamp) - 1
     return points[times[index]] if index >= 0 else ZERO
+
+
+def percentile_decimal(values: list[Decimal], percentile: Decimal) -> Decimal:
+    if not values:
+        return ZERO
+    if percentile < ZERO or percentile > Decimal("1"):
+        raise ValueError("percentile must be between zero and one")
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = Decimal(len(ordered) - 1) * percentile
+    low = int(rank)
+    high = min(low + 1, len(ordered) - 1)
+    weight = rank - Decimal(low)
+    return ordered[low] * (Decimal("1") - weight) + ordered[high] * weight
+
+
+def gross_exposure_path(lifecycles: list[risk.Lifecycle]) -> dict[int, Decimal]:
+    updates: dict[int, list[tuple[str, Decimal]]] = defaultdict(list)
+    for life in lifecycles:
+        for point in life.valuations:
+            if not point["extreme"]:
+                updates[int(point["time_ms"])].append(
+                    (life.life_id, risk.dec(point["notional"]))
+                )
+        # A position-chain mismatch closes this reconstructed lifecycle without
+        # manufacturing a PnL close. Its last valuation can consequently be
+        # non-zero even though a later lifecycle has taken over the market.
+        # Exposure is state, not cumulative PnL: terminate that stale state at
+        # the known boundary. A genuinely open cutoff lifecycle is right
+        # censored and must remain present.
+        if life.end_ms is not None and not life.right_censored:
+            updates[int(life.end_ms)].append((life.life_id, ZERO))
+    latest: dict[str, Decimal] = {}
+    total = ZERO
+    result: dict[int, Decimal] = {}
+    for timestamp in sorted(updates):
+        for life_id, value in updates[timestamp]:
+            total += value - latest.get(life_id, ZERO)
+            latest[life_id] = value
+        result[timestamp] = max(ZERO, total)
+    return result
+
+
+def gross_exposure_peak(
+    lifecycles: list[risk.Lifecycle],
+    *,
+    start_ms: int,
+    end_ms: int,
+) -> ExposurePeak:
+    """Return an auditable simultaneous gross-exposure snapshot.
+
+    The state transition order is identical to :func:`gross_exposure_path`.
+    Positions are grouped by market and direction so the evidence adds exactly
+    to the reported peak rather than exposing internal lifecycle fragments.
+    """
+
+    if end_ms < start_ms:
+        raise ValueError("peak-exposure interval must not be negative")
+    updates: dict[int, list[tuple[str, str, str, Decimal]]] = defaultdict(list)
+    for life in lifecycles:
+        for point in life.valuations:
+            if not point["extreme"]:
+                updates[int(point["time_ms"])].append(
+                    (
+                        life.life_id,
+                        life.coin,
+                        life.side_label,
+                        risk.dec(point["notional"]),
+                    )
+                )
+        if life.end_ms is not None and not life.right_censored:
+            updates[int(life.end_ms)].append(
+                (life.life_id, life.coin, life.side_label, ZERO)
+            )
+
+    latest: dict[str, tuple[str, str, Decimal]] = {}
+
+    def snapshot(timestamp: int) -> ExposurePeak:
+        grouped: dict[tuple[str, str], Decimal] = defaultdict(Decimal)
+        for market, direction, notional in latest.values():
+            if notional > ZERO:
+                grouped[(market, direction)] += notional
+        positions = tuple(
+            ExposurePosition(market, direction, notional)
+            for (market, direction), notional in sorted(
+                grouped.items(), key=lambda item: (-item[1], item[0])
+            )
+        )
+        return ExposurePeak(
+            time_ms=timestamp,
+            gross_notional=sum((item.gross_notional for item in positions), ZERO),
+            positions=positions,
+        )
+
+    peak = ExposurePeak(start_ms, ZERO, ())
+    start_recorded = False
+    for timestamp in sorted(updates):
+        if timestamp > end_ms:
+            break
+        if timestamp > start_ms and not start_recorded:
+            peak = snapshot(start_ms)
+            start_recorded = True
+        for life_id, market, direction, notional in updates[timestamp]:
+            latest[life_id] = (market, direction, notional)
+        if timestamp >= start_ms:
+            candidate = snapshot(timestamp)
+            start_recorded = True
+            if candidate.gross_notional > peak.gross_notional:
+                peak = candidate
+    if not start_recorded:
+        peak = snapshot(start_ms)
+    return peak
+
+
+def time_weighted_average(
+    points: dict[int, Decimal],
+    *,
+    start_ms: int,
+    end_ms: int,
+) -> Decimal:
+    if end_ms <= start_ms:
+        raise ValueError("time-weighted interval must be positive")
+    current = step_value(points, start_ms)
+    previous = start_ms
+    area = ZERO
+    for timestamp in sorted(
+        item for item in points if start_ms < item < end_ms
+    ) + [end_ms]:
+        area += current * Decimal(timestamp - previous)
+        if timestamp != end_ms:
+            current = points[timestamp]
+        previous = timestamp
+    return area / Decimal(end_ms - start_ms)
+
+
+def daily_exposure_observations(
+    exposure: dict[int, Decimal],
+    normalizer: risk.CapitalNormalizer,
+    *,
+    end_ms: int,
+    lookback_days: int = 180,
+) -> list[DailyExposureObservation]:
+    if not exposure:
+        return []
+    day_ms = 86_400_000
+    start_ms = max(min(exposure), end_ms - lookback_days * day_ms)
+    day_start = start_ms // day_ms * day_ms
+    timestamps = sorted(exposure)
+    observations: list[DailyExposureObservation] = []
+    while day_start < end_ms:
+        day_end = min(day_start + day_ms, end_ms)
+        left = bisect.bisect_right(timestamps, day_start)
+        right = bisect.bisect_left(timestamps, day_end)
+        peak = step_value(exposure, day_start)
+        if right > left:
+            peak = max(peak, *(exposure[timestamp] for timestamp in timestamps[left:right]))
+        equity = normalizer.value_at(max(0, day_start - 1))
+        if peak > ZERO and equity > ZERO:
+            observations.append(
+                DailyExposureObservation(
+                    day_start_ms=day_start,
+                    opening_equity=equity,
+                    peak_gross_notional=peak,
+                )
+            )
+        day_start += day_ms
+    return observations
+
+
+def estimate_exposure_elasticity(
+    observations: list[DailyExposureObservation],
+) -> tuple[Decimal, Decimal]:
+    """Return a robust central and conservative upper position elasticity.
+
+    Daily opening equity is used instead of simultaneous equity, preventing a
+    profitable large position from mechanically making both axes rise.  The
+    Theil-Sen median resists isolated oversized trades; its 75th-percentile
+    pair slope is retained as a conservative upper estimate.  Pairs with less
+    than 5% equity separation are discarded because their slopes are noise.
+    """
+
+    slopes: list[Decimal] = []
+    minimum_log_gap = math.log(1.05)
+    for index, left in enumerate(observations):
+        left_x = math.log(float(left.opening_equity))
+        left_y = math.log(float(left.peak_gross_notional))
+        for right in observations[index + 1 :]:
+            right_x = math.log(float(right.opening_equity))
+            delta_x = right_x - left_x
+            if abs(delta_x) < minimum_log_gap:
+                continue
+            right_y = math.log(float(right.peak_gross_notional))
+            slope = Decimal(str((right_y - left_y) / delta_x))
+            if slope.is_finite():
+                slopes.append(slope)
+    if len(observations) < 8 or len(slopes) < 20:
+        # Insufficient variation does not prove fixed-dollar sizing. Keep a
+        # partial-scaling upper case until more evidence becomes available.
+        return ZERO, Decimal("0.5")
+    central = max(ZERO, min(Decimal("1"), percentile_decimal(slopes, Decimal("0.5"))))
+    upper = max(
+        central,
+        min(Decimal("1"), percentile_decimal(slopes, Decimal("0.75"))),
+    )
+    return central, upper
+
+
+def fitted_upper_exposure(
+    observations: list[DailyExposureObservation],
+    *,
+    reference_capital: Decimal,
+    beta: Decimal,
+) -> Decimal:
+    if not observations or reference_capital <= ZERO:
+        return ZERO
+    residuals = [
+        Decimal(
+            str(
+                math.log(float(item.peak_gross_notional))
+                - float(beta) * math.log(float(item.opening_equity))
+            )
+        )
+        for item in observations
+    ]
+    upper_residual = percentile_decimal(residuals, Decimal("0.95"))
+    projected_log = float(beta) * math.log(float(reference_capital)) + float(upper_residual)
+    return Decimal(str(math.exp(projected_log)))
+
+
+def max_loss_per_peak_gross(
+    path: PressurePath,
+    exposure: dict[int, Decimal],
+) -> Decimal:
+    """Worst peak-to-pressure loss divided by peak gross held in that block."""
+
+    timestamps = sorted(set(path.regular) | set(path.stress))
+    if not timestamps:
+        return ZERO
+    peak_value = ZERO
+    latest_value = ZERO
+    block_peak_gross = step_value(exposure, timestamps[0])
+    maximum = ZERO
+    for timestamp in timestamps:
+        if timestamp in path.regular:
+            latest_value = path.regular[timestamp]
+        gross = step_value(exposure, timestamp)
+        if latest_value >= peak_value:
+            peak_value = latest_value
+            block_peak_gross = gross
+        else:
+            block_peak_gross = max(block_peak_gross, gross)
+        pressure_value = path.stress.get(timestamp, latest_value)
+        drawdown = max(ZERO, peak_value - pressure_value)
+        denominator = max(block_peak_gross, gross)
+        if denominator > ZERO:
+            maximum = max(maximum, drawdown / denominator)
+    return maximum
+
+
+def build_exposure_risk_model(
+    *,
+    lifecycles: list[risk.Lifecycle],
+    normalizer: risk.CapitalNormalizer,
+    raw_path: PressurePath,
+    raw_drawdown: DrawdownResult,
+    end_ms: int,
+) -> ExposureRiskModel:
+    exposure = gross_exposure_path(lifecycles)
+    observations = daily_exposure_observations(
+        exposure,
+        normalizer,
+        end_ms=end_ms,
+        lookback_days=180,
+    )
+    beta, beta_upper = estimate_exposure_elasticity(observations)
+    day_ms = 86_400_000
+    recent_start = max(min(exposure, default=end_ms), end_ms - 30 * day_ms)
+    prior_start = max(min(exposure, default=end_ms), end_ms - 60 * day_ms)
+    recent_average = time_weighted_average(
+        exposure,
+        start_ms=recent_start,
+        end_ms=end_ms,
+    )
+    prior_average = time_weighted_average(
+        exposure,
+        start_ms=prior_start,
+        end_ms=recent_start,
+    ) if recent_start > prior_start else ZERO
+    recent_peak_snapshot = gross_exposure_peak(
+        lifecycles,
+        start_ms=recent_start,
+        end_ms=end_ms,
+    )
+    historical_peak_snapshot = gross_exposure_peak(
+        lifecycles,
+        start_ms=min(exposure, default=end_ms),
+        end_ms=end_ms,
+    )
+    prior_values = [
+        step_value(exposure, prior_start),
+        *(value for timestamp, value in exposure.items() if prior_start < timestamp <= recent_start),
+    ]
+    recent_peak = recent_peak_snapshot.gross_notional
+    prior_peak = max(prior_values, default=ZERO)
+    recent_capitals = [
+        item.opening_equity
+        for item in observations
+        if item.day_start_ms >= end_ms - 30 * day_ms
+    ]
+    reference_capital = (
+        percentile_decimal(recent_capitals, Decimal("0.5"))
+        if recent_capitals
+        else normalizer.current_total_account_value
+    )
+    # The central robust beta drives interpolation inside the observed capital
+    # range. ``beta_upper`` remains an uncertainty diagnostic; using it for
+    # every in-range estimate would silently restore the disproven beta=1
+    # assumption whenever noisy pair slopes have a wide upper tail.
+    fitted_upper = fitted_upper_exposure(
+        observations,
+        reference_capital=reference_capital,
+        beta=beta,
+    )
+    projected_peak = max(recent_peak, fitted_upper)
+    # A hard peak-notional policy must cover both a fitted future upper regime
+    # and every actual peak in the reconstructable history. The tail-loss
+    # stress continues to use the recent/fitted regime because the raw
+    # drawdown floor already contains older realized pressure episodes.
+    peak_limit_gross = max(historical_peak_snapshot.gross_notional, projected_peak)
+    historical_p95 = percentile_decimal(
+        [item.peak_gross_notional for item in observations],
+        Decimal("0.95"),
+    )
+    severity = max_loss_per_peak_gross(raw_path, exposure)
+    observed = raw_drawdown.amount
+    # Portfolio drawdowns can span several sequential trades. Dividing such a
+    # cumulative loss by one post-peak position can exceed 100% and must not be
+    # multiplied into a new single-position forecast. Scale the observed raw
+    # portfolio tail only by how far the projected peak-exposure regime exceeds
+    # the comparable historical 95th-percentile regime.
+    regime_scale_factor = (
+        max(Decimal("1"), projected_peak / historical_p95)
+        if historical_p95 > ZERO
+        else Decimal("1")
+    )
+    elasticity_regime_drawdown = observed * regime_scale_factor
+    if elasticity_regime_drawdown > observed:
+        projected = elasticity_regime_drawdown
+        component = "ELASTICITY_RECENT_REGIME_STRESS"
+    else:
+        projected = observed
+        component = "OBSERVED_RAW_PORTFOLIO_DRAWDOWN"
+    return ExposureRiskModel(
+        beta=beta,
+        beta_upper=beta_upper,
+        observation_count=len(observations),
+        reference_capital=reference_capital,
+        recent_average_gross=recent_average,
+        prior_average_gross=prior_average,
+        recent_peak_gross=recent_peak,
+        recent_peak_ms=recent_peak_snapshot.time_ms,
+        recent_peak_positions=recent_peak_snapshot.positions,
+        prior_peak_gross=prior_peak,
+        historical_peak_gross=historical_peak_snapshot.gross_notional,
+        historical_peak_ms=historical_peak_snapshot.time_ms,
+        historical_peak_positions=historical_peak_snapshot.positions,
+        historical_p95_gross=historical_p95,
+        fitted_upper_gross=fitted_upper,
+        projected_peak_gross=projected_peak,
+        peak_limit_gross=peak_limit_gross,
+        worst_loss_per_peak_gross=severity,
+        regime_scale_factor=regime_scale_factor,
+        observed_raw_drawdown=observed,
+        elasticity_regime_drawdown=elasticity_regime_drawdown,
+        projected_raw_drawdown=projected,
+        projected_component=component,
+    )
 
 
 def build_pressure_path(lifecycles: list[risk.Lifecycle]) -> PressurePath:
@@ -428,6 +897,26 @@ def analyze(
         ledger=ledger,
         raw_perp_curve=risk.aggregate_lifecycle_curve(exact, include_extremes=False),
     )
+    raw_usable = [
+        life
+        for life in exact
+        if life.metrics and life.scale is not None and life.complete_start
+    ]
+    for life in raw_usable:
+        life.equity_at_open = normalizer.value_at(max(0, life.start_ms - 1))
+        life.equity_sample_gap_days = normalizer.nearest_sample_gap_days(life.start_ms)
+    raw_path = build_pressure_path(raw_usable)
+    raw_drawdown = portfolio_drawdown(
+        {label: raw_path},
+        {label: Decimal("1")},
+    )
+    exposure_model = build_exposure_risk_model(
+        lifecycles=raw_usable,
+        normalizer=normalizer,
+        raw_path=raw_path,
+        raw_drawdown=raw_drawdown,
+        end_ms=end_ms,
+    )
     followable = risk.build_followable_lifecycles(
         label,
         events,
@@ -448,12 +937,16 @@ def analyze(
             risk.lifecycle_valuations(life, candles.get(life.coin, []))
         if life.metrics and life.scale is not None and life.complete_start:
             usable.append(life)
-    path = build_pressure_path(usable)
-    drawdown = portfolio_drawdown({label: path}, {label: Decimal("1")})
-    historical_tail_pct = drawdown.amount / follower_balance * Decimal("100")
-    theoretical, recommendation, resulting_tail = recommend_balance(
-        normalizer.current_total_account_value,
-        historical_tail_pct,
+    equity_normalized_path = build_pressure_path(usable)
+    equity_normalized_drawdown = portfolio_drawdown(
+        {label: equity_normalized_path},
+        {label: Decimal("1")},
+    )
+    equity_normalized_tail_pct = (
+        equity_normalized_drawdown.amount / follower_balance * Decimal("100")
+    )
+    theoretical, recommendation, resulting_tail = recommend_balance_for_projected_loss(
+        exposure_model.projected_raw_drawdown,
         target_tail_pct,
         round_to=round_to,
         headroom_pct=headroom_pct,
@@ -477,13 +970,16 @@ def analyze(
         saturated=saturated,
         capital_sample_count=len(normalizer.samples),
         max_capital_sample_gap_days=max(gaps, default=None),
-        drawdown=drawdown,
-        historical_tail_pct=historical_tail_pct,
+        drawdown=raw_drawdown,
+        historical_tail_pct=equity_normalized_tail_pct,
+        equity_normalized_drawdown=equity_normalized_drawdown,
+        equity_normalized_tail_pct=equity_normalized_tail_pct,
+        exposure_model=exposure_model,
         theoretical_balance=theoretical,
         recommended_balance=recommendation,
         recommended_tail_pct=resulting_tail,
-        contributors=pressure_contributors(usable, drawdown),
-        path=path,
+        contributors=pressure_contributors(raw_usable, raw_drawdown),
+        path=raw_path,
     )
 
 
@@ -511,15 +1007,17 @@ def render(
         f"Joint limit: **{percent(joint_limit_pct)}**  ",
         "Multiplier: **excluded from this calibration**.",
         "",
-        "| Leader | Current Account Total | Historical pressure tail | Exact target balance | Applied balance | Applied tail |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| Leader | 30d median capital | Exposure beta (upper) | Projected raw drawdown | Exact target balance | Applied balance | Applied tail |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for item in evaluations:
         balance = applied_balances[item.leader.label]
-        applied_tail = item.historical_tail_pct * item.current_total / balance
+        applied_tail = item.exposure_model.projected_raw_drawdown / balance * Decimal("100")
         lines.append(
-            f"| {item.leader.label} | {money(item.current_total)} | "
-            f"{percent(item.historical_tail_pct)} | {money(item.theoretical_balance, 0)} | "
+            f"| {item.leader.label} | {money(item.exposure_model.reference_capital)} | "
+            f"{item.exposure_model.beta:.2f} ({item.exposure_model.beta_upper:.2f}) | "
+            f"{money(item.exposure_model.projected_raw_drawdown)} | "
+            f"{money(item.theoretical_balance, 0)} | "
             f"{money(balance, 0)} | {percent(applied_tail)} |"
         )
 
@@ -533,11 +1031,43 @@ def render(
             f"{item.complete_lifecycles:,} complete followable lifecycles.",
             f"- Current Account Total: Spot {money(item.current_spot)} + Perpetual "
             f"{money(item.current_perp)} = **{money(item.current_total)}**.",
-            f"- Maximum portfolio pressure: {risk.iso(item.drawdown.peak_ms)} → "
-            f"{risk.iso(item.drawdown.trough_ms)} UTC; normalized PnL "
+            f"- Observed raw maximum portfolio pressure: {risk.iso(item.drawdown.peak_ms)} → "
+            f"{risk.iso(item.drawdown.trough_ms)} UTC; raw PnL "
             f"{money(item.drawdown.peak_value)} → {money(item.drawdown.trough_value)}; "
-            f"drawdown **{money(item.drawdown.amount)} "
-            f"({percent(item.historical_tail_pct)})**.",
+            f"drawdown **{money(item.drawdown.amount)}**.",
+            f"- Exposure model: {item.exposure_model.observation_count} active daily observations; "
+            f"beta {item.exposure_model.beta:.2f}, conservative upper beta "
+            f"{item.exposure_model.beta_upper:.2f}; 30d median capital "
+            f"{money(item.exposure_model.reference_capital)}.",
+            f"- Gross exposure regime: prior 30d average/peak "
+            f"{money(item.exposure_model.prior_average_gross)}/"
+            f"{money(item.exposure_model.prior_peak_gross)}; recent 30d "
+            f"{money(item.exposure_model.recent_average_gross)}/"
+            f"{money(item.exposure_model.recent_peak_gross)}; fitted 95% upper "
+            f"{money(item.exposure_model.fitted_upper_gross)}; historical daily-peak P95 "
+            f"{money(item.exposure_model.historical_p95_gross)}.",
+            f"- Recent actual peak evidence: {risk.iso(item.exposure_model.recent_peak_ms)} UTC; "
+            + ", ".join(
+                f"{position.market} {position.direction} {money(position.gross_notional)}"
+                for position in item.exposure_model.recent_peak_positions
+            )
+            + ".",
+            f"- Full-history actual peak evidence: {risk.iso(item.exposure_model.historical_peak_ms)} UTC; "
+            + ", ".join(
+                f"{position.market} {position.direction} {money(position.gross_notional)}"
+                for position in item.exposure_model.historical_peak_positions
+            )
+            + f"; total {money(item.exposure_model.historical_peak_gross)}. "
+            f"Peak-limit input after fitted-upper comparison: "
+            f"{money(item.exposure_model.peak_limit_gross)}.",
+            f"- Stress components: observed raw {money(item.exposure_model.observed_raw_drawdown)}; "
+            f"exposure-regime scale {item.exposure_model.regime_scale_factor:.2f}x; "
+            f"elasticity/recent-regime {money(item.exposure_model.elasticity_regime_drawdown)}; "
+            f"selected **{money(item.exposure_model.projected_raw_drawdown)}** "
+            f"({item.exposure_model.projected_component}).",
+            f"- Full proportional-equity normalization is retained only as a diagnostic upper case: "
+            f"{money(item.equity_normalized_drawdown.amount)} "
+            f"({percent(item.equity_normalized_tail_pct)} on the {money(follower_balance, 0)} basis).",
             f"- Recommendation: exact {money(item.theoretical_balance)}, rounded upward to "
             f"**{money(item.recommended_balance, 0)}**, resulting tail "
             f"**{percent(item.recommended_tail_pct)}**.",
@@ -570,7 +1100,7 @@ def render(
     if len(evaluations) > 1:
         paths = {item.leader.label: item.path for item in evaluations}
         factors = {
-            item.leader.label: item.current_total / applied_balances[item.leader.label]
+            item.leader.label: follower_balance / applied_balances[item.leader.label]
             for item in evaluations
         }
         common_start = max(min(path.regular) for path in paths.values())
@@ -587,6 +1117,8 @@ def render(
             "## Joint validation",
             "",
             f"Common history starts **{risk.iso(common_start)} UTC**.",
+            "Observed raw portfolio paths are mapped through each applied fixed balance; "
+            "the joint test does not assume five independent worst cases happen together.",
             "",
             f"- Net joint maximum: **{money(joint.amount)} ({percent(joint_pct)})**, "
             f"{risk.iso(joint.peak_ms)} → {risk.iso(joint.trough_ms)} UTC.",
@@ -623,6 +1155,8 @@ def render(
         "",
         "- Historical calibration cannot guarantee that future losses or correlations stay inside the sample.",
         "- Pressure uses real fills and complete 4h adverse highs/lows; shorter intrabar spikes can be missed.",
+        "- Position elasticity is estimated from daily opening capital and daily peak gross exposure; "
+        "a recent structural strategy change can still outpace the fitted history.",
         "- A hard future joint limit requires runtime account-level enforcement; static balances alone cannot guarantee it.",
         "- This tool reads public leader data only and never reads or changes live bot configuration.",
         "",
@@ -681,13 +1215,13 @@ def main() -> int:
     # The cutoff is part of the cache path, so current Account Total is fresh
     # on every normal invocation.  Passing a fixed cutoff intentionally reuses
     # a reproducible cache.
-    cache_root = args.cache_dir / str(end_ms)
     evaluations = []
     for leader in args.leaders:
-        # Include the address in the cache namespace.  Reusing a human label
-        # such as "candidate" for another address must never return the first
-        # candidate's cached public history.
-        client = risk.PublicInfoClient(cache_root / f"{leader.label}_{leader.address[2:]}")
+        # A hashed, address-private namespace is shared with the suitability
+        # model so the same public history is never downloaded twice.
+        client = risk.PublicInfoClient(
+            risk.public_history_cache_namespace(args.cache_dir, end_ms, leader.address)
+        )
         evaluations.append(
             analyze(
                 leader,
@@ -726,14 +1260,54 @@ def main() -> int:
                     "label": item.leader.label,
                     "address": item.leader.address,
                     "current_account_total": item.current_total,
-                    "historical_pressure_tail_pct": item.historical_tail_pct,
+                    "equity_normalized_pressure_tail_pct": item.equity_normalized_tail_pct,
+                    "equity_normalized_pressure_drawdown": item.equity_normalized_drawdown.amount,
+                    "observed_raw_pressure_drawdown": item.drawdown.amount,
+                    "exposure_model": {
+                        "beta": item.exposure_model.beta,
+                        "beta_upper": item.exposure_model.beta_upper,
+                        "observation_count": item.exposure_model.observation_count,
+                        "reference_capital": item.exposure_model.reference_capital,
+                        "recent_average_gross": item.exposure_model.recent_average_gross,
+                        "prior_average_gross": item.exposure_model.prior_average_gross,
+                        "recent_peak_gross": item.exposure_model.recent_peak_gross,
+                        "recent_peak_ms": item.exposure_model.recent_peak_ms,
+                        "recent_peak_positions": [
+                            {
+                                "market": position.market,
+                                "direction": position.direction,
+                                "gross_notional": position.gross_notional,
+                            }
+                            for position in item.exposure_model.recent_peak_positions
+                        ],
+                        "prior_peak_gross": item.exposure_model.prior_peak_gross,
+                        "historical_peak_gross": item.exposure_model.historical_peak_gross,
+                        "historical_peak_ms": item.exposure_model.historical_peak_ms,
+                        "historical_peak_positions": [
+                            {
+                                "market": position.market,
+                                "direction": position.direction,
+                                "gross_notional": position.gross_notional,
+                            }
+                            for position in item.exposure_model.historical_peak_positions
+                        ],
+                        "historical_p95_gross": item.exposure_model.historical_p95_gross,
+                        "fitted_upper_gross": item.exposure_model.fitted_upper_gross,
+                        "projected_peak_gross": item.exposure_model.projected_peak_gross,
+                        "peak_limit_gross": item.exposure_model.peak_limit_gross,
+                        "worst_loss_per_peak_gross": item.exposure_model.worst_loss_per_peak_gross,
+                        "regime_scale_factor": item.exposure_model.regime_scale_factor,
+                        "elasticity_regime_drawdown": item.exposure_model.elasticity_regime_drawdown,
+                        "projected_raw_drawdown": item.exposure_model.projected_raw_drawdown,
+                        "projected_component": item.exposure_model.projected_component,
+                    },
                     "theoretical_balance": item.theoretical_balance,
                     "recommended_balance": item.recommended_balance,
                     "applied_balance": balances[item.leader.label],
-                    "applied_tail_pct": item.historical_tail_pct
-                    * item.current_total
-                    / balances[item.leader.label],
-                    "pressure_drawdown": item.drawdown.amount,
+                    "applied_tail_pct": item.exposure_model.projected_raw_drawdown
+                    / balances[item.leader.label]
+                    * Decimal("100"),
+                    "pressure_drawdown": item.exposure_model.projected_raw_drawdown,
                     "pressure_peak_ms": item.drawdown.peak_ms,
                     "pressure_trough_ms": item.drawdown.trough_ms,
                     "contributors": item.contributors,

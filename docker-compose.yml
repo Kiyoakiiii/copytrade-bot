@@ -33,12 +33,15 @@ services:
     build:
       context: ./backend
     restart: unless-stopped
+    cpus: 1.0
+    cpu_shares: 256
+    mem_limit: 2g
     logging: *default-logging
     env_file: .env
     environment:
       EMBEDDED_LOW_LATENCY_WATCHER_ENABLED: "false"
-      DATABASE_POOL_SIZE: "8"
-      DATABASE_MAX_OVERFLOW: "4"
+      DATABASE_POOL_SIZE: "4"
+      DATABASE_MAX_OVERFLOW: "2"
       HYPERLIQUID_EXECUTION_SUBACCOUNT_ADDRESSES: ${HYPERLIQUID_EXECUTION_SUBACCOUNT_ADDRESSES:-}
     depends_on:
       postgres:
@@ -47,10 +50,10 @@ services:
         condition: service_started
     command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/openapi.json >/dev/null"]
-      interval: 2s
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/healthz >/dev/null"]
+      interval: 5s
       timeout: 2s
-      retries: 30
+      retries: 12
       start_period: 5s
     expose:
       - "8000"
@@ -122,18 +125,49 @@ services:
       HYPERLIQUID_ACCOUNT_ADDRESS: ${HYPERLIQUID_ACCOUNT_ADDRESS:-}
       HYPERLIQUID_VAULT_ADDRESS: ${HYPERLIQUID_VAULT_ADDRESS:-}
       HYPERLIQUID_SUBACCOUNT_ADDRESS: ${HYPERLIQUID_SUBACCOUNT_ADDRESS:-}
+      HYPERLIQUID_BACKGROUND_INFO_MIN_INTERVAL_SECONDS: "0.5"
       LEADER_PERFORMANCE_REFRESH_ENABLED: "true"
-      LEADER_PERFORMANCE_REFRESH_SECONDS: "21600"
+      LEADER_PERFORMANCE_REFRESH_SECONDS: "900"
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["python", "-m", "app.tasks.leader_performance_worker"]
+    command: ["sh", "-c", "exec nice -n 19 python -m app.tasks.leader_performance_worker"]
+
+  research:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.research
+    restart: unless-stopped
+    init: true
+    cpus: 0.50
+    cpu_shares: 64
+    mem_limit: 2g
+    logging: *default-logging
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_POOL_SIZE: "1"
+      DATABASE_MAX_OVERFLOW: "0"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      RESEARCH_HISTORY_BUCKET_SECONDS: "21600"
+      RESEARCH_CACHE_RETENTION_SECONDS: "172800"
+      COPYTRADE_PUBLIC_INFO_MIN_INTERVAL_SECONDS: "2"
+      COPYTRADE_PUBLIC_INFO_MAX_REQUESTS: "180"
+      COPYTRADE_PUBLIC_INFO_RATE_STATE: /research-cache/info-api-rate-state
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - research_cache:/research-cache
+    command: ["sh", "-c", "exec nice -n 19 python -m app.tasks.leader_research_worker"]
 
   frontend:
     build:
       context: ./frontend
     restart: unless-stopped
+    cpus: 0.25
+    cpu_shares: 64
+    mem_limit: 512m
     logging: *default-logging
     environment:
       NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-/api}
@@ -160,3 +194,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  research_cache:

@@ -123,9 +123,17 @@ research.
 `scripts/leader_balance_evaluator.py` is the repeatable operator-side research
 tool for calibrating a leader's fixed account value. Given one or more public
 Hyperliquid addresses, it reconstructs fill-driven lifecycles, applies the
-10 USDC economic-dust rule, normalizes each lifecycle with Account Total at
-open, and measures account-level portfolio pressure drawdown. It never replaces
-portfolio risk with a worst loss from one coin.
+10 USDC economic-dust rule, and measures raw account-level portfolio pressure
+drawdown. It also reconstructs daily peak gross exposure, estimates the
+leader's position elasticity from opening Account Total versus subsequent peak
+exposure, and stresses the recent position-size regime against the observed raw
+portfolio tail. Full proportional Account Total normalization remains visible
+as a diagnostic upper case, but no longer drives the recommendation by itself.
+The evaluator never replaces portfolio risk with a worst loss from one coin.
+Hyperliquid's ordinary portfolio history is treated as Account Total directly;
+the `perp*` history is a component and is never added a second time. Historical
+period returns are geometrically chain-linked before maximum drawdown is taken,
+so a reported percentage is a conventional NAV drawdown and cannot exceed 100%.
 
 The default policy is a 20,000 USDC follower balance, approximately 7%
 individual portfolio pressure tail, 15% joint limit, and 10,000 USDC upward
@@ -135,17 +143,79 @@ balance rounding. A single-candidate research run is:
 python scripts/leader_balance_evaluator.py candidate=<PUBLIC_LEADER_ADDRESS>
 ```
 
-Supplying several labelled addresses additionally validates net joint drawdown
-and the concurrent sum of each leader's own high-water drawdown. Existing or
-proposed values can be checked with repeated `--balance LABEL=VALUE` arguments.
-The Markdown output includes every material contributor to the maximum
-portfolio pressure interval, its raw PnL change, and Account Total when that
-lifecycle opened, so each recommendation remains auditable. `--output` saves
-the report and `--json-output` saves a machine-readable result.
+Supplying several labelled addresses additionally validates time-aligned raw
+net joint drawdown and the concurrent sum of each leader's own high-water
+drawdown under the applied fixed balances. Existing or proposed values can be
+checked with repeated `--balance LABEL=VALUE` arguments. The Markdown output
+includes beta, recent/prior average and peak exposure, historical daily-peak
+P95, projected regime scale, every material contributor to the maximum
+portfolio pressure interval, and the full proportional-equity diagnostic, so
+each recommendation remains auditable. `--output` saves the report and
+`--json-output` saves a machine-readable result.
 
 The evaluator only calls public Hyperliquid Info API endpoints. It does not
 import live backend settings, read private keys or API secrets, or modify
 production leader configuration.
+
+## Leader Suitability Evaluation
+
+`scripts/leader_suitability_evaluator.py` is the first-pass admission standard
+for new leaders. It combines normalized profitability, a 5 bps per-traded-
+notional copy-friction stress, portfolio pressure drawdown, completed and
+still-open loss duration, adverse excursion, underwater adding, minimum-order
+viability after safe sizing, and account-placement conflicts. High fill
+frequency, maker activity, smaller markets, and own-liquidation history are
+reported but are not automatic penalties; only measured copy economics and
+loss-management behavior change the score.
+
+The fixed hard gates reject unreliable history, non-positive economics after
+copy friction, a loss-holding P95 of at least 14 days combined with a closed
+loss of at least 25%, safe sizing that makes at least 10% of copied notional
+untradeable, a lifecycle drawdown of at least 35% held for seven days, or a
+still-open losing position held for 14 days after a deep adverse excursion and
+predominantly underwater adding. Liquidations remain visible as observation
+data but never change score, grade, warning level, or a hard gate. Intrinsic
+grades are `STRONG` at 80+, `ADDABLE` at 65+, `WATCH` at 55+, and `REJECT`
+below that or when a hard gate fires.
+
+```bash
+python scripts/leader_suitability_evaluator.py \
+  --group candidate=main \
+  candidate=<PUBLIC_LEADER_ADDRESS>
+```
+
+Use repeated labelled addresses and `--group LABEL=main|sub` arguments to
+measure historical first-arrival conflicts within a proposed account layout.
+`--output` writes the address-free Markdown report and `--json-output` writes
+the address-free machine-readable result. Runtime secrets and follower state
+are never read, reports identify leaders only by their supplied labels, and
+cache directories use one-way address digests.
+
+## Leader Candidate Discovery
+
+`scripts/leader_candidate_discovery.py` builds a broad, deliberately lenient
+candidate funnel before the full suitability evaluation. It samples Hyperdash
+leaderboards across account-value bands so large accounts cannot monopolize the
+pool, combines 30-day PnL, all-time PnL, and Copy Score views, preserves style
+diversity, and then checks a limited shortlist against public Hyperliquid fills.
+The quick screen records activity, sampled break-even friction, maker share,
+and market count for prioritization. Own-liquidation rounds are retained only
+as observation data and do not affect quick score, rejection, or rank. The
+quick screen is not a substitute for the lifecycle evaluator.
+
+```bash
+python scripts/leader_candidate_discovery.py \
+  --quick-limit 100 \
+  --full-shortlist 15
+```
+
+The default private research root is `~/.copytrade-leader-research`, outside
+the repository. Directories and files are created with modes `0700` and `0600`;
+console and public reports contain address suffixes only, with a short digest
+added if two candidates share the same suffix. Configured and previously
+removed database leaders are excluded by default. The command is read-only and
+never mutates bot settings. Feed only the resulting private shortlist into
+`leader_suitability_evaluator.py` for the final admission decision.
 
 ## Project Structure
 

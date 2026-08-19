@@ -1,7 +1,8 @@
 "use client";
 
+import type { ReactNode } from "react";
 import Link from "next/link";
-import { formatDateTime, formatDecimal, formatMs, formatNotional } from "@/lib/format";
+import { formatDateTime, formatDecimal, formatLossMoney, formatLossPercent, formatMs, formatNotional, formatProfitLossBps, formatProfitLossMoney, formatProfitLossPercent, profitLossClass } from "@/lib/format";
 
 type Numeric = string | number | null;
 
@@ -177,8 +178,6 @@ export function LeaderPerformanceOverviewPanel({ data }: { data: LeaderPerforman
 }
 
 function PerformanceCard({ leader }: { leader: LeaderPerformance }) {
-  const contribution = Number(leader.follower_account.known_total_pnl_ex_funding ?? 0);
-  const pnl = Number(leader.leader_account.portfolio_pnl_since_join ?? 0);
   const flags = leader.recommendation.flags.slice(0, 3);
   return (
     <article className="rounded-md border border-line bg-slate-50 p-4">
@@ -199,12 +198,12 @@ function PerformanceCard({ leader }: { leader: LeaderPerformance }) {
       </div>
 
       <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <CompactMetric label="Leader PnL" value={money(leader.leader_account.portfolio_pnl_since_join)} tone={numberTone(pnl)} />
-        <CompactMetric label="Leader 回报" value={percent(leader.leader_account.portfolio_return_pct)} tone={numberTone(pnl)} />
-        <CompactMetric label="最大回撤" value={`${money(leader.leader_account.max_drawdown)} / ${percent(leader.leader_account.max_drawdown_pct)}`} tone="danger" />
-        <CompactMetric label="你的总贡献*" value={money(leader.follower_account.known_total_pnl_ex_funding)} tone={numberTone(contribution)} />
-        <CompactMetric label="已实现 / 浮盈亏" value={`${money(leader.follower_account.realized_net_ex_funding)} / ${money(leader.follower_account.current_unrealized_pnl)}`} />
-        <CompactMetric label="跟单收益边际" value={bps(leader.follower_account.realized_edge_bps)} />
+        <CompactMetric label="Leader PnL" value={<PnlMoney value={leader.leader_account.portfolio_pnl_since_join} />} />
+        <CompactMetric label="Leader 回报" value={<PnlPercent value={leader.leader_account.portfolio_return_pct} />} />
+        <CompactMetric label="最大回撤" value={<><LossMoney value={leader.leader_account.max_drawdown} /> / <LossPercent value={leader.leader_account.max_drawdown_pct} /></>} />
+        <CompactMetric label="你的总贡献*" value={<PnlMoney value={leader.follower_account.known_total_pnl_ex_funding} />} />
+        <CompactMetric label="已实现 / 浮盈亏" value={<><PnlMoney value={leader.follower_account.realized_net_ex_funding} /> / <PnlMoney value={leader.follower_account.current_unrealized_pnl} /></>} />
+        <CompactMetric label="跟单收益边际" value={<PnlBps value={leader.follower_account.realized_edge_bps} />} />
         <CompactMetric label="加权滑点 / P95" value={`${bps(leader.copyability.weighted_adverse_slippage_bps)} / ${bps(leader.copyability.p95_slippage_bps)}`} />
         <CompactMetric label="延迟中位 / P95" value={`${formatMs(leader.copyability.median_event_to_final_ms)} / ${formatMs(leader.copyability.p95_event_to_final_ms)}`} />
         <CompactMetric label="完整交易 / PF" value={`${leader.behavior.complete_lifecycles} / ${formatDecimal(leader.behavior.profit_factor, { maximumFractionDigits: 2 })}`} />
@@ -259,13 +258,13 @@ export function LeaderPerformanceDetailPanel({ performance }: { performance: Lea
       <section className="panel overflow-hidden">
         <div className="border-b border-line px-4 py-3 text-sm font-semibold">Leader 原账户</div>
         <div className="grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-4">
-          <DetailMetric label="加入后 PnL" value={money(leader.leader_account.portfolio_pnl_since_join)} />
-          <DetailMetric label="加入后回报" value={percent(leader.leader_account.portfolio_return_pct)} />
-          <DetailMetric label="最大回撤" value={`${money(leader.leader_account.max_drawdown)} / ${percent(leader.leader_account.max_drawdown_pct)}`} />
-          <DetailMetric label="当前回撤" value={`${money(leader.leader_account.current_drawdown)} / ${percent(leader.leader_account.current_drawdown_pct)}`} />
+          <DetailMetric label="加入后 PnL" value={<PnlMoney value={leader.leader_account.portfolio_pnl_since_join} />} />
+          <DetailMetric label="加入后回报" value={<PnlPercent value={leader.leader_account.portfolio_return_pct} />} />
+          <DetailMetric label="最大回撤" value={<><LossMoney value={leader.leader_account.max_drawdown} /> / <LossPercent value={leader.leader_account.max_drawdown_pct} /></>} />
+          <DetailMetric label="当前回撤" value={<><LossMoney value={leader.leader_account.current_drawdown} /> / <LossPercent value={leader.leader_account.current_drawdown_pct} /></>} />
           <DetailMetric label="起始 / 当前账户价值" value={`${money(leader.leader_account.start_account_value)} / ${money(leader.leader_account.current_account_value)}`} />
-          <DetailMetric label="成交净收益（含 funding）" value={money(leader.leader_account.fill_realized_net_including_funding)} />
-          <DetailMetric label="当前浮盈亏" value={money(leader.leader_account.current_unrealized_pnl)} />
+          <DetailMetric label="成交净收益（含 funding）" value={<PnlMoney value={leader.leader_account.fill_realized_net_including_funding} />} />
+          <DetailMetric label="当前浮盈亏" value={<PnlMoney value={leader.leader_account.current_unrealized_pnl} />} />
           <DetailMetric label="成交量" value={money(leader.leader_account.trading_volume)} />
         </div>
         <div className="border-t border-line p-4">
@@ -278,14 +277,14 @@ export function LeaderPerformanceDetailPanel({ performance }: { performance: Lea
         <div className="panel overflow-hidden">
           <div className="border-b border-line px-4 py-3 text-sm font-semibold">你的实际跟单贡献</div>
           <div className="grid gap-3 p-4 sm:grid-cols-2">
-            <DetailMetric label="已知总贡献（不含 funding）" value={money(leader.follower_account.known_total_pnl_ex_funding)} />
-            <DetailMetric label="已实现净收益（不含 funding）" value={money(leader.follower_account.realized_net_ex_funding)} />
-            <DetailMetric label="当前复制仓位浮盈亏" value={money(leader.follower_account.current_unrealized_pnl)} />
-            <DetailMetric label="已实现曲线最大回撤" value={money(leader.follower_account.realized_curve_max_drawdown)} />
+            <DetailMetric label="已知总贡献（不含 funding）" value={<PnlMoney value={leader.follower_account.known_total_pnl_ex_funding} />} />
+            <DetailMetric label="已实现净收益（不含 funding）" value={<PnlMoney value={leader.follower_account.realized_net_ex_funding} />} />
+            <DetailMetric label="当前复制仓位浮盈亏" value={<PnlMoney value={leader.follower_account.current_unrealized_pnl} />} />
+            <DetailMetric label="已实现曲线最大回撤" value={<LossMoney value={leader.follower_account.realized_curve_max_drawdown} />} />
             <DetailMetric label="峰值分配名义价值" value={money(leader.follower_account.peak_allocated_notional)} />
-            <DetailMetric label="总贡献 / 峰值分配" value={percent(leader.follower_account.return_on_peak_allocated_pct)} />
+            <DetailMetric label="总贡献 / 峰值分配" value={<PnlPercent value={leader.follower_account.return_on_peak_allocated_pct} />} />
             <DetailMetric label="实际成交量" value={money(leader.follower_account.trading_volume)} />
-            <DetailMetric label="扣费后收益边际" value={bps(leader.follower_account.realized_edge_bps)} />
+            <DetailMetric label="扣费后收益边际" value={<PnlBps value={leader.follower_account.realized_edge_bps} />} />
             <DetailMetric label="交易所匹配订单 / fill" value={`${leader.follower_account.matched_exchange_orders} / ${leader.follower_account.exchange_fill_fragments}`} />
             <DetailMetric label="含手动同步仓位" value={leader.follower_account.includes_manual_synced_exposure ? "是" : "否"} />
           </div>
@@ -313,7 +312,7 @@ export function LeaderPerformanceDetailPanel({ performance }: { performance: Lea
             <DetailMetric label="完整生命周期（赢 / 输）" value={`${leader.behavior.complete_lifecycles}（${leader.behavior.winning_lifecycles} / ${leader.behavior.losing_lifecycles}）`} />
             <DetailMetric label="胜率（只展示）" value={percent(leader.behavior.lifecycle_win_rate_pct)} />
             <DetailMetric label="Profit factor" value={formatDecimal(leader.behavior.profit_factor, { maximumFractionDigits: 2 })} />
-            <DetailMetric label="生命周期收益中位 / 最差" value={`${bps(leader.behavior.median_lifecycle_return_bps)} / ${bps(leader.behavior.worst_lifecycle_return_bps)}`} />
+            <DetailMetric label="生命周期收益中位 / 最差" value={<><PnlBps value={leader.behavior.median_lifecycle_return_bps} /> / <PnlBps value={leader.behavior.worst_lifecycle_return_bps} /></>} />
             <DetailMetric label="持仓时长中位 / P90 / 最大" value={`${hours(leader.behavior.median_hold_hours)} / ${hours(leader.behavior.p90_hold_hours)} / ${hours(leader.behavior.max_hold_hours)}`} />
             <DetailMetric label="盈利 / 亏损持仓中位" value={`${hours(leader.behavior.winner_median_hold_hours)} / ${hours(leader.behavior.loser_median_hold_hours)}`} />
             <DetailMetric label="亏损 / 盈利持仓时长倍数" value={ratio(leader.behavior.loser_to_winner_hold_ratio)} />
@@ -368,17 +367,37 @@ function ScoreMetric({ label, score }: { label: string; score: number }) {
   );
 }
 
-function CompactMetric({ label, value, tone }: { label: string; value: string; tone?: "ok" | "danger" }) {
+function CompactMetric({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div className="rounded-md border border-line bg-white px-3 py-2">
       <div className="text-[11px] text-slate-500">{label}</div>
-      <div className={`mt-1 break-words text-sm font-medium tabular-nums ${tone === "ok" ? "text-accent" : tone === "danger" ? "text-danger" : "text-ink"}`}>{value}</div>
+      <div className="mt-1 break-words text-sm font-medium tabular-nums text-ink">{value}</div>
     </div>
   );
 }
 
-function DetailMetric({ label, value }: { label: string; value: string }) {
+function DetailMetric({ label, value }: { label: string; value: ReactNode }) {
   return <CompactMetric label={label} value={value} />;
+}
+
+function PnlMoney({ value }: { value: Numeric }) {
+  return <span className={profitLossClass(value)}>{formatProfitLossMoney(value)}</span>;
+}
+
+function PnlPercent({ value }: { value: Numeric }) {
+  return <span className={profitLossClass(value)}>{formatProfitLossPercent(value)}</span>;
+}
+
+function PnlBps({ value }: { value: Numeric }) {
+  return <span className={profitLossClass(value)}>{formatProfitLossBps(value)}</span>;
+}
+
+function LossMoney({ value }: { value: Numeric }) {
+  return <span className={Number(value ?? 0) === 0 ? "text-ink" : "text-danger"}>{formatLossMoney(value)}</span>;
+}
+
+function LossPercent({ value }: { value: Numeric }) {
+  return <span className={Number(value ?? 0) === 0 ? "text-ink" : "text-danger"}>{formatLossPercent(value)}</span>;
 }
 
 function PnlSparkline({ points }: { points: Array<{ time: string; pnl: string }> }) {
@@ -394,9 +413,9 @@ function PnlSparkline({ points }: { points: Array<{ time: string; pnl: string }>
     <div>
       <svg aria-label="Leader PnL history" className="h-32 w-full rounded-md bg-slate-50" preserveAspectRatio="none" viewBox="0 0 100 40">
         {zeroY !== null ? <line stroke="#cbd5e1" strokeDasharray="2 2" strokeWidth="0.4" x1="0" x2="100" y1={zeroY} y2={zeroY} /> : null}
-        <polyline fill="none" points={polyline} stroke={values.at(-1)! >= 0 ? "#0f766e" : "#b91c1c"} strokeLinejoin="round" strokeWidth="1.2" vectorEffect="non-scaling-stroke" />
+        <polyline fill="none" points={polyline} stroke={values.at(-1)! >= 0 ? "#059669" : "#b91c1c"} strokeLinejoin="round" strokeWidth="1.2" vectorEffect="non-scaling-stroke" />
       </svg>
-      <div className="mt-1 flex justify-between text-[11px] text-slate-500"><span>{formatDateTime(points[0]?.time)}</span><span>{money(values.at(-1) ?? null)}</span><span>{formatDateTime(points.at(-1)?.time)}</span></div>
+      <div className="mt-1 flex justify-between text-[11px] text-slate-500"><span>{formatDateTime(points[0]?.time)}</span><PnlMoney value={values.at(-1) ?? null} /><span>{formatDateTime(points.at(-1)?.time)}</span></div>
     </div>
   );
 }
@@ -419,10 +438,6 @@ function ratio(value: Numeric): string {
 
 function hours(value: Numeric): string {
   return value === null || value === undefined ? "--" : `${formatDecimal(value, { maximumFractionDigits: 2 })}h`;
-}
-
-function numberTone(value: number): "ok" | "danger" | undefined {
-  return value > 0 ? "ok" : value < 0 ? "danger" : undefined;
 }
 
 function scoreClass(score: number): string {

@@ -25,7 +25,7 @@ from app.api.account_states import (
     _load_follower_spot_debug,
     _sizing_payload,
 )
-from app.services.account_abstraction import load_account_abstraction_state
+from app.services.account_abstraction import load_account_abstraction_state, resolved_value_payload
 from app.services.auto_copy import RECOVERY_ORDER_STATUSES
 from app.services.baseline import (
     baseline_readiness_summary,
@@ -59,7 +59,6 @@ from app.services.watcher_status import (
 from app.tasks.leader_state_poller import (
     account_state_cache_status,
     monitoring_account_state_stale_seconds,
-    schedule_account_state_refresh_if_stale,
 )
 
 router = APIRouter(tags=["dashboard"])
@@ -97,11 +96,298 @@ async def dashboard(_: CurrentUser, db: DbSession, settings: AppSettings):
 
 @router.get("/dashboard/realtime")
 async def dashboard_realtime(_: CurrentUser, db: DbSession, settings: AppSettings):
-    state_refresh = await schedule_account_state_refresh_if_stale(
+    # The operator dashboard is a read-only projection of watcher-persisted
+    # state. Browser refreshes must never schedule exchange Info API traffic.
+    state_refresh = await account_state_cache_status(
         settings,
         max_age_seconds=monitoring_account_state_stale_seconds(settings),
     )
     return await build_dashboard_realtime_payload(db=db, settings=settings, state_refresh=state_refresh)
+
+
+@router.get("/dashboard/overview")
+async def dashboard_overview(_: CurrentUser, db: DbSession, settings: AppSettings):
+    """Return the small, DB-only projection consumed by Command Center.
+
+    The legacy realtime payload also serves diagnostics and preflight clients,
+    so it intentionally contains rich follower/leader state.  Command Center
+    only needs execution accounts, active leader configuration, recent orders,
+    and the applied kill-switch state.  Keeping this projection separate avoids
+    rebuilding and transferring several megabytes whenever the operator changes
+    tabs, and it never schedules exchange I/O.
+    """
+
+    return await build_dashboard_overview_payload(db=db, settings=settings)
+
+
+async def build_dashboard_overview_payload(
+    *,
+    db: DbSession,
+    settings: AppSettings,
+) -> dict[str, object]:
+    response_at = datetime.now(timezone.utc)
+    risk = await get_risk_setting(db)
+    kill_switch = bool(risk.get("kill_switch", False))
+
+    main_address = str(
+        settings.hyperliquid_account_address
+        or settings.hyperliquid_signer_address()
+        or ""
+    ).strip().lower()
+    subaccounts = [
+        address
+        for address in settings.hyperliquid_execution_subaccount_address_list()
+        if address and address != main_address
+    ]
+    configured_accounts = [
+        ("", main_address or None, "MAIN", "Main account"),
+        *[
+            (address, address, "SUBACCOUNT", f"Subaccount · {address[-4:]}")
+            for address in subaccounts
+        ],
+    ]
+    addresses = [address for _, address, _, _ in configured_accounts if address]
+
+    status_keys = [
+        "watcher_status" if not scope else f"watcher_status:{scope}"
+        for scope, _, _, _ in configured_accounts
+    ]
+    watcher_rows = (
+        await db.execute(select(AppSetting).where(AppSetting.key.in_(status_keys)))
+    ).scalars().all()
+    watcher_values = {
+        row.key: row.value if isinstance(row.value, dict) else {}
+        for row in watcher_rows
+    }
+    watcher_status_by_scope = watcher_statuses_by_scope(watcher_rows)
+    watcher_active_by_scope = watcher_active_leaders_by_scope(watcher_status_by_scope)
+
+    state_rows = []
+    position_rows = []
+    if addresses:
+        state_rows = (
+            await db.execute(
+                select(LatestAccountState)
+                .where(LatestAccountState.role == FOLLOWER)
+                .where(LatestAccountState.address.in_(addresses))
+                .order_by(LatestAccountState.address, LatestAccountState.dex)
+            )
+        ).scalars().all()
+        position_rows = (
+            await db.execute(
+                select(LatestAccountPosition)
+                .where(LatestAccountPosition.role == FOLLOWER)
+                .where(LatestAccountPosition.address.in_(addresses))
+                .where(LatestAccountPosition.active.is_(True))
+                .order_by(
+                    LatestAccountPosition.address,
+                    LatestAccountPosition.dex,
+                    LatestAccountPosition.coin,
+                )
+            )
+        ).scalars().all()
+
+    states_by_address: dict[str, list[LatestAccountState]] = {}
+    states_by_id: dict[int, LatestAccountState] = {}
+    for row in state_rows:
+        states_by_address.setdefault(row.address.lower(), []).append(row)
+        states_by_id[row.id] = row
+    positions_by_address: dict[str, list[LatestAccountPosition]] = {}
+    for row in position_rows:
+        positions_by_address.setdefault(row.address.lower(), []).append(row)
+
+    # Attribute follower positions from the durable allocation ledger.  This is
+    # intentionally a DB-only overview projection: opening the dashboard never
+    # reaches Hyperliquid and cannot contend with the watcher hot path.  A
+    # detached liquidation lifecycle is operator-owned, so it must not be
+    # presented as an actively followed leader position.
+    execution_scopes = [scope for scope, _, _, _ in configured_accounts]
+    active_allocations = (
+        (
+            await db.execute(
+                select(LeaderPositionAllocationRecord)
+                .where(
+                    LeaderPositionAllocationRecord.execution_venue
+                    == ExecutionVenue.HYPERLIQUID.value
+                )
+                .where(LeaderPositionAllocationRecord.venue_account.in_(execution_scopes))
+                .where(LeaderPositionAllocationRecord.status != "CLOSED")
+                .where(LeaderPositionAllocationRecord.status != "LIQUIDATION_DETACHED")
+                .where(LeaderPositionAllocationRecord.allocated_qty > Decimal("0"))
+            )
+        )
+        .scalars()
+        .all()
+        if execution_scopes
+        else []
+    )
+    position_owners: dict[tuple[str, str, str, str], set[str]] = {}
+    for allocation in active_allocations:
+        key = _overview_position_owner_key(
+            execution_scope=allocation.venue_account,
+            dex=allocation.dex,
+            canonical_coin=(
+                allocation.canonical_coin or allocation.hyperliquid_coin
+            ),
+            side=allocation.position_side,
+        )
+        position_owners.setdefault(key, set()).add(
+            normalize_leader_address(allocation.leader_address)
+        )
+
+    accounts: list[dict[str, object]] = []
+    for scope, address, account_type, label in configured_accounts:
+        status_key = "watcher_status" if not scope else f"watcher_status:{scope}"
+        watcher = watcher_values.get(status_key, {})
+        if not address:
+            accounts.append(
+                {
+                    "execution_scope": scope,
+                    "account_type": account_type,
+                    "account_label": label,
+                    "address": None,
+                    "account_value": None,
+                    "account_value_used_for_sizing": None,
+                    "available_collateral_used_for_margin_check": None,
+                    "withdrawable": None,
+                    "total_margin_used": None,
+                    "data_age_ms": None,
+                    "stale": True,
+                    "error_message": "account address is not configured",
+                    "watcher_running": bool(watcher.get("low_latency_watcher_running")),
+                    "watcher_ready": bool(watcher.get("ready_for_low_latency_live")),
+                    "active_leaders": watcher.get("active_leaders") or [],
+                    "positions": [],
+                }
+            )
+            continue
+
+        address_states = states_by_address.get(address, [])
+        primary_state = next(
+            (row for row in address_states if str(row.dex or "") == ""),
+            address_states[0] if address_states else None,
+        )
+        primary = account_state_payload(
+            primary_state,
+            [],
+            stale_seconds=int(settings.account_state_stale_seconds),
+        )
+        abstraction = await load_account_abstraction_state(
+            db,
+            role=FOLLOWER,
+            address=address,
+        )
+        resolved = resolved_value_payload(abstraction, "") or {}
+        account_value_used = (
+            resolved.get("account_value_used_for_sizing")
+            or resolved.get("accountValueUsedForSizing")
+            or resolved.get("account_value")
+            or resolved.get("accountValue")
+            or primary.get("account_value")
+        )
+        available_collateral = (
+            resolved.get("available_collateral_used_for_margin_check")
+            or resolved.get("availableCollateralUsedForMarginCheck")
+            or resolved.get("withdrawable_or_available")
+            or resolved.get("withdrawableOrAvailable")
+            or primary.get("withdrawable")
+        )
+        positions = []
+        for row in positions_by_address.get(address, []):
+            owner_candidates = position_owners.get(
+                _overview_position_owner_key(
+                    execution_scope=scope,
+                    dex=row.dex,
+                    canonical_coin=row.canonical_coin or row.coin,
+                    side=row.side,
+                ),
+                set(),
+            )
+            leader_address = (
+                next(iter(owner_candidates))
+                if len(owner_candidates) == 1
+                else None
+            )
+            attribution = (
+                "LEADER"
+                if leader_address
+                else "AMBIGUOUS"
+                if owner_candidates
+                else "MANUAL"
+            )
+            positions.append(
+                _overview_position_payload(
+                    row,
+                    account_state=states_by_id.get(row.account_state_id),
+                    leader_address=leader_address,
+                    attribution=attribution,
+                )
+            )
+        accounts.append(
+            {
+                "execution_scope": scope,
+                "account_type": account_type,
+                "account_label": label,
+                "address": address,
+                "account_value": primary.get("account_value"),
+                "account_value_used_for_sizing": account_value_used,
+                "available_collateral_used_for_margin_check": available_collateral,
+                "withdrawable": primary.get("withdrawable"),
+                "total_margin_used": primary.get("total_margin_used"),
+                "data_age_ms": primary.get("data_age_ms"),
+                "stale": bool(primary.get("stale")),
+                "error_message": primary.get("error_message"),
+                "watcher_running": bool(watcher.get("low_latency_watcher_running")),
+                "watcher_ready": bool(watcher.get("ready_for_low_latency_live")),
+                "active_leaders": watcher.get("active_leaders") or [],
+                "positions": positions,
+            }
+        )
+
+    leader_rows = (await db.execute(active_leaders_statement())).scalars().all()
+    leaders = [
+        {
+            "id": row.id,
+            "enabled": row.enabled,
+            "deleted_at": row.deleted_at.isoformat() if row.deleted_at else None,
+            "leader_address": row.leader_address,
+            "copy_multiplier": decimal_to_string(row.copy_multiplier),
+            "fixed_account_value": decimal_to_string(row.fixed_account_value),
+            "hyperliquid_vault_address": row.hyperliquid_vault_address,
+            "watcher_status": (
+                "active"
+                if normalize_leader_address(row.leader_address)
+                in watcher_active_by_scope.get(
+                    watcher_execution_scope(row.hyperliquid_vault_address),
+                    set(),
+                )
+                else "not_subscribed"
+            ),
+        }
+        for row in leader_rows
+    ]
+
+    recent_orders = (
+        await db.execute(select(ExecutionOrder).order_by(ExecutionOrder.created_at.desc()).limit(20))
+    ).scalars().all()
+    auto_copy_orders = [row for row in recent_orders if row.source_type == "AUTO_COPY"]
+    return {
+        "last_updated_at": response_at.isoformat(),
+        "runtime": {
+            "dry_run_or_live": "live" if settings.trading_enabled and not kill_switch else "dry-run",
+            "kill_switch": kill_switch,
+            "kill_switch_updated_at": risk.get("kill_switch_updated_at"),
+            "live_opens_enabled": bool(
+                settings.trading_enabled
+                and settings.hyperliquid_trading_enabled
+                and not kill_switch
+            ),
+        },
+        "accounts": accounts,
+        "leaders": leaders,
+        "recent_orders": [_dashboard_order_payload(row) for row in recent_orders],
+        "latency": _dashboard_latency_summary(auto_copy_orders),
+    }
 
 
 async def build_dashboard_realtime_payload(
@@ -267,6 +553,7 @@ async def build_dashboard_realtime_payload(
                     "fallback_venue": leader.fallback_venue,
                     "max_notional_per_trade": decimal_to_string(leader.max_notional_per_trade),
                     "max_total_notional": decimal_to_string(leader.max_total_notional),
+                    "execution_account": str(leader.hyperliquid_vault_address or "").lower(),
                 },
                 "dex_states": dex_state_payloads,
                 "dexStates": dex_state_payloads,
@@ -430,36 +717,120 @@ async def build_dashboard_realtime_payload(
             }
             for row in allocations
         ],
-        "recent_orders": [
-            {
-                "id": row.id,
-                "allocation_id": row.allocation_id,
-                "leader_address": row.leader_address,
-                "source_coin": row.source_coin,
-                "execution_venue": row.execution_venue,
-                "dex": row.dex,
-                "canonical_coin": row.canonical_coin,
-                "venue_symbol": row.venue_symbol,
-                "side": row.side,
-                "order_action": row.order_action,
-                "status": row.status,
-                "dry_run": row.dry_run,
-                "reason": row.error_message,
-                "avg_fill_price": str(row.avg_fill_price) if row.avg_fill_price is not None else None,
-                "leader_entry_px": str(row.leader_entry_px) if row.leader_entry_px is not None else None,
-                "follower_avg_entry_px": str(row.follower_avg_entry_px) if row.follower_avg_entry_px is not None else None,
-                "event_to_ack_ms": row.event_to_ack_ms,
-                "ws_to_submit_ms": row.ws_to_submit_ms,
-                "submit_to_ack_ms": row.submit_to_ack_ms,
-                "total_hot_path_ms": row.total_hot_path_ms,
-                "created_at": row.created_at.isoformat() if row.created_at else None,
-            }
-            for row in recent_orders
-        ],
+        "recent_orders": [_dashboard_order_payload(row) for row in recent_orders],
         "latency": latency_summary,
         "baseline": baseline_summary,
         "preflight_blockers": preflight_blockers,
         "small_live_start_checklist": checklist,
+    }
+
+
+def _overview_position_payload(
+    row: LatestAccountPosition,
+    *,
+    account_state: LatestAccountState | None,
+    leader_address: str | None = None,
+    attribution: str = "MANUAL",
+) -> dict[str, object]:
+    """Strip raw exchange payloads and compatibility aliases from Overview."""
+
+    payload = position_payload(row, account_state=account_state)
+    raw_position = row.raw_payload_masked if isinstance(row.raw_payload_masked, dict) else {}
+    cumulative_funding = raw_position.get("cumFunding")
+    funding_since_open = (
+        cumulative_funding.get("sinceOpen")
+        if isinstance(cumulative_funding, dict)
+        else None
+    )
+    if funding_since_open is None:
+        funding_since_open = raw_position.get("fundingSinceOpen")
+    if funding_since_open is None:
+        funding_since_open = raw_position.get("funding_since_open")
+    funding_pnl_since_open = None
+    if funding_since_open is not None:
+        try:
+            # Hyperliquid cumFunding is recorded from the account debit
+            # perspective.  Operator-facing PnL uses the inverse convention:
+            # funding received is positive and funding paid is negative.
+            funding_pnl_since_open = -Decimal(str(funding_since_open))
+        except Exception:
+            funding_pnl_since_open = None
+    return_on_equity = raw_position.get("returnOnEquity")
+    if return_on_equity is None:
+        return_on_equity = raw_position.get("return_on_equity")
+    if return_on_equity is None:
+        margin_used = row.margin_used
+        if margin_used is not None and margin_used != 0 and row.unrealized_pnl is not None:
+            return_on_equity = row.unrealized_pnl / abs(margin_used)
+    return {
+        "dex": payload.get("dex"),
+        "canonical_coin": payload.get("canonical_coin"),
+        "coin": payload.get("coin"),
+        "side": payload.get("side"),
+        "size": payload.get("size"),
+        "notional": payload.get("notional"),
+        "entry_px": payload.get("entry_px"),
+        "mark_px": payload.get("mark_px"),
+        "unrealized_pnl": payload.get("unrealized_pnl"),
+        "return_on_equity": str(return_on_equity) if return_on_equity is not None else None,
+        "funding_since_open": (
+            str(funding_pnl_since_open)
+            if funding_pnl_since_open is not None
+            else None
+        ),
+        "leverage": payload.get("leverage"),
+        "margin_used": payload.get("margin_used"),
+        "margin_mode": payload.get("margin_mode"),
+        "liquidation_px": payload.get("liquidation_px"),
+        "data_age_ms": payload.get("data_age_ms"),
+        "leader_address": leader_address,
+        "attribution": attribution,
+    }
+
+
+def _overview_position_owner_key(
+    *,
+    execution_scope: str | None,
+    dex: str | None,
+    canonical_coin: str | None,
+    side: str | None,
+) -> tuple[str, str, str, str]:
+    return (
+        str(execution_scope or "").strip().lower(),
+        str(dex or "").strip().lower(),
+        str(canonical_coin or "").strip().upper(),
+        str(side or "").strip().upper(),
+    )
+
+
+def _dashboard_order_payload(row: ExecutionOrder) -> dict[str, object]:
+    return {
+        "id": row.id,
+        "allocation_id": row.allocation_id,
+        "leader_address": row.leader_address,
+        "source_coin": row.source_coin,
+        "execution_venue": row.execution_venue,
+        "execution_account": row.venue_account,
+        "dex": row.dex,
+        "canonical_coin": row.canonical_coin,
+        "venue_symbol": row.venue_symbol,
+        "side": row.side,
+        "order_action": row.order_action,
+        "status": row.status,
+        "dry_run": row.dry_run,
+        "reason": row.error_message,
+        "avg_fill_price": str(row.avg_fill_price) if row.avg_fill_price is not None else None,
+        "leader_entry_px": str(row.leader_entry_px) if row.leader_entry_px is not None else None,
+        "follower_avg_entry_px": (
+            str(row.follower_avg_entry_px)
+            if row.follower_avg_entry_px is not None
+            else None
+        ),
+        "event_to_ack_ms": row.event_to_ack_ms,
+        "ws_to_submit_ms": row.ws_to_submit_ms,
+        "submit_to_ack_ms": row.submit_to_ack_ms,
+        "total_hot_path_ms": row.total_hot_path_ms,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
     }
 
 

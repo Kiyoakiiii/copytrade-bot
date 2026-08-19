@@ -30,9 +30,11 @@ from app.services.low_latency_watcher import (
     FillEvent,
     FollowerManualPositionGuard,
     HyperliquidLowLatencyWatcher,
+    DELETED_LEADER_MANUAL_TAKEOVER_REASON,
     LEADER_FILL_BACKFILL_OVERLAP_MS,
     LEADER_FILL_PRICE_FALLBACK_SOURCE,
     LIQUIDATION_DETACHED_STATUS,
+    MANUAL_FILL_POSITION_EXACT,
     MINIMUM_RESIDUAL_ECONOMIC_FLAT_REASON,
     MINIMUM_RESIDUAL_ECONOMIC_FLAT_PENDING_REASON,
     LowLatencyPriceCache,
@@ -42,6 +44,7 @@ from app.services.low_latency_watcher import (
     OrderSubmitClaimLost,
     PENDING_OPEN_REASON,
     PENDING_OPEN_STATUS,
+    UNSUPPORTED_SPOT_FILL_REASON,
     PendingIntentLedger,
     PriceEntry,
     RetryableFillProcessingError,
@@ -94,6 +97,7 @@ from app.services.low_latency_watcher import (
     _follower_position_freshness_retry,
     _follower_position_state_is_fresh,
     _ignore_without_allocation_reason,
+    _is_hyperliquid_spot_fill,
     _is_account_value_pending_open,
     _is_deferred_reduce_block,
     _is_pending_open_block,
@@ -359,6 +363,70 @@ def fill_event(
         is_snapshot=snapshot,
         ws_received_at=datetime.fromtimestamp(1_700_000_000_100 / 1000, timezone.utc),
     )
+
+
+def test_hyperliquid_numeric_at_market_is_spot() -> None:
+    assert _is_hyperliquid_spot_fill(fill_event(coin="@334", asset_id=None))
+    assert not _is_hyperliquid_spot_fill(fill_event(coin="BTC", asset_id=None))
+    assert not _is_hyperliquid_spot_fill(
+        fill_event(coin="HYUNDAI", dex="xyz", asset_id=None)
+    )
+
+
+def test_spot_fill_becomes_terminal_before_perp_hot_path_dependencies() -> None:
+    recorded: list[dict[str, object]] = []
+
+    class SpotTerminalEngine(FillDrivenExecutionEngine):
+        async def _record_lifecycle_ignored_order(self, db, **kwargs):
+            recorded.append(kwargs)
+            return SimpleNamespace(status="IGNORED")
+
+        async def _peek_allocation_for_lifecycle_gate(self, db, current_leader, market):
+            raise AssertionError("spot fill reached perpetual allocation lookup")
+
+        async def _hydrate_asset_id(self, fill):
+            raise AssertionError("spot fill reached perpetual metadata hydration")
+
+        async def _resolved_account_value(self, *args, **kwargs):
+            raise AssertionError("spot fill reached account-value lookup")
+
+    engine = SpotTerminalEngine(
+        settings=settings(trading_enabled=True, hyperliquid_trading_enabled=True),
+        info_client=NoopInfoClient(),
+        execution_client=TimeoutExecutionClient(),
+        price_cache=LowLatencyPriceCache(stale_ms=2_000),
+    )
+    event = fill_event(
+        coin="@334",
+        asset_id=None,
+        side="B",
+        start_position="0",
+        direction="Buy",
+        price="0.13115",
+        size="3761.7",
+    )
+    now = datetime.now(timezone.utc)
+
+    result = asyncio.run(
+        engine.reconcile_leader_symbol_allocation(
+            FakeSession(),
+            fill=event,
+            leader=leader(),
+            dedupe_started_at=now,
+            dedupe_done_at=now,
+            debounce_started_at=now,
+            debounce_released_at=now,
+            lock_wait_started_at=now,
+            lock_acquired_at=now,
+            ws_received_at=event.ws_received_at,
+            submit_order=True,
+        )
+    )
+
+    assert result.status == "IGNORED"
+    assert recorded[0]["reason"] == UNSUPPORTED_SPOT_FILL_REASON
+    assert recorded[0]["action"] == "IGNORED_SPOT_FILL"
+    assert recorded[0]["lifecycle_gate"] == "UNSUPPORTED_SPOT_FILL"
 
 
 class FakeResult:
@@ -6790,10 +6858,61 @@ def test_allocation_sync_closes_deleted_leader_allocation() -> None:
     assert allocation.allocated_notional == Decimal("0")
     assert allocation.target_notional == Decimal("0")
     assert allocation.last_leader_position_size == Decimal("0")
+    market = fill_event(coin="HYPE").market
+    guard = watcher.manual_position_guard.active_entry(market)
+    assert guard is not None
+    assert guard.reason == DELETED_LEADER_MANUAL_TAKEOVER_REASON
+    assert guard.expected_position_side == PositionSide.LONG
+    assert guard.expected_position_qty == Decimal("25.21")
+    assert guard.expected_position_relation == MANUAL_FILL_POSITION_EXACT
+    assert guard.position_change_confirmed_at is not None
     events = [item for item in db.added if isinstance(item, AllocationEvent)]
     risks = [item for item in db.added if isinstance(item, RiskEvent)]
     assert events[-1].action == "DELETED_LEADER_ALLOCATION_CLOSED"
     assert risks[-1].event_type == "DELETED_LEADER_ALLOCATION_CLOSED"
+
+
+def test_deleted_leader_manual_takeover_guard_is_persisted() -> None:
+    allocation = allocation_record(qty="25.21", notional="1695.654312")
+    allocation.hyperliquid_coin = "HYPE"
+    allocation.dex = ""
+    allocation.canonical_coin = "HYPE"
+    allocation.position_side = "LONG"
+    db = MagicMock(spec=AsyncSession)
+    db.execute = AsyncMock()
+    db.scalar = AsyncMock(side_effect=[allocation, None])
+    db.flush = AsyncMock()
+    watcher = HyperliquidLowLatencyWatcher(
+        settings=settings(),
+        info_client=NoopInfoClient(),
+        execution_client=TimeoutExecutionClient(),
+        db_session_factory=FakeSessionFactory(),
+    )
+    observed_at = datetime(2026, 8, 14, 3, 51, 44, tzinfo=timezone.utc)
+
+    result = asyncio.run(
+        watcher._activate_deleted_leader_manual_takeover_guard(
+            db,
+            allocation=allocation,
+            observed_at=observed_at,
+        )
+    )
+
+    assert result is allocation
+    persisted = [
+        call.args[0]
+        for call in db.add.call_args_list
+        if isinstance(call.args[0], FollowerMarketGuard)
+    ]
+    assert len(persisted) == 1
+    assert persisted[0].active is True
+    assert persisted[0].position_version == 1
+    assert persisted[0].reason == DELETED_LEADER_MANUAL_TAKEOVER_REASON
+    assert persisted[0].expected_position_side == "LONG"
+    assert persisted[0].expected_position_qty == Decimal("25.21")
+    assert persisted[0].expected_position_relation == MANUAL_FILL_POSITION_EXACT
+    assert persisted[0].position_change_confirmed_at == observed_at
+    db.flush.assert_awaited_once()
 
 
 def test_liquidation_detached_allocation_releases_only_after_actual_follower_flat() -> None:

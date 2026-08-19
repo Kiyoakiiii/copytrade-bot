@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 import structlog
 from sqlalchemy.dialects.postgresql import insert
 
-from app.api import account_states, auth, dashboard, leaders, manual_orders, orders, positions, preflight, risk, stream, symbol_mappings, venues
+from app.api import account_states, auth, dashboard, leaders, manual_orders, orders, positions, preflight, research, risk, stream, symbol_mappings, venues
 from app.core.config import get_settings
 from app.core.logging import configure_logging, redact_text
 from app.db.session import SessionLocal
@@ -39,6 +39,13 @@ configure_logging(settings.log_level)
 log = structlog.get_logger(__name__)
 
 app = FastAPI(title=settings.app_name)
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz() -> dict[str, str]:
+    """Cheap liveness probe that does not build the OpenAPI document."""
+
+    return {"status": "ok"}
 
 
 async def _supervised_background_task(
@@ -259,6 +266,7 @@ app.include_router(positions.router)
 app.include_router(preflight.router)
 app.include_router(orders.router)
 app.include_router(manual_orders.router)
+app.include_router(research.router)
 app.include_router(risk.router)
 app.include_router(stream.router)
 

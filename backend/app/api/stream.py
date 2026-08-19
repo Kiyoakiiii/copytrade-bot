@@ -20,9 +20,9 @@ from app.tasks.leader_state_poller import (
 
 router = APIRouter(tags=["stream"])
 
-HEARTBEAT_SECONDS = 5.0
-VERSION_POLL_SECONDS = 2.0
-SNAPSHOT_CACHE_SECONDS = 5.0
+HEARTBEAT_SECONDS = 15.0
+VERSION_POLL_SECONDS = 5.0
+SNAPSHOT_CACHE_SECONDS = 15.0
 
 # Dashboard change detection used to calculate MAX(updated_at) on several
 # heavily-updated tables once per second, per browser.  PostgreSQL had to scan
@@ -70,34 +70,19 @@ async def stream_dashboard(request: Request, settings: AppSettings):
 
 
 async def _dashboard_event_generator(request: Request, settings: AppSettings):
-    last_seen = request.headers.get("last-event-id") or ""
-    last_version = ""
-    last_components: dict[str, str | None] = {}
-    last_heartbeat = 0.0
+    # Legacy clients may keep this connection open across a frontend deploy.
+    # Keep the endpoint as a zero-query heartbeat so they do not reconnect in
+    # a loop, but never poll PostgreSQL or rebuild dashboard snapshots here.
+    data_version = "db-snapshot-only"
     while not await request.is_disconnected():
-        components = await dashboard_component_versions()
-        version = dashboard_data_version(components)
-        now_monotonic = asyncio.get_running_loop().time()
-        if version != last_version or (last_seen and last_seen != version):
-            initial = not last_components
-            snapshot = await _dashboard_snapshot(settings, version)
-            changed = _changed_components(last_components, components)
-            for event_type, payload in _events_for_change(changed, snapshot, initial=initial):
-                yield sse_event(event_type=event_type, payload=payload, data_version=version)
-            last_components = components
-            last_version = version
-            last_seen = ""
-            last_heartbeat = now_monotonic
-        elif now_monotonic - last_heartbeat >= HEARTBEAT_SECONDS:
-            yield sse_event(
-                event_type="heartbeat",
-                payload={"ok": True},
-                data_version=version,
-                stale=False,
-                data_age_ms=None,
-            )
-            last_heartbeat = now_monotonic
-        await asyncio.sleep(VERSION_POLL_SECONDS)
+        yield sse_event(
+            event_type="heartbeat",
+            payload={"ok": True, "mode": "db_snapshot_only"},
+            data_version=data_version,
+            stale=False,
+            data_age_ms=None,
+        )
+        await asyncio.sleep(HEARTBEAT_SECONDS)
 
 
 async def dashboard_component_versions() -> dict[str, str | None]:

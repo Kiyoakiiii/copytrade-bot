@@ -11,7 +11,7 @@ from app.db.session import (
 
 def submit_db_settings(**overrides) -> Settings:
     values = {
-        "database_url": "postgresql+asyncpg://postgres/copytrade",
+        "database_url": "postgresql+asyncpg://postgres/testdb",
         "low_latency_submit_database_pool_size": 3,
         "low_latency_submit_database_max_overflow": 2,
     }

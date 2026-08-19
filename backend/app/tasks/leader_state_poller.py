@@ -288,6 +288,12 @@ async def poll_once(
     async with SessionLocal() as db:
         leaders = (await db.execute(active_leaders_statement())).scalars().all()
         enabled_dexes = HyperliquidDexRegistry(settings).enabled_dexes() if settings else []
+        # The monitoring poller performs dozens of sequential exchange calls.
+        # End the read transaction before the first network await so PostgreSQL
+        # never sees a multi-second ``idle in transaction`` session.  In
+        # particular, this prevents baseline rows touched later in the pass
+        # from remaining locked while the poller waits on another DEX.
+        await db.commit()
         mids_by_dex: dict[str, dict] = {}
         for dex in enabled_dexes:
             try:
@@ -335,11 +341,16 @@ async def poll_once(
                 "enabled_dexes": watcher_payload["enabled_dexes"],
             },
         )
+        await db.commit()
         if settings is not None:
             for leader in leaders:
                 capture_status = await db.get(AppSetting, baseline_capture_setting_key(leader.id))
                 if capture_status is not None and bool((capture_status.value or {}).get("ready")):
                     continue
+                # Initial capture is exceptional work and performs its own
+                # exchange reads.  Do not carry the capture-status read
+                # transaction into those requests.
+                await db.commit()
                 await capture_leader_position_baselines(
                     db,
                     leader=leader,
@@ -348,12 +359,17 @@ async def poll_once(
                     reason="poller missing baseline capture",
                     force_reset=True,
                 )
+                await db.commit()
+            # A pass where every capture is already ready still leaves the
+            # final db.get() read transaction open unless it is closed here.
+            await db.commit()
         if settings is not None:
             follower_address = settings.hyperliquid_follower_account_address()
             low_latency_primary = bool(settings.low_latency_required_for_live)
             if follower_address and not low_latency_primary:
                 follower_service = AccountStateService(follower_client or client)
                 for dex in enabled_dexes:
+                    await db.commit()
                     try:
                         follower_state = await follower_service.fetch_state(
                             role=FOLLOWER,
@@ -376,6 +392,8 @@ async def poll_once(
                             ),
                         )
                         log.warning("follower_state_poll_failed", dex=dex.dex_name, error=str(exc))
+                    await db.commit()
+                await db.commit()
                 try:
                     spot_state = await (follower_client or client).spot_clearinghouse_state(follower_address)
                     spot_payload = {
@@ -394,8 +412,11 @@ async def poll_once(
                         )
                     )
                     await db.execute(spot_stmt)
+                    await db.commit()
                 except Exception as exc:
+                    await db.rollback()
                     log.warning("follower_spot_state_poll_failed", error=str(exc))
+                await db.commit()
                 try:
                     abstraction = await AccountAbstractionService(
                         follower_client or client,
@@ -417,10 +438,15 @@ async def poll_once(
                             for dex in enabled_dexes
                         },
                     )
+                    await db.commit()
                 except Exception as exc:
+                    await db.rollback()
                     log.warning("follower_account_abstraction_poll_failed", error=str(exc))
         for leader in leaders:
             for dex in enabled_dexes:
+                # The previous DEX's short persistence transaction must be
+                # complete before waiting on the next clearinghouse request.
+                await db.commit()
                 try:
                     raw = await client.clearinghouse_state(leader.leader_address, dex=dex.dex_name)
                     now = datetime.now(timezone.utc)
@@ -476,7 +502,9 @@ async def poll_once(
                         state=account_state,
                         now=now,
                     )
+                    await db.commit()
                 except Exception as exc:
+                    await db.rollback()
                     await save_account_state(
                         db,
                         error_account_state(
@@ -493,7 +521,9 @@ async def poll_once(
                         dex=dex.dex_name,
                         error=str(exc),
                     )
+                    await db.commit()
             if _leader_requires_dynamic_account_abstraction(leader):
+                await db.commit()
                 try:
                     abstraction = await AccountAbstractionService(client, settings).fetch_snapshot(
                         role=LEADER,
@@ -512,7 +542,9 @@ async def poll_once(
                             for dex in enabled_dexes
                         },
                     )
+                    await db.commit()
                 except Exception as exc:
+                    await db.rollback()
                     log.warning(
                         "leader_account_abstraction_poll_failed",
                         leader_address=leader.leader_address,

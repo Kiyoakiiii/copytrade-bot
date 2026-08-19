@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     app_env: str = "production"
     log_level: str = "INFO"
 
+    # Production must provide DATABASE_URL from the ignored local .env file.
+    # This credential-free fallback is deliberately non-production.
     database_url: str = "postgresql+asyncpg://postgres/copytrade"
     database_pool_size: int = 12
     database_max_overflow: int = 4
@@ -136,9 +138,9 @@ class Settings(BaseSettings):
     account_value_full_refresh_seconds: float = 300.0
     # Performance analytics stay disabled inside the API process.
     # Production runs them from the isolated analytics worker, which writes a
-    # database cache and advances exchange cursors every six hours.
+    # database cache and advances exchange cursors every 15 minutes.
     leader_performance_refresh_enabled: bool = False
-    leader_performance_refresh_seconds: float = 21600.0
+    leader_performance_refresh_seconds: float = 900.0
     bootstrap_leader_addresses: str | None = None
 
     app_secret_key: SecretStr = Field(default=SecretStr("change-me"))

@@ -9,12 +9,14 @@ never prints the matched value. Use ``--staged`` from a pre-commit hook,
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import re
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlsplit
 
 
 @dataclass(frozen=True)
@@ -59,7 +61,53 @@ PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
         "AWS access-key candidate",
         re.compile(b"(?:AKIA|ASIA)" + rb"[A-Z0-9]{16}"),
     ),
+    (
+        "URL containing embedded credentials",
+        re.compile(
+            rb"[A-Za-z][A-Za-z0-9+.-]*" + b"://" + rb"[^\s:/@]+:[^\s/@]+@"
+        ),
+    ),
 )
+
+
+URL_PATTERN = re.compile(rb"(?:https?|wss?)://[^\s\"'<>`)]+", re.IGNORECASE)
+ALLOWED_URL_HOSTS = {
+    "api.binance.com",
+    "api.hyperliquid-testnet.xyz",
+    "api.hyperliquid.xyz",
+    "api.telegram.org",
+    "backend",
+    "developers.binance.com",
+    "fapi.binance.com",
+    "frontend",
+    "fstream.binance.com",
+    "get.docker.com",
+    "github.com",
+    "hyperliquid.gitbook.io",
+    "localhost",
+    "nextjs.org",
+    "raw.githubusercontent.com",
+    "registry.npmjs.org",
+    "stream.binancefuture.com",
+    "testnet.binancefuture.com",
+}
+LOCAL_SECRET_KEY_PATTERN = re.compile(
+    r"(?:PASSWORD|PASSWD|PRIVATE_KEY|SECRET|TOKEN|API_KEY|API_SECRET|"
+    r"ACCOUNT_ADDRESS|SUBACCOUNT|VAULT_ADDRESS|ADMIN_EMAIL|ALLOWED_USER_IDS|"
+    r"DATABASE_URL)",
+    re.IGNORECASE,
+)
+SENSITIVE_ASSIGNMENT_KEYS = {
+    "ADMIN_PASSWORD_BOOTSTRAP",
+    "APP_SECRET_KEY",
+    "BINANCE_API_KEY",
+    "BINANCE_API_SECRET",
+    "ENCRYPTION_MASTER_KEY",
+    "HYPERLIQUID_PRIVATE_KEY",
+    "HYPERLIQUID_SIGNER_PRIVATE_KEY",
+    "POSTGRES_PASSWORD",
+    "TELEGRAM_CONTROL_BOT_TOKEN",
+}
 
 
 def git(*args: str, input_data: bytes | None = None) -> bytes:
@@ -85,6 +133,140 @@ def scan(source: str, data: bytes) -> list[Finding]:
                     category=category,
                 )
             )
+    # Lockfiles contain package-registry and maintainer funding URLs generated
+    # by the package manager. They are not runtime frontend configuration.
+    source_path = source.split("@", 1)[0]
+    url_matches = (
+        ()
+        if source_path.endswith(("package-lock.json", "yarn.lock", "pnpm-lock.yaml"))
+        else URL_PATTERN.finditer(data)
+    )
+    for match in url_matches:
+        raw_url = match.group(0).decode("utf-8", "replace").rstrip(".,;:")
+        if any(marker in raw_url for marker in ("<", ">", "{", "}", "$")):
+            continue
+        try:
+            host = (urlsplit(raw_url).hostname or "").lower()
+        except ValueError:
+            host = ""
+        if _url_host_allowed(host):
+            continue
+        findings.append(
+            Finding(
+                source=source,
+                line=data.count(b"\n", 0, match.start()) + 1,
+                category="unapproved public URL (possible frontend endpoint)",
+            )
+        )
+    findings.extend(_literal_sensitive_assignment_findings(source, data))
+    return findings
+
+
+def _url_host_allowed(host: str) -> bool:
+    if host in ALLOWED_URL_HOSTS:
+        return True
+    if host == "hyperdash.com" or host.endswith(".hyperdash.com"):
+        return True
+    if host == "example.com" or host.endswith((".example", ".invalid", ".test")):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _literal_sensitive_assignment_findings(source: str, data: bytes) -> list[Finding]:
+    findings: list[Finding] = []
+    for line_number, raw_line in enumerate(data.splitlines(), start=1):
+        line = raw_line.decode("utf-8", "replace").strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.match(
+            r"[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?"
+            r"\s*(?::\s*[^=]+)?=\s*(.+)$",
+            line,
+        )
+        if match is None:
+            match = re.match(
+                r"[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?\s*:\s*(.+)$",
+                line,
+            )
+        if not match or match.group(1).upper() not in SENSITIVE_ASSIGNMENT_KEYS:
+            continue
+        value = match.group(2).strip().rstrip(",").strip().strip("\"").strip("'")
+        lower = value.lower()
+        if (
+            not value
+            or value.startswith(("${", "<"))
+            or lower in {"none", "null"}
+            or any(marker in lower for marker in ("change-me", "changeme", "placeholder", "example", "dummy", "redacted"))
+            or (
+                "/tests/" in f"/{source}"
+                and (
+                    len(value) < 32
+                    or any(marker in lower for marker in ("secret", "token", "test"))
+                )
+            )
+        ):
+            continue
+        findings.append(
+            Finding(
+                source=source,
+                line=line_number,
+                category=f"literal sensitive configuration value for {match.group(1).upper()}",
+            )
+        )
+    return findings
+
+
+def local_sensitive_values() -> list[tuple[str, bytes]]:
+    """Load real local values for equality checks without ever printing them."""
+
+    env_path = Path(".env")
+    if not env_path.exists():
+        return []
+    values: list[tuple[str, bytes]] = []
+    for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        if not LOCAL_SECRET_KEY_PATTERN.search(key):
+            continue
+        value = raw_value.strip().strip("\"").strip("'")
+        if len(value) >= 8:
+            values.append((key.strip(), value.encode("utf-8")))
+        if key.strip().upper() == "DATABASE_URL":
+            try:
+                password = urlsplit(value).password or ""
+            except ValueError:
+                password = ""
+            if len(password) >= 8:
+                values.append(("DATABASE_URL_PASSWORD", password.encode("utf-8")))
+    return values
+
+
+def local_value_findings(
+    sources: Iterable[tuple[str, bytes]],
+) -> list[Finding]:
+    local_values = local_sensitive_values()
+    if not local_values:
+        return []
+    findings: list[Finding] = []
+    for source, data in sources:
+        if b"\x00" in data:
+            continue
+        for key, value in local_values:
+            offset = data.find(value)
+            if offset < 0:
+                continue
+            findings.append(
+                Finding(
+                    source=source,
+                    line=data.count(b"\n", 0, offset) + 1,
+                    category=f"matches ignored local sensitive setting {key}",
+                )
+            )
     return findings
 
 
@@ -103,8 +285,16 @@ def staged_blobs() -> Iterable[tuple[str, bytes]]:
         yield path, git("show", f":{path}")
 
 
-def tracked_blobs() -> Iterable[tuple[str, bytes]]:
-    for raw_path in git("ls-files", "-z").split(b"\x00"):
+def worktree_blobs() -> Iterable[tuple[str, bytes]]:
+    """Scan tracked and not-ignored untracked files before they are staged."""
+
+    for raw_path in git(
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ).split(b"\x00"):
         if not raw_path:
             continue
         path = raw_path.decode("utf-8", "surrogateescape")
@@ -150,13 +340,19 @@ def main() -> int:
     elif args.staged:
         sources = staged_blobs()
     else:
-        sources = tracked_blobs()
+        sources = worktree_blobs()
 
+    source_rows = list(sources)
     findings: list[Finding] = []
     scanned = 0
-    for source, data in sources:
+    for source, data in source_rows:
         scanned += 1
         findings.extend(scan(source, data))
+    # The ignored production .env exists only on the deployment host.  This
+    # equality check complements format-based CI scanning and reports key names
+    # and locations only, never the local value.
+    if not args.history and not args.commit_message:
+        findings.extend(local_value_findings(source_rows))
 
     if findings:
         print("privacy scan failed; sensitive values are not displayed", file=sys.stderr)
